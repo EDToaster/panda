@@ -1,8 +1,11 @@
 [package]
 name = "panda-cpu8"
+description = "Panda-8: gate-only 8-bit reference CPU benchmark (ISA, assembler, emulator, gate-level generator)"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
 
 [dependencies]
 panda-netlist.workspace = true
+panda-circuits.workspace = true
+panda-timing.workspace = true

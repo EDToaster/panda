@@ -1,0 +1,1040 @@
+{
+  "format": "panda/1",
+  "defs": [
+    {
+      "id": "d_latch",
+      "name": "d_latch",
+      "version": 0,
+      "pins": [
+        {
+          "name": "D",
+          "dir": "in",
+          "width": 1
+        },
+        {
+          "name": "E",
+          "dir": "in",
+          "width": 1
+        },
+        {
+          "name": "Q",
+          "dir": "out",
+          "width": 1
+        },
+        {
+          "name": "Q_n",
+          "dir": "out",
+          "width": 1
+        }
+      ],
+      "instances": [
+        {
+          "id": "g0",
+          "kind": {
+            "atom": {
+              "atom": "not",
+              "width": 1
+            }
+          }
+        },
+        {
+          "id": "g1",
+          "kind": {
+            "atom": {
+              "atom": "gate",
+              "op": "nand",
+              "inputs": 2,
+              "width": 1,
+              "reduce": false
+            }
+          }
+        },
+        {
+          "id": "g2",
+          "kind": {
+            "atom": {
+              "atom": "gate",
+              "op": "nand",
+              "inputs": 2,
+              "width": 1,
+              "reduce": false
+            }
+          }
+        },
+        {
+          "id": "g3",
+          "kind": {
+            "atom": {
+              "atom": "gate",
+              "op": "nand",
+              "inputs": 2,
+              "width": 1,
+              "reduce": false
+            }
+          }
+        },
+        {
+          "id": "g4",
+          "kind": {
+            "atom": {
+              "atom": "gate",
+              "op": "nand",
+              "inputs": 2,
+              "width": 1,
+              "reduce": false
+            }
+          }
+        }
+      ],
+      "nets": [
+        {
+          "id": "D",
+          "width": 1,
+          "ends": [
+            [
+              "pin",
+              "D"
+            ],
+            [
+              "g0",
+              "in"
+            ],
+            [
+              "g1",
+              "in0"
+            ]
+          ]
+        },
+        {
+          "id": "E",
+          "width": 1,
+          "ends": [
+            [
+              "pin",
+              "E"
+            ],
+            [
+              "g1",
+              "in1"
+            ],
+            [
+              "g2",
+              "in1"
+            ]
+          ]
+        },
+        {
+          "id": "n0",
+          "width": 1,
+          "ends": [
+            [
+              "g0",
+              "out"
+            ],
+            [
+              "g2",
+              "in0"
+            ]
+          ]
+        },
+        {
+          "id": "n1",
+          "width": 1,
+          "ends": [
+            [
+              "g1",
+              "out"
+            ],
+            [
+              "g3",
+              "in0"
+            ]
+          ]
+        },
+        {
+          "id": "n2",
+          "width": 1,
+          "ends": [
+            [
+              "g2",
+              "out"
+            ],
+            [
+              "g4",
+              "in0"
+            ]
+          ]
+        },
+        {
+          "id": "Q_n",
+          "width": 1,
+          "ends": [
+            [
+              "g3",
+              "in1"
+            ],
+            [
+              "g4",
+              "out"
+            ],
+            [
+              "pin",
+              "Q_n"
+            ]
+          ]
+        },
+        {
+          "id": "Q",
+          "width": 1,
+          "ends": [
+            [
+              "g3",
+              "out"
+            ],
+            [
+              "g4",
+              "in1"
+            ],
+            [
+              "pin",
+              "Q"
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "id": "dff",
+      "name": "dff",
+      "version": 0,
+      "pins": [
+        {
+          "name": "D",
+          "dir": "in",
+          "width": 1
+        },
+        {
+          "name": "clk",
+          "dir": "in",
+          "width": 1
+        },
+        {
+          "name": "Q",
+          "dir": "out",
+          "width": 1
+        }
+      ],
+      "instances": [
+        {
+          "id": "g0",
+          "kind": {
+            "atom": {
+              "atom": "not",
+              "width": 1
+            }
+          }
+        },
+        {
+          "id": "master",
+          "kind": {
+            "def": "d_latch"
+          }
+        },
+        {
+          "id": "slave",
+          "kind": {
+            "def": "d_latch"
+          }
+        }
+      ],
+      "nets": [
+        {
+          "id": "D",
+          "width": 1,
+          "ends": [
+            [
+              "pin",
+              "D"
+            ],
+            [
+              "master",
+              "D"
+            ]
+          ]
+        },
+        {
+          "id": "clk",
+          "width": 1,
+          "ends": [
+            [
+              "pin",
+              "clk"
+            ],
+            [
+              "g0",
+              "in"
+            ],
+            [
+              "slave",
+              "E"
+            ]
+          ]
+        },
+        {
+          "id": "n0",
+          "width": 1,
+          "ends": [
+            [
+              "g0",
+              "out"
+            ],
+            [
+              "master",
+              "E"
+            ]
+          ]
+        },
+        {
+          "id": "m",
+          "width": 1,
+          "ends": [
+            [
+              "master",
+              "Q"
+            ],
+            [
+              "slave",
+              "D"
+            ]
+          ]
+        },
+        {
+          "id": "n1",
+          "width": 1,
+          "ends": [
+            [
+              "master",
+              "Q_n"
+            ]
+          ]
+        },
+        {
+          "id": "Q",
+          "width": 1,
+          "ends": [
+            [
+              "slave",
+              "Q"
+            ],
+            [
+              "pin",
+              "Q"
+            ]
+          ]
+        },
+        {
+          "id": "n2",
+          "width": 1,
+          "ends": [
+            [
+              "slave",
+              "Q_n"
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "id": "counter4",
+      "name": "counter4",
+      "version": 0,
+      "pins": [
+        {
+          "name": "clk",
+          "dir": "in",
+          "width": 1
+        },
+        {
+          "name": "rst",
+          "dir": "in",
+          "width": 1
+        },
+        {
+          "name": "Q",
+          "dir": "out",
+          "width": 4
+        }
+      ],
+      "instances": [
+        {
+          "id": "g0",
+          "kind": {
+            "atom": {
+              "atom": "not",
+              "width": 1
+            }
+          }
+        },
+        {
+          "id": "g1",
+          "kind": {
+            "atom": {
+              "atom": "not",
+              "width": 1
+            }
+          }
+        },
+        {
+          "id": "g2",
+          "kind": {
+            "atom": {
+              "atom": "gate",
+              "op": "and",
+              "inputs": 2,
+              "width": 1,
+              "reduce": false
+            }
+          }
+        },
+        {
+          "id": "ff0",
+          "kind": {
+            "def": "dff"
+          }
+        },
+        {
+          "id": "g3",
+          "kind": {
+            "atom": {
+              "atom": "gate",
+              "op": "xor",
+              "inputs": 2,
+              "width": 1,
+              "reduce": false
+            }
+          }
+        },
+        {
+          "id": "g4",
+          "kind": {
+            "atom": {
+              "atom": "gate",
+              "op": "and",
+              "inputs": 2,
+              "width": 1,
+              "reduce": false
+            }
+          }
+        },
+        {
+          "id": "g5",
+          "kind": {
+            "atom": {
+              "atom": "gate",
+              "op": "and",
+              "inputs": 2,
+              "width": 1,
+              "reduce": false
+            }
+          }
+        },
+        {
+          "id": "ff1",
+          "kind": {
+            "def": "dff"
+          }
+        },
+        {
+          "id": "g6",
+          "kind": {
+            "atom": {
+              "atom": "gate",
+              "op": "xor",
+              "inputs": 2,
+              "width": 1,
+              "reduce": false
+            }
+          }
+        },
+        {
+          "id": "g7",
+          "kind": {
+            "atom": {
+              "atom": "gate",
+              "op": "and",
+              "inputs": 2,
+              "width": 1,
+              "reduce": false
+            }
+          }
+        },
+        {
+          "id": "g8",
+          "kind": {
+            "atom": {
+              "atom": "gate",
+              "op": "and",
+              "inputs": 2,
+              "width": 1,
+              "reduce": false
+            }
+          }
+        },
+        {
+          "id": "ff2",
+          "kind": {
+            "def": "dff"
+          }
+        },
+        {
+          "id": "g9",
+          "kind": {
+            "atom": {
+              "atom": "gate",
+              "op": "xor",
+              "inputs": 2,
+              "width": 1,
+              "reduce": false
+            }
+          }
+        },
+        {
+          "id": "g10",
+          "kind": {
+            "atom": {
+              "atom": "gate",
+              "op": "and",
+              "inputs": 2,
+              "width": 1,
+              "reduce": false
+            }
+          }
+        },
+        {
+          "id": "g11",
+          "kind": {
+            "atom": {
+              "atom": "gate",
+              "op": "and",
+              "inputs": 2,
+              "width": 1,
+              "reduce": false
+            }
+          }
+        },
+        {
+          "id": "ff3",
+          "kind": {
+            "def": "dff"
+          }
+        },
+        {
+          "id": "g12",
+          "kind": {
+            "atom": {
+              "atom": "splitter",
+              "width": 4,
+              "parts": [
+                [
+                  0,
+                  0
+                ],
+                [
+                  1,
+                  1
+                ],
+                [
+                  2,
+                  2
+                ],
+                [
+                  3,
+                  3
+                ]
+              ]
+            }
+          }
+        },
+        {
+          "id": "g13",
+          "kind": {
+            "atom": {
+              "atom": "splitter",
+              "width": 4,
+              "parts": [
+                [
+                  0,
+                  0
+                ],
+                [
+                  1,
+                  1
+                ],
+                [
+                  2,
+                  2
+                ],
+                [
+                  3,
+                  3
+                ]
+              ]
+            }
+          }
+        }
+      ],
+      "nets": [
+        {
+          "id": "clk",
+          "width": 1,
+          "ends": [
+            [
+              "pin",
+              "clk"
+            ],
+            [
+              "ff0",
+              "clk"
+            ],
+            [
+              "ff1",
+              "clk"
+            ],
+            [
+              "ff2",
+              "clk"
+            ],
+            [
+              "ff3",
+              "clk"
+            ]
+          ]
+        },
+        {
+          "id": "rst",
+          "width": 1,
+          "ends": [
+            [
+              "pin",
+              "rst"
+            ],
+            [
+              "g0",
+              "in"
+            ]
+          ]
+        },
+        {
+          "id": "n0",
+          "width": 1,
+          "ends": [
+            [
+              "g0",
+              "out"
+            ],
+            [
+              "g2",
+              "in1"
+            ],
+            [
+              "g5",
+              "in1"
+            ],
+            [
+              "g8",
+              "in1"
+            ],
+            [
+              "g11",
+              "in1"
+            ]
+          ]
+        },
+        {
+          "id": "n1",
+          "width": 1,
+          "ends": [
+            [
+              "g1",
+              "in"
+            ],
+            [
+              "ff0",
+              "Q"
+            ],
+            [
+              "g3",
+              "in1"
+            ],
+            [
+              "g4",
+              "in0"
+            ],
+            [
+              "g13",
+              "p0"
+            ]
+          ]
+        },
+        {
+          "id": "n2",
+          "width": 1,
+          "ends": [
+            [
+              "g3",
+              "in0"
+            ],
+            [
+              "g4",
+              "in1"
+            ],
+            [
+              "ff1",
+              "Q"
+            ],
+            [
+              "g13",
+              "p1"
+            ]
+          ]
+        },
+        {
+          "id": "n3",
+          "width": 1,
+          "ends": [
+            [
+              "g6",
+              "in0"
+            ],
+            [
+              "g7",
+              "in1"
+            ],
+            [
+              "ff2",
+              "Q"
+            ],
+            [
+              "g13",
+              "p2"
+            ]
+          ]
+        },
+        {
+          "id": "n4",
+          "width": 1,
+          "ends": [
+            [
+              "g9",
+              "in0"
+            ],
+            [
+              "g10",
+              "in1"
+            ],
+            [
+              "ff3",
+              "Q"
+            ],
+            [
+              "g13",
+              "p3"
+            ]
+          ]
+        },
+        {
+          "id": "n5",
+          "width": 1,
+          "ends": [
+            [
+              "g1",
+              "out"
+            ],
+            [
+              "g2",
+              "in0"
+            ]
+          ]
+        },
+        {
+          "id": "n6",
+          "width": 1,
+          "ends": [
+            [
+              "g2",
+              "out"
+            ],
+            [
+              "ff0",
+              "D"
+            ],
+            [
+              "g12",
+              "p0"
+            ]
+          ]
+        },
+        {
+          "id": "n7",
+          "width": 1,
+          "ends": [
+            [
+              "g3",
+              "out"
+            ],
+            [
+              "g5",
+              "in0"
+            ]
+          ]
+        },
+        {
+          "id": "n8",
+          "width": 1,
+          "ends": [
+            [
+              "g4",
+              "out"
+            ],
+            [
+              "g6",
+              "in1"
+            ],
+            [
+              "g7",
+              "in0"
+            ]
+          ]
+        },
+        {
+          "id": "n9",
+          "width": 1,
+          "ends": [
+            [
+              "g5",
+              "out"
+            ],
+            [
+              "ff1",
+              "D"
+            ],
+            [
+              "g12",
+              "p1"
+            ]
+          ]
+        },
+        {
+          "id": "n10",
+          "width": 1,
+          "ends": [
+            [
+              "g6",
+              "out"
+            ],
+            [
+              "g8",
+              "in0"
+            ]
+          ]
+        },
+        {
+          "id": "n11",
+          "width": 1,
+          "ends": [
+            [
+              "g7",
+              "out"
+            ],
+            [
+              "g9",
+              "in1"
+            ],
+            [
+              "g10",
+              "in0"
+            ]
+          ]
+        },
+        {
+          "id": "n12",
+          "width": 1,
+          "ends": [
+            [
+              "g8",
+              "out"
+            ],
+            [
+              "ff2",
+              "D"
+            ],
+            [
+              "g12",
+              "p2"
+            ]
+          ]
+        },
+        {
+          "id": "n13",
+          "width": 1,
+          "ends": [
+            [
+              "g9",
+              "out"
+            ],
+            [
+              "g11",
+              "in0"
+            ]
+          ]
+        },
+        {
+          "id": "n14",
+          "width": 1,
+          "ends": [
+            [
+              "g10",
+              "out"
+            ]
+          ]
+        },
+        {
+          "id": "n15",
+          "width": 1,
+          "ends": [
+            [
+              "g11",
+              "out"
+            ],
+            [
+              "ff3",
+              "D"
+            ],
+            [
+              "g12",
+              "p3"
+            ]
+          ]
+        },
+        {
+          "id": "next",
+          "width": 4,
+          "ends": [
+            [
+              "g12",
+              "whole"
+            ]
+          ]
+        },
+        {
+          "id": "Q",
+          "width": 4,
+          "ends": [
+            [
+              "g13",
+              "whole"
+            ],
+            [
+              "pin",
+              "Q"
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "id": "counter4_clocked",
+      "name": "counter4_clocked",
+      "version": 0,
+      "pins": [
+        {
+          "name": "Q",
+          "dir": "out",
+          "width": 4
+        },
+        {
+          "name": "clk",
+          "dir": "out",
+          "width": 1
+        }
+      ],
+      "instances": [
+        {
+          "id": "g0",
+          "kind": {
+            "atom": {
+              "atom": "clock",
+              "period": 20,
+              "high": 10,
+              "phase": 10
+            }
+          }
+        },
+        {
+          "id": "g1",
+          "kind": {
+            "atom": {
+              "atom": "power_on_reset",
+              "ticks": 45
+            }
+          }
+        },
+        {
+          "id": "cnt",
+          "kind": {
+            "def": "counter4"
+          }
+        }
+      ],
+      "nets": [
+        {
+          "id": "clk",
+          "width": 1,
+          "ends": [
+            [
+              "g0",
+              "out"
+            ],
+            [
+              "cnt",
+              "clk"
+            ],
+            [
+              "pin",
+              "clk"
+            ]
+          ]
+        },
+        {
+          "id": "rst",
+          "width": 1,
+          "ends": [
+            [
+              "g1",
+              "out"
+            ],
+            [
+              "cnt",
+              "rst"
+            ]
+          ]
+        },
+        {
+          "id": "Q",
+          "width": 4,
+          "ends": [
+            [
+              "cnt",
+              "Q"
+            ],
+            [
+              "pin",
+              "Q"
+            ]
+          ]
+        }
+      ]
+    }
+  ],
+  "top": "counter4_clocked"
+}

@@ -1,0 +1,25 @@
+# 4-bit synchronous counter with synchronous reset, see examples::counter4.
+set clk=0 rst=1
+settle
+expect Q=x                # no clock edge yet: the register is unknown
+pulse clk                 # reset is sampled on the rising edge
+expect Q=0
+set rst=0
+settle                    # let rst reach the flip-flops before the edge (setup time!)
+pulse clk
+expect Q=1
+pulse clk 2
+expect Q=3 next=4
+pulse clk 12
+expect Q=15 next=0
+pulse clk                 # wraps around
+expect Q=0
+pulse clk 5
+expect Q=5
+set rst=1
+settle
+pulse clk
+expect Q=0
+reset                     # power-on again (inputs keep their values: rst=1, clk=0)
+settle
+expect Q=x

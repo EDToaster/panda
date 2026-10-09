@@ -6,3 +6,7 @@ license.workspace = true
 
 [dependencies]
 panda-netlist.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+panda-timing.workspace = true

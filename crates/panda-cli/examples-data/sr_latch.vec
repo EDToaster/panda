@@ -1,0 +1,27 @@
+# NAND SR latch (active-low set / reset), see examples::sr_latch.
+set S_n=1 R_n=1
+settle
+# Inputs default to 0 at power-on, so this first 'set' is itself a simultaneous release of
+# S_n and R_n: the latch oscillates with period 2, collapses to X and a Metastable note appears.
+expect Q=x Q_n=x
+set S_n=0                 # set
+settle
+expect Q=1 Q_n=0
+set S_n=1                 # hold
+settle
+expect Q=1 Q_n=0
+set R_n=0                 # reset
+settle
+expect Q=0 Q_n=1
+set R_n=1                 # hold
+settle
+expect Q=0 Q_n=1
+set S_n=0 R_n=0           # forbidden input: both outputs high
+settle
+expect Q=1 Q_n=1
+set S_n=1 R_n=1           # simultaneous release: period-2 collapse to X (Metastable, SPEC 5.3)
+settle
+expect Q=x Q_n=x
+set S_n=0                 # a real set recovers from X
+settle
+expect Q=1 Q_n=0

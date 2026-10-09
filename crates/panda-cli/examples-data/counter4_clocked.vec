@@ -1,0 +1,11 @@
+# counter4 driven by a Clock (period 20, rising at tick 10) and a PowerOnReset of 45 ticks.
+expect Q=x clk=0 rst=1
+run 14                    # first rising edge at tick 10; Q is reset a few ticks later
+expect Q=0 clk=1
+run 36                    # tick 50: reset released at 45, rising edge now
+expect rst=0
+run 10                    # tick 60
+expect Q=1 clk=0
+run 200                   # tick 260: 10 more rising edges (70, 90, ..., 250)
+expect Q=11
+print Q cnt/next

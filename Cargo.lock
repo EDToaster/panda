@@ -19,6 +19,8 @@ name = "panda-circuits"
 version = "0.1.0"
 dependencies = [
  "panda-netlist",
+ "panda-timing",
+ "serde_json",
 ]
 
 [[package]]
@@ -26,6 +28,8 @@ name = "panda-cli"
 version = "0.1.0"
 dependencies = [
  "panda-netlist",
+ "panda-timing",
+ "serde_json",
 ]
 
 [[package]]
@@ -39,7 +43,9 @@ dependencies = [
 name = "panda-cpu8"
 version = "0.1.0"
 dependencies = [
+ "panda-circuits",
  "panda-netlist",
+ "panda-timing",
 ]
 
 [[package]]

@@ -158,7 +158,9 @@ impl FlatNetlist {
         let mut resolvers = vec![Vec::new(); n];
         for (i, g) in self.gates.iter().enumerate() {
             for &inp in &g.inputs {
-                if !gates[inp as usize].contains(&(i as GateIdx)) {
+                // Gates are visited in increasing order, so a duplicate (a gate reading the same
+                // net twice) can only be the last entry: O(1) dedup instead of `contains`.
+                if gates[inp as usize].last() != Some(&(i as GateIdx)) {
                     gates[inp as usize].push(i as GateIdx);
                 }
             }

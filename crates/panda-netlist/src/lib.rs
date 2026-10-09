@@ -5,6 +5,7 @@ pub mod builder;
 pub mod eval;
 pub mod flat;
 mod flatten_impl;
+mod structure;
 pub mod model;
 pub mod validate;
 pub mod value;

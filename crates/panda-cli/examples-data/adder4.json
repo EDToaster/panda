@@ -1,0 +1,704 @@
+{
+  "format": "panda/1",
+  "defs": [
+    {
+      "id": "full_adder",
+      "name": "full_adder",
+      "version": 0,
+      "pins": [
+        {
+          "name": "A",
+          "dir": "in",
+          "width": 1
+        },
+        {
+          "name": "B",
+          "dir": "in",
+          "width": 1
+        },
+        {
+          "name": "Cin",
+          "dir": "in",
+          "width": 1
+        },
+        {
+          "name": "S",
+          "dir": "out",
+          "width": 1
+        },
+        {
+          "name": "Cout",
+          "dir": "out",
+          "width": 1
+        }
+      ],
+      "instances": [
+        {
+          "id": "g0",
+          "kind": {
+            "atom": {
+              "atom": "gate",
+              "op": "xor",
+              "inputs": 2,
+              "width": 1,
+              "reduce": false
+            }
+          }
+        },
+        {
+          "id": "g1",
+          "kind": {
+            "atom": {
+              "atom": "gate",
+              "op": "xor",
+              "inputs": 2,
+              "width": 1,
+              "reduce": false
+            }
+          }
+        },
+        {
+          "id": "g2",
+          "kind": {
+            "atom": {
+              "atom": "gate",
+              "op": "and",
+              "inputs": 2,
+              "width": 1,
+              "reduce": false
+            }
+          }
+        },
+        {
+          "id": "g3",
+          "kind": {
+            "atom": {
+              "atom": "gate",
+              "op": "and",
+              "inputs": 2,
+              "width": 1,
+              "reduce": false
+            }
+          }
+        },
+        {
+          "id": "g4",
+          "kind": {
+            "atom": {
+              "atom": "gate",
+              "op": "or",
+              "inputs": 2,
+              "width": 1,
+              "reduce": false
+            }
+          }
+        }
+      ],
+      "nets": [
+        {
+          "id": "A",
+          "width": 1,
+          "ends": [
+            [
+              "pin",
+              "A"
+            ],
+            [
+              "g0",
+              "in0"
+            ],
+            [
+              "g2",
+              "in0"
+            ]
+          ]
+        },
+        {
+          "id": "B",
+          "width": 1,
+          "ends": [
+            [
+              "pin",
+              "B"
+            ],
+            [
+              "g0",
+              "in1"
+            ],
+            [
+              "g2",
+              "in1"
+            ]
+          ]
+        },
+        {
+          "id": "Cin",
+          "width": 1,
+          "ends": [
+            [
+              "pin",
+              "Cin"
+            ],
+            [
+              "g1",
+              "in1"
+            ],
+            [
+              "g3",
+              "in1"
+            ]
+          ]
+        },
+        {
+          "id": "axb",
+          "width": 1,
+          "ends": [
+            [
+              "g0",
+              "out"
+            ],
+            [
+              "g1",
+              "in0"
+            ],
+            [
+              "g3",
+              "in0"
+            ]
+          ]
+        },
+        {
+          "id": "S",
+          "width": 1,
+          "ends": [
+            [
+              "g1",
+              "out"
+            ],
+            [
+              "pin",
+              "S"
+            ]
+          ]
+        },
+        {
+          "id": "n0",
+          "width": 1,
+          "ends": [
+            [
+              "g2",
+              "out"
+            ],
+            [
+              "g4",
+              "in0"
+            ]
+          ]
+        },
+        {
+          "id": "n1",
+          "width": 1,
+          "ends": [
+            [
+              "g3",
+              "out"
+            ],
+            [
+              "g4",
+              "in1"
+            ]
+          ]
+        },
+        {
+          "id": "Cout",
+          "width": 1,
+          "ends": [
+            [
+              "g4",
+              "out"
+            ],
+            [
+              "pin",
+              "Cout"
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "id": "adder4",
+      "name": "adder4",
+      "version": 0,
+      "pins": [
+        {
+          "name": "A",
+          "dir": "in",
+          "width": 4
+        },
+        {
+          "name": "B",
+          "dir": "in",
+          "width": 4
+        },
+        {
+          "name": "Cin",
+          "dir": "in",
+          "width": 1
+        },
+        {
+          "name": "S",
+          "dir": "out",
+          "width": 4
+        },
+        {
+          "name": "Cout",
+          "dir": "out",
+          "width": 1
+        }
+      ],
+      "instances": [
+        {
+          "id": "g0",
+          "kind": {
+            "atom": {
+              "atom": "splitter",
+              "width": 4,
+              "parts": [
+                [
+                  0,
+                  0
+                ],
+                [
+                  1,
+                  1
+                ],
+                [
+                  2,
+                  2
+                ],
+                [
+                  3,
+                  3
+                ]
+              ]
+            }
+          }
+        },
+        {
+          "id": "g1",
+          "kind": {
+            "atom": {
+              "atom": "splitter",
+              "width": 4,
+              "parts": [
+                [
+                  0,
+                  0
+                ],
+                [
+                  1,
+                  1
+                ],
+                [
+                  2,
+                  2
+                ],
+                [
+                  3,
+                  3
+                ]
+              ]
+            }
+          }
+        },
+        {
+          "id": "fa0",
+          "kind": {
+            "def": "full_adder"
+          }
+        },
+        {
+          "id": "fa1",
+          "kind": {
+            "def": "full_adder"
+          }
+        },
+        {
+          "id": "fa2",
+          "kind": {
+            "def": "full_adder"
+          }
+        },
+        {
+          "id": "fa3",
+          "kind": {
+            "def": "full_adder"
+          }
+        },
+        {
+          "id": "g2",
+          "kind": {
+            "atom": {
+              "atom": "splitter",
+              "width": 4,
+              "parts": [
+                [
+                  0,
+                  0
+                ],
+                [
+                  1,
+                  1
+                ],
+                [
+                  2,
+                  2
+                ],
+                [
+                  3,
+                  3
+                ]
+              ]
+            }
+          }
+        },
+        {
+          "id": "g3",
+          "kind": {
+            "atom": {
+              "atom": "splitter",
+              "width": 4,
+              "parts": [
+                [
+                  0,
+                  0
+                ],
+                [
+                  1,
+                  1
+                ],
+                [
+                  2,
+                  2
+                ],
+                [
+                  3,
+                  3
+                ]
+              ]
+            }
+          }
+        }
+      ],
+      "nets": [
+        {
+          "id": "A",
+          "width": 4,
+          "ends": [
+            [
+              "pin",
+              "A"
+            ],
+            [
+              "g0",
+              "whole"
+            ]
+          ]
+        },
+        {
+          "id": "B",
+          "width": 4,
+          "ends": [
+            [
+              "pin",
+              "B"
+            ],
+            [
+              "g1",
+              "whole"
+            ]
+          ]
+        },
+        {
+          "id": "Cin",
+          "width": 1,
+          "ends": [
+            [
+              "pin",
+              "Cin"
+            ],
+            [
+              "fa0",
+              "Cin"
+            ]
+          ]
+        },
+        {
+          "id": "n0",
+          "width": 1,
+          "ends": [
+            [
+              "g0",
+              "p0"
+            ],
+            [
+              "fa0",
+              "A"
+            ]
+          ]
+        },
+        {
+          "id": "n1",
+          "width": 1,
+          "ends": [
+            [
+              "g0",
+              "p1"
+            ],
+            [
+              "fa1",
+              "A"
+            ]
+          ]
+        },
+        {
+          "id": "n2",
+          "width": 1,
+          "ends": [
+            [
+              "g0",
+              "p2"
+            ],
+            [
+              "fa2",
+              "A"
+            ]
+          ]
+        },
+        {
+          "id": "n3",
+          "width": 1,
+          "ends": [
+            [
+              "g0",
+              "p3"
+            ],
+            [
+              "fa3",
+              "A"
+            ]
+          ]
+        },
+        {
+          "id": "n4",
+          "width": 1,
+          "ends": [
+            [
+              "g1",
+              "p0"
+            ],
+            [
+              "fa0",
+              "B"
+            ]
+          ]
+        },
+        {
+          "id": "n5",
+          "width": 1,
+          "ends": [
+            [
+              "g1",
+              "p1"
+            ],
+            [
+              "fa1",
+              "B"
+            ]
+          ]
+        },
+        {
+          "id": "n6",
+          "width": 1,
+          "ends": [
+            [
+              "g1",
+              "p2"
+            ],
+            [
+              "fa2",
+              "B"
+            ]
+          ]
+        },
+        {
+          "id": "n7",
+          "width": 1,
+          "ends": [
+            [
+              "g1",
+              "p3"
+            ],
+            [
+              "fa3",
+              "B"
+            ]
+          ]
+        },
+        {
+          "id": "n8",
+          "width": 1,
+          "ends": [
+            [
+              "fa0",
+              "S"
+            ],
+            [
+              "g3",
+              "p0"
+            ]
+          ]
+        },
+        {
+          "id": "n9",
+          "width": 1,
+          "ends": [
+            [
+              "fa0",
+              "Cout"
+            ],
+            [
+              "fa1",
+              "Cin"
+            ],
+            [
+              "g2",
+              "p0"
+            ]
+          ]
+        },
+        {
+          "id": "n10",
+          "width": 1,
+          "ends": [
+            [
+              "fa1",
+              "S"
+            ],
+            [
+              "g3",
+              "p1"
+            ]
+          ]
+        },
+        {
+          "id": "n11",
+          "width": 1,
+          "ends": [
+            [
+              "fa1",
+              "Cout"
+            ],
+            [
+              "fa2",
+              "Cin"
+            ],
+            [
+              "g2",
+              "p1"
+            ]
+          ]
+        },
+        {
+          "id": "n12",
+          "width": 1,
+          "ends": [
+            [
+              "fa2",
+              "S"
+            ],
+            [
+              "g3",
+              "p2"
+            ]
+          ]
+        },
+        {
+          "id": "n13",
+          "width": 1,
+          "ends": [
+            [
+              "fa2",
+              "Cout"
+            ],
+            [
+              "fa3",
+              "Cin"
+            ],
+            [
+              "g2",
+              "p2"
+            ]
+          ]
+        },
+        {
+          "id": "n14",
+          "width": 1,
+          "ends": [
+            [
+              "fa3",
+              "S"
+            ],
+            [
+              "g3",
+              "p3"
+            ]
+          ]
+        },
+        {
+          "id": "Cout",
+          "width": 1,
+          "ends": [
+            [
+              "fa3",
+              "Cout"
+            ],
+            [
+              "g2",
+              "p3"
+            ],
+            [
+              "pin",
+              "Cout"
+            ]
+          ]
+        },
+        {
+          "id": "carry",
+          "width": 4,
+          "ends": [
+            [
+              "g2",
+              "whole"
+            ]
+          ]
+        },
+        {
+          "id": "S",
+          "width": 4,
+          "ends": [
+            [
+              "g3",
+              "whole"
+            ],
+            [
+              "pin",
+              "S"
+            ]
+          ]
+        }
+      ]
+    }
+  ],
+  "top": "adder4"
+}

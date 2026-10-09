@@ -3,6 +3,17 @@ name = "panda-cli"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
+description = "Panda command-line tool: run designs, test vectors, VCD dumps, design info"
+
+[lib]
+name = "panda_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "panda"
+path = "src/main.rs"
 
 [dependencies]
 panda-netlist.workspace = true
+panda-timing.workspace = true
+serde_json.workspace = true

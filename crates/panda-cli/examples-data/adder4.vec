@@ -1,0 +1,20 @@
+# 4-bit ripple-carry adder, see examples::adder4.
+set A=0 B=0 Cin=0
+settle
+expect S=0 Cout=0 carry=0
+set A=5 B=3
+settle
+expect S=8 Cout=0 carry=0b0111
+set Cin=1
+settle
+expect S=9 Cout=0
+set A=0xf B=0xf Cin=1
+settle
+expect S=0xf Cout=1 carry=0b1111
+set A=0b1010 B=0b0101 Cin=0
+settle
+expect S=0b1111 Cout=0 fa2/axb=1
+expect S=0b1-1- carry[3:2]=0b00     # don't-care bits and a bit range
+set B=x                   # unknown operand
+settle
+expect S=x Cout=-

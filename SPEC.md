@@ -1,6 +1,6 @@
 # Panda — Digital Logic Sandbox: Design Spec
 
-> Status: **v0.2 — design converged**, ready for M1 (see §13).
+> Status: **v0.3**: M1 in progress. v0.3 defines Fast mode by the kernel-delta reference algorithm (§6).
 > Implementation language: **Rust**.
 > Conventions: **MUST / SHOULD / MAY** are normative. `[OPEN]` marks unresolved questions.
 > Evidence behind each decision is summarized in §14.
@@ -161,13 +161,40 @@ Under exact simultaneity, unit-delay logic produces period-2 oscillation where r
 
 ---
 
-## 6. Fast Mode — synchronous semantics
+## 6. Fast Mode — kernel-delta semantics
 
-- State advances in **phases**. A phase is an interval between consecutive clock edges in the hyperperiod of all Clocks. With edge fusion, it advances once per clock cycle.
-- Within a phase, all combinational logic is zero-delay. Each latch kernel follows its characterized behavior (§8.4) under the phase's clock values.
-- **Input changes** from the UI take effect at the next phase boundary, after the clock edge.
-- **Equivalence (D10):** Fast and Timing produce identical values at phase boundaries whenever the design **passes STA (§9)**, i.e. setup, hold, no hazard on any kernel guard, and no oscillator kernels. Failures are reported as diagnostics with locations, and the user can switch to Timing mode to see the actual behavior.
-- Constructs Fast mode does not compile (free-running oscillators, glitch/pulse-generated clocks) produce `X` on the affected nets plus a diagnostic.
+Fast mode is defined by a simple reference algorithm. Every optimization (§7, §8.5–§8.9) MUST produce identical results to it, and differential tests enforce this. Its relationship to Timing mode is the equivalence contract below.
+
+### 6.1 Ingredients
+- **Kernels** (§8.3): small state-holding gate clusters found by the compiler. Each kernel has input nets, output nets, and a **state**: the values of all nets inside it. A kernel's **transition** `T(state, inputs) → state'` is "apply the new inputs all at once and simulate the kernel's gates with Timing-mode semantics (§5.1, including period-2 collapse) until quiescent". Characterized kernels cache `T` in a table (§8.4); others compute it on the fly.
+- **Combinational logic**: every gate/resolver not inside a kernel. After kernel extraction, every cycle of the netlist passes through a kernel, so this logic is acyclic given kernel outputs. It is evaluated with **zero delay**: settled values equal the gate functions applied in topological order, which is exactly what unit-delay acyclic logic settles to.
+- **Events**: clock edges, `PowerOnReset` release, and UI input changes. The schedule is the merged timeline of all sources (§8.2). Simultaneous events form one event.
+
+### 6.2 The algorithm (per event)
+```
+given: settled state S (all nets, all kernel states), the event's new source values
+round 0:  evaluate combinational logic with new sources, kernel outputs taken from current states
+repeat:   for every kernel whose input vector changed since its last transition:
+              state ← T(state, inputs)
+          re-evaluate combinational logic downstream of kernels whose outputs changed
+until no kernel input changed            (bound: DELTA_LIMIT rounds → affected nets X + IterationLimit)
+publish S
+```
+- One **phase** = the interval between consecutive events. `step(Phase)` processes one event.
+- UI input changes are applied as their own event right after the next clock event, never simultaneously with it. This mirrors "inputs change after the edge" (hold).
+- Initial state: all nets `X`. Kernels with `X` in their state or inputs use on-the-fly transitions (exact; tables index binary values only).
+
+Why this matches hardware intuition: at an edge, the clock-derived kernel inputs change first (round 0 → first transitions), and data that depends on kernel outputs changes afterwards (later rounds). That is exactly the order a hold-time-clean circuit guarantees. A master-slave register costs one round at each edge. Combinational logic runs once per cycle, after the edge that opens the slave latches, because the master latches are opaque when its outputs arrive.
+
+### 6.3 Equivalence with Timing mode (D10)
+When Timing mode runs with the clock period ≥ the STA minimum and UI inputs change outside hold windows, Fast mode's values at the end of each phase equal Timing mode's values at the tick just before the next event, **for every net**, provided:
+1. **Setup**: every phase settles before the next event (§9.1).
+2. **Hold**: at every kernel, data-input changes caused by this event arrive after its clock-derived input changes have settled (§9.2). Rounds model exactly this ordering.
+3. **No hazards** on kernel inputs that can change kernel state (guards, SR inputs): their cones produce no glitch for the event (§9.3). Glitches on data inputs of opaque kernels are harmless, and transparent kernels pass a glitch through but then settle.
+4. **Order-insensitive bursts**: when several inputs of one kernel change in the same round, the table entry gives the same result for every arrival order (§8.4). Otherwise the result depends on unit-delay skew. Fast mode raises `DelaySensitive` at runtime when such an entry is used.
+5. No free-running oscillator kernels. Those yield `X` plus `Oscillating` in Fast mode.
+
+Each violated condition raises a diagnostic with a location. Switching to Timing mode shows the real behavior.
 
 ---
 
@@ -196,10 +223,11 @@ All state comes from gate loops, so the compiler has to *rediscover* state eleme
 
 ### 8.1 Pipeline
 ```
-flatten (keep hierarchy map) → const-fold → clock-net identification (8.2)
+flatten (keep hierarchy map) → const-fold
   → kernel extraction (8.3) → kernel characterization (8.4)
-  → phase specialization (8.5) → [edge fusion (8.5.3)]
-  → STA (9) → partitioning + guards (8.6) → slice packing (8.7) → FastIR
+  → FastRef: direct interpreter of §6.2                      [M3: the oracle]
+  → phase specialization (8.5) → STA (9)
+  → partitioning + guards (8.6) → slice packing (8.7) → LUTs (7) → FastIR   [M4]
 ```
 Order matters. Running SCC analysis on the raw flattened graph yields **one giant SCC** in any CPU, because register → ALU → register loops close through the latches (§14.4). Kernels have to be found locally first.
 
@@ -210,15 +238,22 @@ Clock nets are those driven by `Clock` sources through buffers/inverters only. N
 1. **Seed loops**: find all simple cycles of length ≤ `KERNEL_MAX_LOOP` (default 6). Cross-coupled pairs have length 2.
 2. **Merge** overlapping cycles into a kernel core.
 3. **Absorb private fan-in**: add every gate whose fan-out lies entirely inside the kernel (local clock inverters, the `s`/`r` steering NANDs of a D latch). Without this, a D latch's core sees correlated inputs `s`, `r` that can't be classified, and a toggle FF sees `clk`/`nclk` as independent (§14.4).
-4. Kernels with `inputs + state_nets ≤ KERNEL_MAX_BITS` (default ≈ 10) are **characterized**. Larger ones become **iterative kernels**, evaluated by bounded fixpoint iteration of their gate code (bound = 2 × net count).
+4. **Residual cycles**: compute SCCs of the graph with all kernels contracted. Each remaining non-trivial SCC becomes a **sim kernel** (it also absorbs private fan-in). Afterwards every cycle passes through a kernel, so combinational logic is acyclic. Long-loop latches, cyclic-combinational logic and anything unusual land here: correct, just slower.
+5. **Keeper-terminated resolvers** hold state, so they become 1-bit kernels.
+6. Kernels whose `binary inputs + cut bits ≤ KERNEL_MAX_BITS` (default ≈ 12) are **characterized** (§8.4). The others are sim kernels: `T` is computed on the fly by unit-delay simulation of the kernel's gates (bound = 4 × net count + 8, then `X` + `IterationLimit`).
+
+Correctness never depends on which kernels are found: `T` is exact either way. Heuristics only decide what is fast.
 
 **Clock-like pins** of a package: pins p such that, for each constant value of p, the package outputs do not depend on its data inputs within a phase.
 
 ### 8.4 Kernel characterization (Latch Tables)
-- **State** = values of *all* nets in the kernel at quiescence (minimized: drop nets that are functions of others and inputs). The cut set is only an internal detail of simulation; it never defines state. This removes the dependence on previous inputs found in the prototype, and makes power-on/saved state independent of netlist order (§14.4).
-- For every (stable state, new input vector), simulate the kernel **with Timing-mode semantics** (§5, including period-2 collapse) to quiescence. Record next state, outputs and settle latency. Because the table is derived from the reference semantics, it matches Timing mode by construction for fundamental-mode transitions: inputs change, then hold until the kernel settles.
-- Alongside, run **ternary simulation** (Eichelberger Algorithm A + B) on each transition. Where ternary gives `X` but Timing mode is binary, mark the entry **delay-sensitive**: the result relies on exact unit delays and would be a race in real hardware. This is a **warning only** and never changes results. Ternary analysis treats clock skew as unbounded, which makes it too pessimistic to use as semantics (it turns every edge of a toggle FF into `X`; §14.4).
-- Tables are cached per def hash when the kernel lies entirely inside one def. That is the common case, since most users package their latches/FFs.
+- **State** = values of *all* nets in the kernel. Absorbed fan-in nets are functions of the inputs, so a state implicitly records the inputs it settled under. This is why results never depend on "previous inputs" (§14.4), and why power-on and saved state are independent of netlist order. The cut set is only used to enumerate states.
+- **Stable-state enumeration**: for each binary input vector, assign each binary value to the cut nets, settle with Timing semantics, and keep the binary fixed points. Stable states get dense ids.
+- **Transitions**: for every (stable state, new binary input vector), run `T` and record the next state id (or *non-binary*: it collapsed or oscillated to `X`), the output values, and the settle latency per output (used by STA).
+- **Order sensitivity**: for entries where j ≥ 2 inputs change, also apply the changes one at a time in every order (each settling before the next; j! ≤ 24 for j ≤ 4, else sampled). If any order disagrees with the simultaneous result, mark the entry **order-sensitive** (§6.3 condition 4). Kernel-internal skew (e.g. a local clock inverter) is modeled exactly because it lies inside the kernel. This is why ternary simulation is *not* used for this check: it treats internal delays as unbounded too, and so flags every toggle-FF edge (§14.4).
+- **Ternary simulation** (Eichelberger A+B) is still run per entry as an *advisory* "would race under arbitrary gate delays" lint (`DelaySensitive`, info severity, off by default in the UI).
+- At runtime, a kernel with `X` anywhere in its state or inputs uses the on-the-fly `T`. When it returns to a binary stable state it re-enters table mode (look up its id by state hash).
+- Tables are cached per (def hash, kernel position) when the kernel lies entirely inside one def. That is the common case, since most users package latches/FFs.
 
 ### 8.5 Phase specialization
 
@@ -233,8 +268,10 @@ Clock nets are those driven by `Clock` sources through buffers/inverters only. N
 
 **8.5.2** Build the per-phase graph with opaque kernels as cut points and check it is **acyclic at the kernel level**. Gate-level constant propagation alone doesn't break latch loops (§14.4). Residual cycles become iterative kernels with a diagnostic.
 
-**8.5.3 Edge fusion** (semantic, not topological). For each group of kernels on the same clock, compose their per-phase tables over one clock cycle. If the composition observed once per cycle equals "sample on edge, hold otherwise", replace the group with an **edge-triggered register**. If an entire clock domain fuses, its phases collapse into a single **cycle program**: evaluate combinational logic once, then commit registers. This halves the work and is required for D7.
+**8.5.3 Edge fusion** (semantic, not topological; *optional optimization*, M4+). Under §6.2 with dirty tracking, combinational logic already runs once per cycle. Fusion only removes the master-latch round at the inactive edge. For each group of kernels on the same clock, compose their per-phase tables over one clock cycle. If the composition observed once per cycle equals "sample on edge, hold otherwise", replace the group with an **edge-triggered register**. If an entire clock domain fuses, its phases collapse into a single **cycle program**: evaluate combinational logic once, then commit registers.
 - Fused state stays probe-able. A master latch's value is reconstructable from the slave and its D input, since it is transparent in one phase and holds the slave's value in the other.
+
+**8.5.0 Purpose.** Phase specialization turns kernel tables into *bitwise code*. Under fixed clock values, a transparent latch is a copy and a conditional latch is a mux (`q = g ? d : q`). These pack into word ops across a register's bits (§8.7). An 8-bit register's slave latches at the rising edge become one 8-bit word copy instead of 8 table lookups. Kernels classified *general* keep table steps.
 
 **8.5.4 Derived clocks** (ripple counters, clock dividers): a guard that depends on kernel state can't be fixed per phase. These kernels are evaluated with **delta iteration**: after a phase program runs, any changed guard re-triggers the dependent kernels, in topological order of guard dependence, up to a bound. Beyond the bound → `X` + diagnostic. It is correct, but slower in proportion to how much logic is derived-clocked.
 
@@ -346,9 +383,9 @@ A gate-only 8-bit CPU, generated programmatically into a netlist, is the accepta
 |---|---|---|
 | **M1** | `panda-netlist`, `panda-timing`, `panda-cli` (load, run, test vectors, VCD) | Golden circuits behave per §5: SR/D latches, MS-DFF, counters, ring oscillator, period-2 collapse, Panda-8 runs a program |
 | **M2** | Combinational compilation; ideal blocks; classification | Randomized equivalence: ideal block outputs = glass-box settled outputs |
-| **M3** | Kernel extraction + characterization, phase specialization, STA, interpreter | **Differential fuzzing**: Fast = Timing at phase boundaries on all STA-clean designs; every mismatch is a reported STA diagnostic |
-| **M4** | Edge fusion, partitions + guarded skipping, slice packing, ROM→LUT | Panda-8 ≥ 1 MHz interpreted (estimate 1.5–2 MHz) |
-| **M5** | Cranelift tier 2, background compile + hot-swap | ≥ 2× over tier 1 on Panda-8 |
+| **M3** | `panda-compile`: kernel extraction + characterization, **FastRef** (§6.2 interpreter), STA; ideal blocks for Timing mode (§5.2) | **Differential fuzzing**: FastRef = Timing at phase boundaries on STA-clean designs; every mismatch is explained by a reported diagnostic. Panda-8 runs correctly in FastRef |
+| **M4** | `panda-fast`: phase specialization → FastIR (word ops, partitions + dirty flags + guarded skipping, slice packing, ROM→LUT), bytecode interpreter; optional edge fusion | FastIR engine = FastRef on all fuzz designs; Panda-8 ≥ 1 MHz interpreted |
+| **M5** | `panda-jit` (Cranelift, background compile + hot-swap) and `panda-kernel` facade (§10: modes, incremental edits, snapshots) | JIT = interpreter bit-for-bit; ≥ 2× over interpreter on Panda-8; facade API tests |
 | **M6** | Editor/renderer over `panda-kernel` | Place, wire, package, click-to-test, waveform view, diagnostics panel |
 
 Engineering rules from the start: struct-of-arrays state (Turing Complete hit a wall at ~1M nodes of over 200 bytes each), no per-instance recursion at runtime (Digital Logic Sim's main cost), and the Timing engine is always the oracle for tests.
@@ -419,7 +456,7 @@ Engineering rules from the start: struct-of-arrays state (Turing Complete hit a 
 
 ## 15. Open Questions (non-blocking)
 
-- **[OPEN-1]** Tunables: `KERNEL_MAX_LOOP` (6), `KERNEL_MAX_BITS` (10), `LUT_MAX_BITS` (12–16), `LUT_MIN_GATES`, partition size (50–200), `P2_LIMIT` (4). Settle by benchmark in M3/M4.
+- **[OPEN-1]** Tunables: `KERNEL_MAX_LOOP` (6), `KERNEL_MAX_BITS` (12), `DELTA_LIMIT`, `LUT_MAX_BITS` (12–16), `LUT_MIN_GATES`, partition size (50–200), `P2_LIMIT` (4). Settle by benchmark in M3/M4.
 - **[OPEN-2]** Per-gate-type delays in Timing mode (currently uniform 1). This affects STA and tables but no architecture.
 - **[OPEN-3]** Parametric packages (N-bit register) — v2. The netlist must not preclude them.
 - **[OPEN-4]** Should Fast mode support multiple asynchronous clock domains beyond hyperperiod scheduling (e.g. incommensurate periods)? Hyperperiod is fine for integer tick periods. Revisit if users hit it.

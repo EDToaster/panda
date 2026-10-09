@@ -1,0 +1,125 @@
+{
+  "format": "panda/1",
+  "defs": [
+    {
+      "id": "sr_latch",
+      "name": "sr_latch",
+      "version": 0,
+      "pins": [
+        {
+          "name": "S_n",
+          "dir": "in",
+          "width": 1
+        },
+        {
+          "name": "R_n",
+          "dir": "in",
+          "width": 1
+        },
+        {
+          "name": "Q",
+          "dir": "out",
+          "width": 1
+        },
+        {
+          "name": "Q_n",
+          "dir": "out",
+          "width": 1
+        }
+      ],
+      "instances": [
+        {
+          "id": "g0",
+          "kind": {
+            "atom": {
+              "atom": "gate",
+              "op": "nand",
+              "inputs": 2,
+              "width": 1,
+              "reduce": false
+            }
+          }
+        },
+        {
+          "id": "g1",
+          "kind": {
+            "atom": {
+              "atom": "gate",
+              "op": "nand",
+              "inputs": 2,
+              "width": 1,
+              "reduce": false
+            }
+          }
+        }
+      ],
+      "nets": [
+        {
+          "id": "S_n",
+          "width": 1,
+          "ends": [
+            [
+              "pin",
+              "S_n"
+            ],
+            [
+              "g0",
+              "in0"
+            ]
+          ]
+        },
+        {
+          "id": "R_n",
+          "width": 1,
+          "ends": [
+            [
+              "pin",
+              "R_n"
+            ],
+            [
+              "g1",
+              "in0"
+            ]
+          ]
+        },
+        {
+          "id": "Q_n",
+          "width": 1,
+          "ends": [
+            [
+              "g0",
+              "in1"
+            ],
+            [
+              "g1",
+              "out"
+            ],
+            [
+              "pin",
+              "Q_n"
+            ]
+          ]
+        },
+        {
+          "id": "Q",
+          "width": 1,
+          "ends": [
+            [
+              "g0",
+              "out"
+            ],
+            [
+              "g1",
+              "in1"
+            ],
+            [
+              "pin",
+              "Q"
+            ]
+          ]
+        }
+      ]
+    }
+  ],
+  "top": "sr_latch"
+}
