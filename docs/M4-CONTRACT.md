@@ -84,3 +84,28 @@ Every specialization must give exactly the table's result for every single trans
 cycles/s, ns/cycle, partitions evaluated per cycle, ops executed per cycle, kernel transitions
 per cycle — for FastRef and FastSim. No profiler is installed (no perf/valgrind); measure with
 counters and microbenchmarks.
+
+## Facts from M3 (existing APIs to build on)
+- `panda_compile::{compile_kernels, compile_kernels_with_cache, KernelOptions, FastOptions, FastRef}`;
+  `kernels::{KernelSet, Kernel{kind,gates,resolvers,inputs,outputs,nets,cut,owner}, Node}` with
+  `comb_order` (topological, acyclic) and `kernel_of_gate/resolver`.
+- `charz::KernelTable { transition(state,input)->&Transition{next:Option<u32>,latency,order_sensitive}, lookup(&[Logic])->Option<u32> (state id), states_by_input, home_input, is_order_sensitive(state,u,v), is_oscillator() }`,
+  `charz::{input_index, input_vector}` (input bit i = kernel.inputs[i]), `KernelSim` (on-the-fly
+  transitions incl. X; keeps diagnostics), `TableCache`.
+- FastRef semantics details to mirror exactly: read crates/panda-compile/src/fastref.rs (round
+  structure, which kernels transition, DelaySensitive dedupe via `is_order_sensitive(state,u,v)`,
+  Oscillating/IterationLimit handling, power-on first transition, diagnostics forwarding).
+- Differential harness: crates/panda-difftest (`generator::generate(seed,&GenConfig,scale)`,
+  `harness`, `driver`, `cpu8::run_cpu8`). For FastSim vs FastRef you can compare after every
+  event directly (same event sequence, same inputs) — simpler than the Timing comparison.
+
+## panda-kernel facade (built in parallel, against FastRef first)
+SPEC §10 API. Engines behind a trait (Timing = TimingSim, Fast = FastRef now; FastSim plugs in
+when ready via `FastBackend::{Reference, Compiled}`). Incremental edits: `EditOp` over the
+hierarchical `Design` (add/remove instance, connect/disconnect endpoints, add/remove net,
+change atom params, add/remove/replace def) → revalidate → reflatten → recompile only defs whose
+content hash changed (TableCache keyed by structural hash already makes kernel tables reusable);
+state carried across by net name. Snapshots (`State`) restore by net name. Mode switch Timing →
+Fast at quiescence (load kernel states from net values), Fast → Timing (load all net values via
+force). Background compilation: compile on a worker thread; until ready, Fast mode requests run
+on the previous program or FastRef. Diagnostics unified.
