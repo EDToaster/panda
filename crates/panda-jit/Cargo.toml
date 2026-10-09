@@ -3,6 +3,23 @@ name = "panda-jit"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
+description = "Tier-2 Cranelift JIT for panda-fast programs (SPEC §8.9)"
 
 [dependencies]
+panda-fast.workspace = true
+cranelift-codegen = "0.135.5"
+cranelift-frontend = "0.135.5"
+cranelift-jit = "0.135.5"
+cranelift-module = "0.135.5"
+cranelift-native = "0.135.5"
+
+[dev-dependencies]
 panda-netlist.workspace = true
+panda-compile.workspace = true
+panda-difftest.workspace = true
+panda-cpu8.workspace = true
+panda-circuits.workspace = true
+
+[features]
+# Cycle-counter probes of panda-fast's event loop (profiling; see tests/bench.rs).
+prof = ["panda-fast/prof"]

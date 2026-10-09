@@ -181,7 +181,7 @@ fn analyze(
         if c.0 != key || c.1.len() > 4096 {
             *c = (key, TableCache::new());
         }
-        compile_kernels_with_cache(flat, &kopts, &mut c.1)
+        compile_kernels_with_cache(flat, &kopts, &c.1)
     });
     let report = analyze_with(flat, &ks, &tables, &cfg.sta);
     let max_settle = |pred: &dyn Fn(EventKind) -> bool| -> Option<u32> {

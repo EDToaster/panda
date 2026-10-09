@@ -156,7 +156,11 @@ fn all_values(k: &Kernel) -> Vec<Option<Value>> {
     names.iter().map(|n| k.read(n)).collect()
 }
 
-const BACKENDS: [FastBackend; 2] = [FastBackend::Reference, FastBackend::Compiled];
+const BACKENDS: [FastBackend; 3] = [
+    FastBackend::Reference,
+    FastBackend::Compiled,
+    FastBackend::Jit,
+];
 
 // ---------------------------------------------------------------------------------------------
 // Edit atomicity
@@ -322,7 +326,7 @@ fn abab_edits_while_compiling() {
     }
     assert_eq!(k.design().unwrap(), &design);
     k.wait_ready().unwrap();
-    assert_eq!(k.engine(), EngineKind::Fast(FastBackend::Compiled));
+    assert_eq!(k.engine(), EngineKind::Fast(FastBackend::default()));
     assert!(k.read("PROBE").is_none());
     assert_eq!(arch(&k), want[0]);
     for (c, w) in want.iter().enumerate().skip(1) {

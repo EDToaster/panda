@@ -5,6 +5,11 @@
 
 mod common;
 
+/// Native-code hook of `common::pair` (none here: the interpreter; the panda-jit crate runs
+/// this suite with the JIT installed through it).
+#[allow(dead_code)]
+fn native_hook(_: &mut panda_fast::FastSim) {}
+
 use std::sync::Arc;
 
 use common::{Coverage, pair, random_compile, random_lockstep};

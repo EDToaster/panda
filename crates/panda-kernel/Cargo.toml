@@ -10,7 +10,14 @@ panda-timing.workspace = true
 panda-compile.workspace = true
 panda-fast.workspace = true
 panda-sta.workspace = true
+panda-jit = { workspace = true, optional = true }
 serde_json.workspace = true
+
+[features]
+default = ["jit"]
+# Tier 2 of Fast mode: the Cranelift JIT (`FastBackend::Jit`; without the feature it runs as
+# `FastBackend::Compiled`).
+jit = ["dep:panda-jit"]
 
 [dev-dependencies]
 panda-circuits.workspace = true

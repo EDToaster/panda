@@ -5,10 +5,14 @@
 //! * **Timing mode** ([`Mode::Timing`]): the unit-delay reference engine
 //!   ([`panda_timing::TimingSim`]).
 //! * **Fast mode** ([`Mode::Fast`]): the kernel-delta engine of SPEC §6 behind an internal engine
-//!   trait. The backend is chosen with [`KernelOptions::backend`]: [`FastBackend::Compiled`]
-//!   (default, `panda_fast::FastSim`) or [`FastBackend::Reference`] (FastRef semantics, the
-//!   oracle). Both are bit-identical after every event; with `Compiled`, a Reference engine
-//!   built from the same kernel tables serves while the FastSim program compiles.
+//!   trait. The backend is chosen with [`KernelOptions::backend`]: [`FastBackend::Jit`]
+//!   (default: `panda_fast::FastSim` with its Cranelift tier from `panda_jit`),
+//!   [`FastBackend::Compiled`] (the `FastSim` interpreter only) or [`FastBackend::Reference`]
+//!   (FastRef semantics, the oracle). All are bit-identical after every event; with `Compiled`
+//!   and `Jit`, a Reference engine built from the same kernel tables serves while the FastSim
+//!   program compiles, and with `Jit` the interpreting FastSim hot-swaps to native code at an
+//!   event boundary once the JIT has compiled its program (tiers Reference → interpreter →
+//!   JIT; see [`Kernel::jit_active`]).
 //!
 //! # Time
 //!
@@ -136,7 +140,7 @@ pub use panda_fast::CompileOptions as FastCompileOptions;
 pub use panda_netlist::Design;
 pub use panda_sta::TimingReport;
 
-use engine::{Artifacts, FastEngine, LoadReport, build_engine};
+use engine::{Artifacts, FastEngine, JitTier, LoadReport, build_engine};
 use schedule::Schedule;
 use timing::TimingEngine;
 
@@ -375,6 +379,8 @@ pub struct Kernel {
     pristine: bool,
     diags: DiagStore,
     cache: Arc<Mutex<TableCache>>,
+    /// The JIT tier of [`FastBackend::Jit`] (its function cache persists across edits).
+    jit: JitTier,
     generation: u64,
     /// `generation`, shared with the compiler threads (stale jobs stop early).
     current: Arc<AtomicU64>,
@@ -463,6 +469,7 @@ struct CompileJob {
     backend: FastBackend,
     cache: Arc<Mutex<TableCache>>,
     art: Option<Artifacts>,
+    jit: JitTier,
     /// The job's generation and the kernel's current one: once they differ, the result can never
     /// be used, so the job stops at the next stage boundary without sending anything.
     generation: u64,
@@ -488,13 +495,13 @@ impl CompileJob {
                     charz: self.fopts.charz.clone(),
                 };
                 let (ks, tables) = {
-                    let mut cache = lock(&self.cache);
+                    let cache = lock(&self.cache);
                     // Checked again under the lock: stale jobs queued behind a long
                     // characterization do not repeat it.
                     if self.stale() {
                         return;
                     }
-                    panda_compile::compile_kernels_with_cache(&self.flat, &kopts, &mut cache)
+                    panda_compile::compile_kernels_with_cache(&self.flat, &kopts, &cache)
                 };
                 Artifacts {
                     kernels: Arc::new(ks),
@@ -512,6 +519,7 @@ impl CompileJob {
             &self.fopts,
             &self.copts,
             &art,
+            &self.jit,
         )
         .map(|e| (e, art.clone()));
         let failed = r.is_err();
@@ -519,8 +527,15 @@ impl CompileJob {
         if last || failed || self.stale() {
             return;
         }
-        let r =
-            build_engine(self.backend, self.flat, &self.fopts, &self.copts, &art).map(|e| (e, art));
+        let r = build_engine(
+            self.backend,
+            self.flat,
+            &self.fopts,
+            &self.copts,
+            &art,
+            &self.jit,
+        )
+        .map(|e| (e, art));
         emit(self.backend, true, r);
     }
 }
@@ -529,7 +544,9 @@ impl Kernel {
     /// A kernel without a design.
     pub fn new(opts: KernelOptions) -> Kernel {
         let (tx, rx) = channel();
+        let jit = JitTier::new(opts.background);
         Kernel {
+            jit,
             opts,
             loaded: None,
             mode: Mode::Timing,
@@ -753,6 +770,42 @@ impl Kernel {
         self.poll(true)
     }
 
+    /// True if the active Fast engine runs native (JIT) code ([`FastBackend::Jit`] after its code
+    /// was hot-swapped in). Installs code that became ready since the last event.
+    pub fn jit_active(&mut self) -> bool {
+        self.poll(false).ok();
+        match &mut self.active {
+            Some(Active::Fast { engine, .. }) => engine.native_active(),
+            _ => false,
+        }
+    }
+
+    /// Wait (up to `timeout`) until the Fast engine runs native code ([`Kernel::wait_ready`]
+    /// first); false if it does not by then (other backend, Timing mode, or JIT failure).
+    pub fn wait_jit(&mut self, timeout: Duration) -> bool {
+        if self.wait_ready().is_err() {
+            return false;
+        }
+        let t0 = Instant::now();
+        loop {
+            if self.jit_active() {
+                return true;
+            }
+            let pending = match &mut self.active {
+                Some(Active::Fast { engine, .. }) => engine.native_pending(),
+                _ => false,
+            };
+            if !pending {
+                // Finished meanwhile (installed by `native_pending`), failed, or not started.
+                return self.jit_active();
+            }
+            if self.opts.backend != FastBackend::Jit || t0.elapsed() >= timeout {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     /// Compile the Fast-mode program for the current design in the background now (so a later
     /// switch to Fast mode is immediate).
     pub fn precompile(&mut self) {
@@ -777,6 +830,7 @@ impl Kernel {
             backend,
             cache: self.cache.clone(),
             art: loaded.art.clone(),
+            jit: self.jit.clone(),
             generation,
             current: self.current.clone(),
         };
@@ -1521,11 +1575,8 @@ impl Kernel {
                     extract: self.opts.fast.extract.clone(),
                     charz: self.opts.fast.charz.clone(),
                 };
-                let (ks, tables) = panda_compile::compile_kernels_with_cache(
-                    &flat,
-                    &kopts,
-                    &mut lock(&self.cache),
-                );
+                let (ks, tables) =
+                    panda_compile::compile_kernels_with_cache(&flat, &kopts, &lock(&self.cache));
                 let a = Artifacts {
                     kernels: Arc::new(ks),
                     tables: Arc::new(tables),

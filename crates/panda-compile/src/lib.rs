@@ -18,7 +18,8 @@ use std::sync::Arc;
 use panda_netlist::FlatNetlist;
 
 pub use charz::{
-    CharzOptions, KernelSim, KernelTable, Settled, TableCache, Transition, characterize,
+    CacheSnapshot, CharzOptions, KernelSim, KernelTable, Settled, TableCache, Transition,
+    characterize,
 };
 pub use fastref::{FastOptions, FastRef, FastRefStats};
 pub use graph::Node;
@@ -41,22 +42,30 @@ pub fn compile_kernels(
     flat: &FlatNetlist,
     opts: &KernelOptions,
 ) -> (KernelSet, Vec<Option<Arc<KernelTable>>>) {
-    let mut cache = TableCache::new();
-    compile_kernels_with_cache(flat, opts, &mut cache)
+    compile_kernels_with_cache(flat, opts, &TableCache::new())
 }
 
 /// [`compile_kernels`] with a caller-provided cache (reusable across compilations with the same
-/// [`CharzOptions`]).
+/// [`CharzOptions`]; internally synchronized, so `&mut` is not required and the cache can be
+/// shared). Distinct missing kernels are characterized in parallel on up to
+/// [`charz::default_threads`] threads; see [`compile_kernels_with`].
 pub fn compile_kernels_with_cache(
     flat: &FlatNetlist,
     opts: &KernelOptions,
-    cache: &mut TableCache,
+    cache: &TableCache,
+) -> (KernelSet, Vec<Option<Arc<KernelTable>>>) {
+    compile_kernels_with(flat, opts, cache, charz::default_threads())
+}
+
+/// [`compile_kernels_with_cache`] using at most `threads` threads for characterization (`0` or
+/// `1` = on the calling thread only). The result does not depend on `threads`.
+pub fn compile_kernels_with(
+    flat: &FlatNetlist,
+    opts: &KernelOptions,
+    cache: &TableCache,
+    threads: usize,
 ) -> (KernelSet, Vec<Option<Arc<KernelTable>>>) {
     let ks = extract(flat, &opts.extract);
-    let tables = ks
-        .kernels
-        .iter()
-        .map(|k| cache.get_or_characterize(flat, k, &opts.charz))
-        .collect();
+    let tables = cache.characterize_all(flat, &ks.kernels, &opts.charz, threads);
     (ks, tables)
 }

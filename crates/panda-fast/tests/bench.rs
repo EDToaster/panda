@@ -673,7 +673,9 @@ fn profile_breakdown() {
         (probe::LUT, "  of which LUT ops"),
         (probe::DECIDE, "round-boundary decisions"),
         (probe::GENERAL, "  of which general transitions"),
+        (probe::FAST, "  of which fast paths"),
         (probe::WRITE, "state writes"),
+        (probe::WFAST, "  of which fast-path output writes"),
         (probe::FLUSH, "change propagation (inside the above)"),
     ] {
         let c = probe::COUNTERS[slot].load(Ordering::Relaxed) as f64 / n as f64;

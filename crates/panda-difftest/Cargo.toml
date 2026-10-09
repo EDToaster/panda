@@ -11,3 +11,10 @@ panda-compile.workspace = true
 panda-sta.workspace = true
 panda-circuits.workspace = true
 panda-cpu8.workspace = true
+
+[dev-dependencies]
+# End-to-end chain test (tests/end_to_end.rs): the compiled engines and the facade. Dev-only, so
+# the crates that dev-depend on panda-difftest (panda-fast, panda-jit, panda-kernel) see no cycle.
+panda-fast.workspace = true
+panda-jit.workspace = true
+panda-kernel.workspace = true

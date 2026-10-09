@@ -657,6 +657,44 @@ fn run_gates(
     i
 }
 
+/// Evaluate partition `p` alone (the interpreter path of a mixed native / interpreted sweep).
+pub(crate) fn run_partition_alone(prog: &Program, values: &mut [Logic], rt: &mut Rt, p: usize) {
+    let mut chg = std::mem::take(&mut rt.chg);
+    debug_assert!(chg.is_empty());
+    chg.reserve(rt.max_chg);
+    run_partition(prog, values, rt, &mut chg, p);
+    rt.chg = chg;
+}
+
+/// The cold path of LUT `lut` (some support net is not binary), with change propagation: the
+/// interpreter's `run_lut` for that case.
+pub(crate) fn run_lut_cold(prog: &Program, values: &mut [Logic], rt: &mut Rt, lut: u32) {
+    let l = &prog.luts[lut as usize];
+    rt.lut_last[lut as usize] = NONE;
+    let mut chg = std::mem::take(&mut rt.chg);
+    debug_assert!(chg.is_empty());
+    run_cold(prog, values, &mut chg, l);
+    clear_bit(&mut rt.lut_stale, lut);
+    if !chg.is_empty() {
+        rt.marks.flush(prog, values, &chg);
+        chg.clear();
+    }
+    rt.chg = chg;
+}
+
+/// Resolver op `i` of [`Program::ops`] with change propagation.
+pub(crate) fn run_resolve_alone(prog: &Program, values: &mut [Logic], rt: &mut Rt, i: u32) {
+    let (op, rec) = (prog.ops[i as usize], prog.op_rec[i as usize]);
+    let mut chg = std::mem::take(&mut rt.chg);
+    debug_assert!(chg.is_empty());
+    run_resolve(prog, values, rt, &mut chg, op, rec);
+    if !chg.is_empty() {
+        rt.marks.flush(prog, values, &chg);
+        chg.clear();
+    }
+    rt.chg = chg;
+}
+
 /// Recompute the outputs of the gates absorbed into fused ops ([`Program::fcold`]) from their
 /// (up-to-date) inputs.
 pub(crate) fn run_fcold_silent(prog: &Program, values: &mut [Logic]) {

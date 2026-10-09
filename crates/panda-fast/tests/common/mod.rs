@@ -26,7 +26,8 @@ pub fn pair(
         fast: fast.clone(),
         compile: compile.clone(),
     };
-    let fs = FastSim::from_parts(flat.clone(), opts, ks, tables).expect("FastSim");
+    let mut fs = FastSim::from_parts(flat.clone(), opts, ks, tables).expect("FastSim");
+    crate::native_hook(&mut fs);
     (fr, fs)
 }
 

@@ -1,6 +1,6 @@
 # Panda — Digital Logic Sandbox: Design Spec
 
-> Status: **v0.3**: M1 in progress. v0.3 defines Fast mode by the kernel-delta reference algorithm (§6).
+> Status: **v0.4**: M1–M4 implemented, M5 (JIT) in progress. v0.3 defined Fast mode by the kernel-delta reference algorithm (§6); v0.4 records implementation outcomes (§0, §11, §14.5).
 > Implementation language: **Rust**.
 > Conventions: **MUST / SHOULD / MAY** are normative. `[OPEN]` marks unresolved questions.
 > Evidence behind each decision is summarized in §14.
@@ -22,6 +22,9 @@
 | D9 | Build order | Kernel first (reference sim → compiler → fast engine → JIT), editor UI last. |
 | D10 | Fast ↔ Timing link | Fast mode is **defined** by synchronous semantics and **equals** Timing mode whenever static timing checks pass (§9). |
 | D11 | Packaged combinational components | **Ideal blocks**: glitch-free, per-output fixed latency, compiled. |
+| D12 | Fast-mode reference | FastRef, a direct interpreter of §6.2, is the oracle. Compiled engines must match it bit-for-bit, including diagnostics kinds per event. |
+| D13 | Compiled execution | Round-faithful (kernels transition only at round boundaries). Kernel ops are specialized per clock phase into opaque/transparent fast paths with exactness proven from the tables. Single-pass phases are not used. |
+| D14 | Reference CPU ROM | Panda-8 default ROM is a sum-of-products decoder (3,671 gates total). The literal mux-tree ROM (7,726 gates) remains a variant. Both compile to LUTs. |
 
 ---
 

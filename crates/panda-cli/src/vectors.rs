@@ -15,6 +15,8 @@
 //! | `expect S=V [S=V ...]` | check signals now. Each `S=V` is one check. |
 //! | `print S [S ...]` | print current values (for debugging; never fails). |
 //! | `reset` | power-on reset (tick 0; all gate outputs `X`). Input values set so far are kept. |
+//! | `cycle [N]` | advance `N` clock cycles (default `1`) of the reference clock: to the tick just before the `N`-th rising edge after the next tick (see [`crate::clock`]). Needs a running `Clock`. |
+//! | `mode timing\|fast` | switch the simulation mode (state is carried over by the `panda_kernel` facade). |
 //!
 //! ## Values
 //!
@@ -39,6 +41,29 @@
 //! expect Q=1 Q_n=0
 //! ```
 //!
+//! # Modes
+//!
+//! A file without `mode` lines runs on a plain [`TimingSim`] ([`Program::run`]). A file with
+//! `mode` lines (or `panda test --mode fast`) runs on a [`panda_kernel::Kernel`]
+//! ([`Program::run_kernel`]), starting in Timing mode unless the runner says otherwise. `mode fast`
+//! compiles the design (synchronously) and continues in Fast mode (SPEC §6): time advances in
+//! whole phases, so in Fast mode
+//!
+//! * `run N` ends at the end of the phase containing the target tick. Targets accumulate from
+//!   power-on exactly as in Timing mode (`run 14` then `run 36` targets tick 50, whatever phase
+//!   end the first `run` stopped at), so a file written for Timing mode samples the same phases;
+//! * `cycle N` is the natural step for clocked designs (identical sample points in both modes,
+//!   also counted from power-on: the first `cycle` ends one tick before the first rising edge);
+//! * `settle` processes pending input changes; on a design without running clocks it also lets
+//!   every remaining source change (a `PowerOnReset` release) happen. It fails only if the design
+//!   does not settle within the bound (largest `settle` argument of the file);
+//! * input changes are their own event after the last processed clock edge.
+//! * `reset` powers on again and ends at the end of the first phase (Fast mode has no
+//!   mid-phase sample points).
+//!
+//! On the kernel runner in Timing mode, `settle` on a design with running clocks advances `MAX`
+//! ticks and fails (as on the plain runner); without running clocks it settles phase by phase.
+//!
 //! # Running
 //!
 //! [`Program::parse`] checks syntax and resolves every name and literal against the netlist up
@@ -51,10 +76,13 @@
 use std::fmt;
 use std::io::{self, Write};
 
+use panda_kernel::{Kernel, Mode, StepUnit};
 use panda_netlist::flat::FlatNetlist;
 use panda_netlist::{Diagnostic, Logic, Value};
 use panda_timing::TimingSim;
 
+use crate::clock::{self, RefClock};
+use crate::fastmode;
 use crate::signals::{Signal, resolve};
 use crate::vcd::{self, VcdWriter};
 
@@ -155,6 +183,10 @@ pub enum Command {
     Print(Vec<Signal>),
     /// Power-on reset.
     Reset,
+    /// Advance N cycles of the reference clock.
+    Cycle(u64),
+    /// Switch the simulation mode.
+    Mode(Mode),
 }
 
 /// A command with its source line.
@@ -268,6 +300,9 @@ impl Report {
 pub struct Program {
     /// The commands in order.
     pub steps: Vec<Step>,
+    /// Reference clock of `cycle` commands (default: the first running `Clock` of the netlist;
+    /// may be replaced before running, e.g. by `panda test --clock`).
+    pub clock: Option<RefClock>,
 }
 
 fn parse_count(arg: Option<&str>, default: u64, what: &str) -> Result<u64, String> {
@@ -292,7 +327,7 @@ fn input_width(nl: &FlatNetlist, pin: &str) -> Result<u32, String> {
         .ok_or_else(|| format!("'{pin}' is not a top-level input pin"))
 }
 
-fn parse_line(nl: &FlatNetlist, words: &[&str]) -> Result<Command, Vec<String>> {
+fn parse_line(nl: &FlatNetlist, clock: Option<&RefClock>, words: &[&str]) -> Result<Command, Vec<String>> {
     let (kw, args) = (words[0], &words[1..]);
     let one = |e: String| vec![e];
     let max_args = |n: usize| {
@@ -364,7 +399,23 @@ fn parse_line(nl: &FlatNetlist, words: &[&str]) -> Result<Command, Vec<String>> 
             max_args(0)?;
             Ok(Command::Reset)
         }
-        _ => Err(one(format!("unknown command '{kw}' (expected set, run, tick, settle, pulse, expect, print, reset)"))),
+        "cycle" => {
+            max_args(1)?;
+            if clock.is_none() {
+                return Err(one("'cycle' needs a design with a running Clock".into()));
+            }
+            Ok(Command::Cycle(parse_count(args.first().copied(), 1, kw).map_err(one)?))
+        }
+        "mode" => {
+            max_args(1)?;
+            let m = args.first().ok_or_else(|| one("'mode' needs 'timing' or 'fast'".into()))?;
+            Ok(Command::Mode(
+                fastmode::parse_mode(m).ok_or_else(|| one(format!("unknown mode '{m}' (expected timing or fast)")))?,
+            ))
+        }
+        _ => Err(one(format!(
+            "unknown command '{kw}' (expected set, run, tick, settle, pulse, cycle, expect, print, reset, mode)"
+        ))),
     }
 }
 
@@ -373,6 +424,7 @@ impl Program {
     pub fn parse(src: &str, nl: &FlatNetlist) -> Result<Program, Vec<VectorError>> {
         let mut steps = Vec::new();
         let mut errors = Vec::new();
+        let clock = RefClock::find(nl, None).ok().flatten();
         for (i, raw) in src.lines().enumerate() {
             let line = i + 1;
             let text = raw.split('#').next().unwrap_or("");
@@ -380,12 +432,12 @@ impl Program {
             if words.is_empty() {
                 continue;
             }
-            match parse_line(nl, &words) {
+            match parse_line(nl, clock.as_ref(), &words) {
                 Ok(command) => steps.push(Step { line, command }),
                 Err(es) => errors.extend(es.into_iter().map(|message| VectorError { line, message })),
             }
         }
-        if errors.is_empty() { Ok(Program { steps }) } else { Err(errors) }
+        if errors.is_empty() { Ok(Program { steps, clock }) } else { Err(errors) }
     }
 
     /// Number of `expect` checks in the program.
@@ -396,7 +448,22 @@ impl Program {
             .sum()
     }
 
-    /// Run on `sim` (which is used as-is: it is *not* reset first).
+    /// True if the program has `mode` lines (so it needs [`Program::run_kernel`]).
+    pub fn uses_modes(&self) -> bool {
+        self.steps.iter().any(|s| matches!(s.command, Command::Mode(_)))
+    }
+
+    /// The largest `settle` bound of the program (at least the default), used as the kernel
+    /// runner's settle bound.
+    pub fn max_settle(&self) -> u64 {
+        self.steps
+            .iter()
+            .filter_map(|s| if let Command::Settle(m) = s.command { Some(m) } else { None })
+            .fold(DEFAULT_SETTLE_MAX, u64::max)
+    }
+
+    /// Run on `sim` (which is used as-is: it is *not* reset first). `mode timing` lines are
+    /// no-ops; a `mode fast` line is a failed check (Fast mode needs [`Program::run_kernel`]).
     pub fn run(&self, sim: &mut TimingSim) -> Report {
         self.run_inner::<io::Sink>(sim, None).expect("no I/O without a VCD writer")
     }
@@ -479,6 +546,19 @@ impl Program {
                         w.sample(sim)?;
                     }
                 }
+                Command::Cycle(n) => {
+                    let clk = self.clock.as_ref().expect("checked at parse time");
+                    clock::run_cycles(sim, clk, *n, vcd.as_deref_mut())?;
+                }
+                Command::Mode(Mode::Timing) => {}
+                Command::Mode(Mode::Fast) => report.checks.push(Check {
+                    line,
+                    tick: sim.tick(),
+                    what: "mode fast".into(),
+                    expected: "Fast mode".into(),
+                    actual: "not supported by the Timing-only runner".into(),
+                    passed: false,
+                }),
             }
             for d in sim.take_diagnostics() {
                 report.diagnostics.push(TimedDiagnostic { line, tick: sim.tick(), diagnostic: d });
@@ -486,6 +566,202 @@ impl Program {
         }
         Ok(report)
     }
+}
+
+impl Program {
+    /// Run on a loaded `kernel` (used as-is, in its current mode), switching modes at `mode`
+    /// lines (see the module docs, "Modes"). A kernel passed in Fast mode is assumed to be freshly
+    /// powered on (its program time starts at tick 0, whatever phase end the engine is at). With `vcd`, values are sampled after every tick in
+    /// Timing mode (`run`, `cycle`), after every phase in Fast mode, and after each other command.
+    pub fn run_kernel<W: Write>(&self, kernel: &mut Kernel, mut vcd: Option<&mut VcdWriter<W>>) -> io::Result<Report> {
+        let mut r = KernelRun { k: kernel, clock: self.clock.as_ref(), report: Report::default(), logical: 0 };
+        // A kernel in Fast mode is at the end of a phase; the program's time starts at the
+        // power-on tick (0) it stands for (see the module docs, "Modes").
+        r.logical = if r.k.mode() == Mode::Fast { 0 } else { r.k.tick() };
+        r.sample(vcd.as_deref_mut())?;
+        for step in &self.steps {
+            let line = step.line;
+            if r.k.mode() == Mode::Timing {
+                r.logical = r.k.tick();
+            }
+            match &step.command {
+                Command::Set(items) => {
+                    for (pin, v) in items {
+                        r.k.set_input(pin, v).expect("pin and width checked at parse time");
+                    }
+                }
+                Command::Run(n) => r.advance(Advance::Ticks(*n), vcd.as_deref_mut())?,
+                Command::Cycle(n) => r.advance(Advance::Cycles(*n), vcd.as_deref_mut())?,
+                Command::Settle(max) => {
+                    if !r.settle(*max, vcd.as_deref_mut())? {
+                        r.failed_settle(line, format!("settle {max}"));
+                    }
+                }
+                Command::Pulse { pin, count } => {
+                    let (one, zero) = (Value::from_bool(true), Value::from_bool(false));
+                    for _ in 0..*count {
+                        let mut ok = true;
+                        for v in [&one, &zero] {
+                            r.k.set_input(pin, v).expect("pin checked at parse time");
+                            ok &= r.settle(DEFAULT_SETTLE_MAX, vcd.as_deref_mut())?;
+                        }
+                        if !ok {
+                            r.failed_settle(line, format!("pulse {pin}"));
+                            break;
+                        }
+                    }
+                }
+                Command::Expect(items) => {
+                    let values = fastmode::values(r.k);
+                    for (sig, exp) in items {
+                        let actual = gather_values(&values, sig);
+                        r.report.checks.push(Check {
+                            line,
+                            tick: r.k.tick(),
+                            what: sig.name.clone(),
+                            expected: exp.to_string(),
+                            actual: actual.to_string(),
+                            passed: exp.matches(&actual),
+                        });
+                    }
+                }
+                Command::Print(sigs) => {
+                    let values = fastmode::values(r.k);
+                    for sig in sigs {
+                        r.report.printed.push(Printed {
+                            line,
+                            tick: r.k.tick(),
+                            name: sig.name.clone(),
+                            value: gather_values(&values, sig),
+                        });
+                    }
+                }
+                Command::Reset => {
+                    let design = r.k.design().cloned().expect("kernel has a design");
+                    r.k.load(design).expect("the loaded design reloads");
+                    if r.k.mode() == Mode::Fast {
+                        r.k.wait_ready().ok();
+                    }
+                    r.logical = 0;
+                    r.sample(vcd.as_deref_mut())?;
+                }
+                Command::Mode(m) => {
+                    if let Err(e) = fastmode::enter_mode(r.k, *m) {
+                        r.report.checks.push(Check {
+                            line,
+                            tick: r.k.tick(),
+                            what: format!("mode {}", if *m == Mode::Fast { "fast" } else { "timing" }),
+                            expected: "ready".into(),
+                            actual: e,
+                            passed: false,
+                        });
+                    }
+                    r.sample(vcd.as_deref_mut())?;
+                }
+            }
+            let tick = r.k.tick();
+            for d in r.k.diagnostics().to_vec() {
+                r.report.diagnostics.push(TimedDiagnostic { line, tick, diagnostic: d });
+            }
+            r.k.clear_diagnostics();
+        }
+        Ok(r.report)
+    }
+}
+
+/// How far [`KernelRun::advance`] goes.
+#[derive(Clone, Copy, Debug)]
+enum Advance {
+    Ticks(u64),
+    Cycles(u64),
+}
+
+/// State of one [`Program::run_kernel`].
+struct KernelRun<'a> {
+    k: &'a mut Kernel,
+    clock: Option<&'a RefClock>,
+    report: Report,
+    /// The tick the program has asked for so far: Timing mode reaches it exactly, Fast mode
+    /// ends at the end of the phase containing it (so `run`/`cycle` targets accumulate the same
+    /// way in both modes, counted from power-on).
+    logical: u64,
+}
+
+impl KernelRun<'_> {
+    fn sample<W: Write>(&self, vcd: Option<&mut VcdWriter<W>>) -> io::Result<()> {
+        match vcd {
+            Some(w) => w.sample_values(self.k.tick(), &fastmode::values(self.k)),
+            None => Ok(()),
+        }
+    }
+
+    fn failed_settle(&mut self, line: usize, what: String) {
+        self.report.checks.push(Check {
+            line,
+            tick: self.k.tick(),
+            what,
+            expected: "quiescent".into(),
+            actual: "still active".into(),
+            passed: false,
+        });
+    }
+
+    fn advance<W: Write>(&mut self, how: Advance, vcd: Option<&mut VcdWriter<W>>) -> io::Result<()> {
+        let base = self.logical;
+        let target = match how {
+            Advance::Ticks(n) => base.saturating_add(n),
+            Advance::Cycles(n) => self.clock.expect("checked at parse time").cycles_end(base, n),
+        };
+        self.logical = target;
+        // Apply pending input changes even when no time passes.
+        self.k.step(0, StepUnit::Tick);
+        let Some(w) = vcd else {
+            self.k.run_to(target);
+            return Ok(());
+        };
+        while self.k.tick() < target {
+            let before = self.k.tick();
+            let unit = if self.k.mode() == Mode::Timing { StepUnit::Tick } else { StepUnit::Phase };
+            self.k.step(1, unit);
+            if self.k.tick() == before {
+                break;
+            }
+            w.sample_values(self.k.tick(), &fastmode::values(self.k))?;
+        }
+        Ok(())
+    }
+
+    /// See the module docs ("Modes"). Returns true if settled.
+    fn settle<W: Write>(&mut self, max: u64, mut vcd: Option<&mut VcdWriter<W>>) -> io::Result<bool> {
+        if self.clock.is_some() {
+            if self.k.mode() == Mode::Fast {
+                self.k.step(0, StepUnit::Tick);
+                self.sample(vcd)?;
+                return Ok(true);
+            }
+            self.advance(Advance::Ticks(max), vcd)?;
+            return Ok(false);
+        }
+        let start = self.k.tick();
+        let settled = loop {
+            let before = self.k.tick();
+            self.k.step(1, StepUnit::Phase);
+            self.sample(vcd.as_deref_mut())?;
+            if self.k.tick() == before {
+                break true;
+            }
+            if self.k.tick() - start >= max {
+                break false;
+            }
+        };
+        self.logical = self.logical.max(self.k.tick());
+        Ok(settled)
+    }
+}
+
+/// Value of a signal from a full net-value array.
+pub fn gather_values(values: &[Logic], sig: &Signal) -> Value {
+    Value::from_bits(&sig.nets.iter().map(|&n| values[n as usize]).collect::<Vec<_>>())
 }
 
 /// Current value of a signal.

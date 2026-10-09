@@ -33,6 +33,15 @@
 //! last-transition inputs of a synced kernel are its inputs at the previous boundary, recovered
 //! from the boundary log ([`exec::Marks::boundary_value`]).
 //!
+//! # Native tier
+//!
+//! With native code installed ([`FastSim::install_native`], [`crate::native`]), sweeps call the
+//! native partition functions, and a scheduled or input event whose clock tuple has a native
+//! event function runs its timed-source writes, sweeps and round loop natively until a round
+//! boundary needs the general machinery; the loop above then continues from that decision
+//! point. Native code works on the same state and has the same effects, so every statistic
+//! except `native_*` is identical to the interpreter's.
+//!
 //! # Lazy nets
 //!
 //! LUT-internal nets, the outputs of gates fused into other ops ([`crate::fuse`]) and the
@@ -59,6 +68,7 @@ use crate::compile::{CompileOptions, compile};
 use crate::exec::{self, Rt, clear_bit, for_bits, set_bit, test_bit};
 use crate::fxhash::FxHashMap;
 use crate::ir::{KTableData, KernelOpKind, NONE, Program, VACT_OPAQUE};
+use crate::native::{Env, EventCtx, NativeCode, NativeSlot};
 use crate::probe;
 use crate::schedule::Timed;
 
@@ -109,6 +119,12 @@ pub struct FastSimStats {
     pub transparent: u64,
     /// Fast-path transitions that needed per-kernel work (the rest are word-level skips).
     pub fast_evals: u64,
+    /// Round boundaries handled by native event functions (part of `rounds`).
+    pub native_rounds: u64,
+    /// Native event functions that stopped at a round decision point for the interpreter to
+    /// continue (a kernel needed the general path, an order check, explicit inputs, or the delta
+    /// limit was reached).
+    pub native_bails: u64,
 }
 
 /// What a kernel transitions to in the current round.
@@ -154,7 +170,15 @@ pub struct FastSim {
     opts: FastSimOptions,
     ks: KernelSet,
     tables: Vec<Option<Arc<KernelTable>>>,
-    prog: Program,
+    prog: Arc<Program>,
+    /// Installed native code (tier 2) for `prog`, if any.
+    native: Option<Arc<NativeCode>>,
+    /// Mailbox of a background native compiler (polled at every event boundary).
+    native_slot: Option<Arc<NativeSlot>>,
+    /// Scratch of the native event functions (`EventCtx::pending`): two words per kernel.
+    native_pending: Vec<u32>,
+    /// Prebuilt contexts of the native event functions.
+    native_cache: Option<Box<NativeCache>>,
 
     timed: Vec<(NetIdx, Timed)>,
     input_srcs: Vec<(NetIdx, u32, u32)>,
@@ -205,6 +229,8 @@ pub struct FastSim {
     next_tick: Option<u64>,
     /// Per timed source: its next change tick (`u64::MAX`: none).
     tnext: Vec<u64>,
+    /// Per timed source: its bit in the clock tuple (`Program::timed_nets`), or [`NONE`].
+    timed_bit: Vec<u32>,
     res_reported: Vec<bool>,
     diags: Vec<Diagnostic>,
     stats: FastSimStats,
@@ -298,6 +324,15 @@ impl FastSim {
             .collect();
         let nk = ks.kernels.len();
         let kw = nk.div_ceil(64);
+        let timed_bit = timed
+            .iter()
+            .map(|&(net, _)| {
+                prog.timed_nets
+                    .iter()
+                    .position(|&n| n == net)
+                    .map_or(NONE, |b| b as u32)
+            })
+            .collect();
         let mut fs = FastSim {
             rt: Rt::new(&prog),
             values: UnsafeCell::new(vec![Logic::X; prog.num_nets as usize]),
@@ -319,7 +354,11 @@ impl FastSim {
             opts,
             ks,
             tables,
-            prog,
+            prog: Arc::new(prog),
+            native: None,
+            native_slot: None,
+            native_pending: vec![0; 2 * nk],
+            native_cache: None,
             timed,
             input_srcs,
             undriven,
@@ -331,6 +370,7 @@ impl FastSim {
             tick: 0,
             next_tick: None,
             tnext: Vec::new(),
+            timed_bit,
             pending: Vec::new(),
             fast_pending: Vec::new(),
             frozen_list: Vec::new(),
@@ -354,6 +394,68 @@ impl FastSim {
     /// The compiled program (introspection: ops, partitions, LUTs, kernel classes).
     pub fn program(&self) -> &Program {
         &self.prog
+    }
+
+    /// The compiled program, shared (what a native backend compiles; see
+    /// [`FastSim::install_native`]).
+    pub fn program_arc(&self) -> &Arc<Program> {
+        &self.prog
+    }
+
+    /// Install native code (tier 2) for this engine's program; it is used from the next sweep
+    /// on. The code must have been compiled for exactly this program (checked by identity).
+    pub fn install_native(&mut self, code: Arc<NativeCode>) -> Result<(), String> {
+        if !Arc::ptr_eq(code.program(), &self.prog) {
+            return Err("native code was compiled for a different program".into());
+        }
+        self.native = Some(code);
+        Ok(())
+    }
+
+    /// Remove the installed native code (back to the interpreter).
+    pub fn remove_native(&mut self) -> Option<Arc<NativeCode>> {
+        self.native.take()
+    }
+
+    /// The installed native code, if any.
+    pub fn native(&self) -> Option<&Arc<NativeCode>> {
+        self.native.as_ref()
+    }
+
+    /// Attach a mailbox from which native code is installed at the next event boundary once a
+    /// background compiler publishes it (hot swap). Code for another program is ignored.
+    pub fn set_native_slot(&mut self, slot: Arc<NativeSlot>) {
+        self.native_slot = Some(slot);
+        self.poll_native();
+    }
+
+    /// Install native code waiting in the native slot now (normally done at the next event
+    /// boundary); returns true if native code is installed.
+    pub fn poll_native_slot(&mut self) -> bool {
+        self.poll_native();
+        self.native.is_some()
+    }
+
+    /// Install native code waiting in the slot, if any.
+    #[inline]
+    fn poll_native(&mut self) {
+        if let Some(slot) = &self.native_slot
+            && slot.is_ready()
+            && let Some(code) = slot.take()
+        {
+            let _ = self.install_native(code);
+        }
+    }
+
+    /// Evaluate the dirty partitions (native code where installed).
+    #[inline]
+    fn sweep(&mut self) {
+        match &self.native {
+            Some(code) => {
+                crate::native::sweep_native(&self.prog, self.values.get_mut(), &mut self.rt, code)
+            }
+            None => exec::sweep(&self.prog, self.values.get_mut(), &mut self.rt),
+        }
     }
 
     /// The kernel set.
@@ -519,7 +621,7 @@ impl FastSim {
         // Combinational logic from the loaded kernel nets and sources; its marks are dropped
         // (FastRef clears the candidates after this evaluation).
         fill_bits(&mut m.dirty, self.prog.partitions.len());
-        exec::sweep(&self.prog, self.values.get_mut(), &mut self.rt);
+        self.sweep();
         let m = &mut self.rt.marks;
         m.kpending.fill(0);
         m.bepoch.fill(u32::MAX);
@@ -629,6 +731,7 @@ impl FastSim {
     /// else the next scheduled source event. Returns the event tick, or `None` if there is nothing
     /// to do.
     pub fn step_event(&mut self) -> Option<u64> {
+        self.poll_native();
         if self.inputs_pending {
             self.inputs_pending = false;
             // Same tick: the timed sources keep their values.
@@ -638,11 +741,76 @@ impl FastSim {
         }
         let t = self.next_event_tick()?;
         self.tick = t;
-        let ta = probe::start();
-        self.apply_timed();
-        probe::stop(probe::TIMED, ta);
-        self.process_event();
+        if !self.native_timed_event() {
+            let ta = probe::start();
+            self.apply_timed();
+            probe::stop(probe::TIMED, ta);
+            self.process_event();
+        }
         Some(t)
+    }
+
+    /// A scheduled event at `self.tick` processed by a native event function, which also writes
+    /// the timed-source changes (see `native::EventCtx`); false (nothing done) if there is no
+    /// event function for the event's clock tuple.
+    #[inline]
+    fn native_timed_event(&mut self) -> bool {
+        let Some(code) = self.native.as_ref() else {
+            return false;
+        };
+        if !code.has_events() {
+            return false;
+        }
+        let t = self.tick;
+        let values = self.values.get_mut();
+        let mut tuple = self
+            .prog
+            .timed_nets
+            .iter()
+            .enumerate()
+            .fold(0u32, |a, (i, &n)| {
+                a | u32::from(values[n as usize] == Logic::One) << i
+            });
+        let mut changed = 0u32;
+        for (i, &(net, _)) in self.timed.iter().enumerate() {
+            if self.tnext[i] != t {
+                continue;
+            }
+            let bit = self.timed_bit[i];
+            if bit == NONE {
+                return false;
+            }
+            // Clocks flip; a power-on reset falls to 0 (its only change).
+            let one = match self.timed[i].1 {
+                Timed::Clock { .. } => values[net as usize] != Logic::One,
+                Timed::PowerOnReset { .. } => false,
+            };
+            changed |= 1 << bit;
+            tuple = tuple & !(1 << bit) | u32::from(one) << bit;
+        }
+        if code.event(tuple).is_none() {
+            return false;
+        }
+        for (i, &(net, src)) in self.timed.iter().enumerate() {
+            if self.tnext[i] != t {
+                continue;
+            }
+            let next = match src {
+                Timed::Clock { period, high, .. } => {
+                    let rising = values[net as usize] != Logic::One;
+                    t.saturating_add(if rising { high } else { period - high })
+                }
+                Timed::PowerOnReset { .. } => u64::MAX,
+            };
+            debug_assert_eq!(
+                Some(next).filter(|&x| x != u64::MAX),
+                src.next_change_after(t)
+            );
+            self.tnext[i] = next;
+        }
+        self.next_tick = self.compute_next_tick();
+        self.process_event_with(Some((tuple, changed)));
+        true
     }
 
     /// Process up to `n` events (stops early when there is nothing to do).
@@ -853,7 +1021,73 @@ impl FastSim {
     #[doc(hidden)]
     pub fn bench_full_sweep(&mut self) {
         fill_bits(&mut self.rt.marks.dirty, self.prog.partitions.len());
-        exec::sweep(&self.prog, self.values.get_mut(), &mut self.rt);
+        self.sweep();
+    }
+
+    /// Test hook: the engine's internal runtime state between events, by component (raw net
+    /// values except the outputs of fused-away gates, which only native code may store;
+    /// change-propagation marks; the boundary log; LUT and kernel bookkeeping). Two engines
+    /// over the same program that took the same steps (in any mix of tiers) have equal states:
+    /// the differential tests compare them to catch divergences before they become observable.
+    #[doc(hidden)]
+    pub fn debug_runtime_state(&self) -> Vec<(&'static str, Vec<u64>)> {
+        let m = &self.rt.marks;
+        let w32 = |v: &[u32]| v.iter().map(|&x| u64::from(x)).collect::<Vec<u64>>();
+        let values = self
+            .values_ref()
+            .iter()
+            .zip(&self.prog.lazy_owner)
+            .map(|(v, &o)| {
+                if o == crate::ir::LAZY_FUSED {
+                    u64::MAX
+                } else {
+                    u64::from(v.code())
+                }
+            })
+            .collect();
+        vec![
+            ("values", values),
+            ("dirty", m.dirty.clone()),
+            ("kpending", m.kpending.clone()),
+            ("fastok", m.fastok.clone()),
+            ("ddirty", m.ddirty.clone()),
+            ("bval", m.bval.iter().map(|v| u64::from(v.code())).collect()),
+            ("bepoch", w32(&m.bepoch)),
+            ("epoch", vec![u64::from(m.epoch)]),
+            ("kin", w32(&m.kin)),
+            ("kin_prev", w32(&m.kin_prev)),
+            ("lut_stale", self.rt.lut_stale.clone()),
+            ("lut_last", w32(&self.rt.lut_last)),
+            (
+                "res_contending",
+                self.rt
+                    .res_contending
+                    .iter()
+                    .map(|&b| u64::from(b))
+                    .collect(),
+            ),
+            ("lazy", self.lazy.clone()),
+            ("unsynced", self.unsynced.clone()),
+            ("kob", w32(&self.kob)),
+            ("tlast", self.tlast.clone()),
+        ]
+    }
+
+    /// Test hook: jump the boundary log's interval counter to `epoch` (to exercise its
+    /// wrap-around at `u32::MAX` in every tier). Between events no log entry belongs to the
+    /// current interval (every event ends by starting a new one), so a jump forward to an
+    /// epoch above every logged one does not change the simulation.
+    #[doc(hidden)]
+    pub fn set_epoch_for_test(&mut self, epoch: u32) {
+        assert!(
+            self.rt
+                .marks
+                .bepoch
+                .iter()
+                .all(|&e| e == u32::MAX || e < epoch),
+            "set_epoch_for_test: only forward jumps"
+        );
+        self.rt.marks.epoch = epoch;
     }
 
     // -----------------------------------------------------------------------------------------
@@ -980,15 +1214,37 @@ impl FastSim {
 
     /// Rounds 0.. of SPEC §6.2 for the source values already applied (round-faithful).
     fn process_event(&mut self) {
+        self.process_event_with(None);
+    }
+
+    /// [`FastSim::process_event`]; with `Some((tuple, timed))`, the event's clock tuple is
+    /// `tuple` and the timed sources in `timed` (tuple bits) are not written yet: the native
+    /// event function of `tuple` (which must exist) writes them.
+    fn process_event_with(&mut self, native: Option<(u32, u32)>) {
         self.clean.set(false);
         self.stats.events += 1;
-        let t0 = probe::start();
-        exec::sweep(&self.prog, self.values.get_mut(), &mut self.rt);
-        probe::stop(probe::SWEEP, t0);
-        let tuple = self.current_tuple();
-        let words = self.prog.kernel_words as usize;
+        // The clock tuple only depends on sources (already written).
+        let (tuple, timed) = native.unwrap_or_else(|| (self.current_tuple(), 0));
         let mut rounds_since_freeze = 0u32;
         let mut event_rounds = 0u32;
+        match self.native_event(tuple, timed) {
+            Some((rounds, true)) => {
+                self.stats.max_rounds = self.stats.max_rounds.max(rounds);
+                self.check_contention();
+                return;
+            }
+            Some((rounds, false)) => {
+                // Continue at the round decision point where native code stopped.
+                rounds_since_freeze = rounds;
+                event_rounds = rounds;
+            }
+            None => {
+                let t0 = probe::start();
+                self.sweep();
+                probe::stop(probe::SWEEP, t0);
+            }
+        }
+        let words = self.prog.kernel_words as usize;
         let mut pending = std::mem::take(&mut self.pending);
         let mut fast_pending = std::mem::take(&mut self.fast_pending);
         let mut general = std::mem::take(&mut self.general);
@@ -1051,6 +1307,7 @@ impl FastSim {
                     self.stats.opaque_skips += n;
                 } else {
                     let mut cnt = FastCounts::default();
+                    let tf = probe::start();
                     fast_round(
                         &self.prog,
                         self.values.get_mut(),
@@ -1066,6 +1323,7 @@ impl FastSim {
                         &self.check_cache,
                         &mut cnt,
                     );
+                    probe::stop(probe::FAST, tf);
                     let n = cnt.opaque + cnt.transparent;
                     self.stats.transitions += n;
                     self.stats.table_hits += n;
@@ -1109,6 +1367,7 @@ impl FastSim {
                 }
             }
             if !fast_pending.is_empty() {
+                let tw = probe::start();
                 write_fast(
                     &self.prog,
                     self.values.get_mut(),
@@ -1116,6 +1375,7 @@ impl FastSim {
                     &mut self.kob,
                     &fast_pending,
                 );
+                probe::stop(probe::WFAST, tw);
                 fast_pending.clear();
             }
             let wrote = !pending.is_empty() || self.rt.marks.kpending.iter().any(|&w| w != 0);
@@ -1130,7 +1390,7 @@ impl FastSim {
                 break;
             }
             let t3 = probe::start();
-            exec::sweep(&self.prog, self.values.get_mut(), &mut self.rt);
+            self.sweep();
             probe::stop(probe::SWEEP, t3);
         }
         self.pending = pending;
@@ -1142,6 +1402,113 @@ impl FastSim {
             clear_bit(&mut self.frozen, k);
         }
         self.check_contention();
+    }
+
+    /// Run the native event function of `tuple` (if installed): `Some((rounds, done))` with the
+    /// rounds it completed and whether it finished the event (else it stopped at a round
+    /// decision point, after the initial sweep; see `native::EventCtx`), or `None`.
+    #[inline]
+    fn native_event(&mut self, tuple: u32, timed: u32) -> Option<(u32, bool)> {
+        if tuple == NONE {
+            return None;
+        }
+        let code = self.native.as_ref()?;
+        let f = code.event(tuple)?;
+        let parts = code.table();
+        debug_assert!(self.frozen.iter().all(|&w| w == 0));
+        // Contexts are cached (rebuilding them costs ~9% of the JIT's event throughput) and
+        // rebuilt when the engine moved or its native code changed.
+        let me: *const FastSim = self;
+        if self
+            .native_cache
+            .as_ref()
+            .is_none_or(|c| c.owner != me || c.parts != parts)
+        {
+            let mut c = Box::new(self.native_contexts(parts));
+            c.ctx.env = (&raw mut c.env).cast();
+            self.native_cache = Some(c);
+        }
+        let epoch = self.rt.marks.epoch;
+        let c = self.native_cache.as_mut().expect("built above");
+        c.ctx.epoch = epoch;
+        c.ectx.timed = timed;
+        c.ectx.rounds = 0;
+        c.ectx.opaque = 0;
+        c.ectx.transparent = 0;
+        c.ectx.evals = 0;
+        // SAFETY: `f` was compiled for `self.prog` (checked when installed) and implements the
+        // `EventCtx` contract; the cached contexts point into this engine at its current
+        // address (rebuilt above otherwise) with the program's sizes (`parts` has one entry per
+        // partition), and the state is not otherwise accessed during the call.
+        let tp = probe::start();
+        let r = unsafe { f(&mut c.ctx, &mut c.ectx) };
+        probe::stop(probe::NATIVE, tp);
+        let ec = &c.ectx;
+        let n = ec.opaque + ec.transparent;
+        self.stats.transitions += n;
+        self.stats.table_hits += n;
+        self.stats.opaque_skips += ec.opaque;
+        self.stats.transparent += ec.transparent;
+        self.stats.fast_evals += ec.evals;
+        self.stats.rounds += ec.rounds;
+        self.stats.native_rounds += ec.rounds;
+        let done = match r {
+            crate::native::EVENT_DONE => true,
+            crate::native::EVENT_BAIL => {
+                self.stats.native_bails += 1;
+                false
+            }
+            _ => panic!("native event function of tuple {tuple}: bad result {r}"),
+        };
+        Some((ec.rounds as u32, done))
+    }
+
+    /// The native contexts for this engine at its current address (`ctx.env` is set by the
+    /// caller once the value has its final address).
+    fn native_contexts(&mut self, parts: *const crate::native::PartitionFn) -> NativeCache {
+        let prog: *const Program = &*self.prog;
+        let values = self.values.get_mut();
+        let len = values.len();
+        let vp = values.as_mut_ptr();
+        let rtp: *mut Rt = &mut self.rt;
+        // SAFETY: `rtp` is valid; only raw pointers into it are taken.
+        let (kin_prev, epoch) = unsafe {
+            (
+                (*rtp).marks.kin_prev.as_mut_ptr(),
+                &raw mut (*rtp).marks.epoch,
+            )
+        };
+        NativeCache {
+            owner: self,
+            parts,
+            env: Env {
+                prog,
+                rt: rtp,
+                values: vp,
+                len,
+            },
+            // `env` is set by the caller.
+            ctx: crate::native::make_ctx(&self.prog, vp, len, rtp, std::ptr::null_mut()),
+            ectx: EventCtx {
+                lazy: self.lazy.as_mut_ptr(),
+                tlast: self.tlast.as_mut_ptr(),
+                kin_prev,
+                kob: self.kob.as_mut_ptr(),
+                unsynced: self.unsynced.as_mut_ptr(),
+                pending: self.native_pending.as_mut_ptr(),
+                epoch,
+                epoch_wrap: crate::native::epoch_wrap_cb,
+                parts,
+                delta_limit: self.opts.fast.delta_limit,
+                timed: 0,
+                n_tuples: self.prog.num_tuples,
+                n_parts: self.prog.partitions.len() as u32,
+                rounds: 0,
+                opaque: 0,
+                transparent: 0,
+                evals: 0,
+            },
+        }
     }
 
     /// True if every pending kernel (`todo`) is fast-ok and skipped in phase `tuple` without a
@@ -1161,6 +1528,9 @@ impl FastSim {
 
     /// Report contention of combinational resolvers evaluated during this event.
     fn check_contention(&mut self) {
+        if self.rt.res_touched.is_empty() {
+            return;
+        }
         let touched = std::mem::take(&mut self.rt.res_touched);
         for &r in &touched {
             let ri = r as usize;
@@ -1691,6 +2061,28 @@ impl FastSim {
         }
     }
 }
+
+/// The contexts handed to native event functions, prebuilt: they point into the owning
+/// [`FastSim`] (its runtime vectors, which never reallocate, and its fields), so they are
+/// rebuilt when the engine moved (`owner`) or its native code changed (`parts`; a new table
+/// at the address of a dropped one is equally valid).
+///
+/// Note: the raw pointers are derived once and reused across calls while the interpreter
+/// accesses the same state through `&mut` borrows in between. Machine code cannot observe the
+/// difference (the pointers only reach opaque native calls), but Rust's formal aliasing
+/// models (Stacked/Tree Borrows) would consider the later uses invalidated.
+struct NativeCache {
+    owner: *const FastSim,
+    parts: *const crate::native::PartitionFn,
+    env: Env,
+    ctx: crate::native::NativeCtx,
+    ectx: EventCtx,
+}
+
+// SAFETY: the pointers refer to the owning `FastSim` (moved together with it, and checked
+// against its address before every use) and to its native code (kept alive by it); they are
+// only dereferenced by `&mut FastSim` methods.
+unsafe impl Send for NativeCache {}
 
 /// Transitions done by [`fast_round`].
 #[derive(Default)]

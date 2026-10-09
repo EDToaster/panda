@@ -46,6 +46,12 @@
 //! the hot path; `values()` / `get()` materialize them on demand, so they are always exactly
 //! FastRef's.
 //!
+//! [`native`] is the hook of the native tier (SPEC §8.9): a backend (the Cranelift JIT in
+//! `panda-jit`) compiles partitions and per-clock-tuple event functions to machine code over the
+//! same runtime state; [`FastSim::install_native`] / [`FastSim::set_native_slot`] swap it in at
+//! an event boundary, and the interpreter remains the reference and the fallback for anything
+//! the native code does not handle.
+//!
 //! [`probe`] (feature `prof`) provides cycle / instruction-counter probes of the event loop.
 
 pub mod compile;
@@ -55,10 +61,12 @@ mod fxhash;
 pub mod ir;
 pub mod kspec;
 pub mod lut;
+pub mod native;
 pub mod probe;
 pub mod schedule;
 mod sim;
 
 pub use compile::{CompileOptions, OrderStrategy};
 pub use ir::{Op, PhaseClass, Program, ProgramStats};
+pub use native::{NativeCode, NativeSlot};
 pub use sim::{FastSim, FastSimOptions, FastSimStats};

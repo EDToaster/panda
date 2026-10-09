@@ -161,6 +161,20 @@ impl<W: Write> VcdWriter<W> {
     pub fn sample(&mut self, sim: &TimingSim) -> io::Result<()> {
         let tick = sim.tick();
         let incremental = matches!(self.prev_tick, Some(p) if tick == p + 1);
+        let changed = incremental.then(|| sim.last_changed());
+        self.sample_with(tick, changed, |n| sim.get(n))
+    }
+
+    /// Record net `values` (index = net) as the state at `tick`, comparing every selected signal
+    /// against its last dumped value. Used for engines other than [`TimingSim`] (e.g. Fast mode,
+    /// sampled at phase ends).
+    pub fn sample_values(&mut self, tick: u64, values: &[Logic]) -> io::Result<()> {
+        self.sample_with(tick, None, |n| values[n as usize])
+    }
+
+    /// Shared sampling core: `changed` = the nets that may have changed since the previous
+    /// sample (`None`: compare every signal).
+    fn sample_with(&mut self, tick: u64, changed: Option<&[NetIdx]>, get: impl Fn(NetIdx) -> Logic) -> io::Result<()> {
         if let Some(p) = self.prev_tick
             && tick < p
         {
@@ -172,8 +186,8 @@ impl<W: Write> VcdWriter<W> {
         let time = tick + self.offset;
 
         self.dirty_list.clear();
-        if incremental {
-            for &n in sim.last_changed() {
+        if let Some(changed) = changed {
+            for &n in changed {
                 if let Some(sigs) = self.net_signals.get(&n) {
                     for &s in sigs {
                         if !self.dirty[s as usize] {
@@ -195,12 +209,12 @@ impl<W: Write> VcdWriter<W> {
             self.dirty[s] = false;
             let nets = &self.signals[s].nets;
             let last = &mut self.last[s];
-            let changed = last.len() != nets.len() || nets.iter().zip(last.iter()).any(|(&n, &l)| sim.get(n) != l);
+            let changed = last.len() != nets.len() || nets.iter().zip(last.iter()).any(|(&n, &l)| get(n) != l);
             if !changed {
                 continue;
             }
             last.clear();
-            last.extend(nets.iter().map(|&n| sim.get(n)));
+            last.extend(nets.iter().map(|&n| get(n)));
             if !header_written {
                 header_written = true;
                 // Sampling the same tick twice must not repeat the timestamp.
@@ -230,8 +244,13 @@ impl<W: Write> VcdWriter<W> {
 
     /// Write a final timestamp for the simulator's current tick (so viewers show the whole
     /// simulated span), flush, and return the underlying writer.
-    pub fn finish(mut self, sim: &TimingSim) -> io::Result<W> {
-        let time = sim.tick() + self.offset;
+    pub fn finish(self, sim: &TimingSim) -> io::Result<W> {
+        self.finish_at(sim.tick())
+    }
+
+    /// [`VcdWriter::finish`] for an engine at `tick`.
+    pub fn finish_at(mut self, tick: u64) -> io::Result<W> {
+        let time = tick + self.offset;
         if self.last_time.is_none_or(|t| time > t) {
             writeln!(self.out, "#{time}")?;
         }

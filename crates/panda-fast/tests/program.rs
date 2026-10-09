@@ -3,6 +3,10 @@
 
 mod common;
 
+/// Native-code hook of `common::pair` (none here: the interpreter; the panda-jit crate runs
+/// this suite with the JIT installed through it).
+fn native_hook(_: &mut panda_fast::FastSim) {}
+
 use std::sync::Arc;
 
 use panda_compile::{FastOptions, FastRef};
@@ -124,6 +128,7 @@ fn ops_match_reference_semantics_exhaustively() {
             ..FastSimOptions::default()
         };
         let mut fs = FastSim::new(flat.clone(), opts).unwrap();
+        native_hook(&mut fs);
         if lut_min_gates == 1 {
             let st = fs.program().stats();
             assert!(st.luts >= 1 && st.lut_gates == 26, "{st:?}");
@@ -289,6 +294,7 @@ fn program_structure_invariants() {
 fn run_cycles_matches_run_until() {
     let flat = panda8(RomStyle::SumOfProducts, Variant::Flat);
     let mut fs = FastSim::new(flat.clone(), FastSimOptions::default()).unwrap();
+    native_hook(&mut fs);
     let mut fr = FastRef::new(flat.clone(), FastOptions::default()).unwrap();
     let (period, phase) = flat
         .sources
@@ -342,6 +348,7 @@ fn fastsim_is_send() {
 fn api_mirrors_fastref() {
     let flat = panda8(RomStyle::Decoder, Variant::Hierarchical);
     let mut fs = FastSim::new(flat.clone(), FastSimOptions::default()).unwrap();
+    native_hook(&mut fs);
     let mut fr = FastRef::new(flat.clone(), FastOptions::default()).unwrap();
     fs.run_events(500);
     fr.run_events(500);

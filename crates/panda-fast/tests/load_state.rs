@@ -6,6 +6,10 @@
 
 mod common;
 
+/// Native-code hook of `common::pair` (none here: the interpreter; the panda-jit crate runs
+/// this suite with the JIT installed through it).
+fn native_hook(_: &mut panda_fast::FastSim) {}
+
 use std::sync::Arc;
 
 use common::random_value;
@@ -34,6 +38,7 @@ fn reload_and_compare(a: &mut FastSim, flat: &Arc<FlatNetlist>, events: u64, ctx
         a.tables().to_vec(),
     )
     .unwrap();
+    native_hook(&mut b);
     let fallen = b.load_state(a.tick(), a.values(), &inputs_of(a, flat));
     assert_eq!(
         fallen, 0,
@@ -71,6 +76,7 @@ fn panda8_reload_mid_run() {
                         Arc::new(flatten(&panda8_with(&programs::BENCH_LOOP.image(), &o)).unwrap());
                     let opts = FastSimOptions::default();
                     let mut a = FastSim::new(flat.clone(), opts.clone()).unwrap();
+                    native_hook(&mut a);
                     for (i, n) in [3u64, 17, 101, 400].into_iter().enumerate() {
                         a.run_events(n);
                         reload_and_compare(&mut a, &flat, 300, &format!("{rom:?} {v:?} #{i}"));
@@ -89,6 +95,7 @@ fn reload_seed(seed: u64) -> usize {
     let flat = Arc::new(flatten(&g.design).unwrap());
     let opts = FastSimOptions::from(FastOptions::default());
     let mut a = FastSim::new(flat.clone(), opts).unwrap();
+    native_hook(&mut a);
     let pins: Vec<(String, u32)> = flat
         .top_inputs
         .iter()
@@ -112,6 +119,7 @@ fn reload_seed(seed: u64) -> usize {
             a.tables().to_vec(),
         )
         .unwrap();
+        native_hook(&mut b);
         let fallen = b.load_state(a.tick(), a.values(), &inputs_of(&a, &flat));
         if fallen != 0 || a.values().iter().any(|v| !v.is_known()) {
             continue;

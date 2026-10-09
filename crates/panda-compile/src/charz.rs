@@ -1,8 +1,17 @@
 //! Kernel characterization — Latch Tables (SPEC §8.4).
 //!
-//! Every transition is computed by running [`TimingSim`] on the kernel's sub-netlist
-//! ([`crate::subnet`]), so tables have exactly Timing-mode semantics, including period-2
-//! collapse (§5.3).
+//! Every transition has exactly the semantics of running [`TimingSim`] on the kernel's
+//! sub-netlist ([`crate::subnet`]), so tables have Timing-mode semantics, including period-2
+//! collapse (§5.3). The reference implementation does literally that
+//! ([`characterize_subnet_reference`]); [`characterize`] / [`characterize_subnet`] use an exact
+//! specialized re-implementation (`fast` module: bit-parallel transitions, compact order walks,
+//! optional threads, see [`characterize_subnet_with`]) that produces bit-identical tables and
+//! falls back to the reference for sub-netlists outside its preconditions.
+//!
+//! [`TableCache`] holds tables by structural key; it is internally synchronized, characterizes
+//! distinct kernels in parallel ([`TableCache::characterize_all`]), offers non-blocking lookups
+//! ([`TableCache::try_tables`]) and can be saved and restored ([`TableCache::snapshot`],
+//! [`TableCache::save`] / [`TableCache::load`]).
 //!
 //! * **State** = the values of all kernel nets ([`Kernel::nets`] order).
 //! * **Stable states**: for every binary input vector `u` and every binary assignment of the cut
@@ -37,7 +46,16 @@ use panda_netlist::{Diagnostic, Logic, Termination, Value};
 use panda_timing::{TimingOptions, TimingSim};
 
 use crate::kernels::{Kernel, KernelKind};
-use crate::subnet::{INPUT_PIN, SubnetMap, kernel_subnet, structural_key};
+use crate::subnet::{INPUT_PIN, SubnetMap, kernel_subnet};
+
+mod cache;
+mod fast;
+mod lanes;
+
+pub use cache::{
+    CacheSnapshot, OptionsTag, SNAPSHOT_FORMAT, SNAPSHOT_VERSION, SnapshotEntry, TableCache,
+    TableData,
+};
 
 /// Tunables of characterization.
 #[derive(Clone, Debug)]
@@ -465,7 +483,123 @@ pub fn characterize_subnet(
     if map.num_inputs() > MAX_TABLE_INPUTS {
         return None;
     }
-    Characterizer::new(sub, map, opts).run()
+    characterize_subnet_with(sub, map, opts, default_threads())
+}
+
+/// The default number of threads characterization may use: the available parallelism.
+pub fn default_threads() -> usize {
+    std::thread::available_parallelism().map_or(1, |n| n.get())
+}
+
+/// [`characterize_subnet`] using at most `threads` threads (`0` is treated as 1). Small kernels
+/// never spawn threads. The table does not depend on `threads`.
+pub fn characterize_subnet_with(
+    sub: Arc<FlatNetlist>,
+    map: SubnetMap,
+    opts: &CharzOptions,
+    threads: usize,
+) -> Option<KernelTable> {
+    if map.num_inputs() > MAX_TABLE_INPUTS {
+        return None;
+    }
+    let (cut, order) = cut_and_order(&sub, map.num_inputs(), map.num_state());
+    if let Some(table) = fast::characterize(&sub, &map, opts, &cut, &order, threads.max(1)) {
+        return table;
+    }
+    Characterizer::with_cut(sub, map, opts, cut, order).run()
+}
+
+/// The reference characterization: every transition runs through [`KernelSim`] (a full
+/// [`TimingSim`] reset, load and settle). [`characterize_subnet`] gives bit-identical tables
+/// (its fast path re-implements exactly the simulation semantics used here); this entry point
+/// exists for differential tests and as the documentation of record.
+#[doc(hidden)]
+pub fn characterize_subnet_reference(
+    sub: Arc<FlatNetlist>,
+    map: SubnetMap,
+    opts: &CharzOptions,
+) -> Option<KernelTable> {
+    if map.num_inputs() > MAX_TABLE_INPUTS {
+        return None;
+    }
+    let (cut, order) = cut_and_order(&sub, map.num_inputs(), map.num_state());
+    Characterizer::with_cut(sub, map, opts, cut, order).run()
+}
+
+/// True if [`characterize_subnet`] uses its fast path for this sub-netlist (the reference path
+/// otherwise; both give identical tables). For tests and diagnostics.
+#[doc(hidden)]
+pub fn uses_fast_path(sub: &FlatNetlist, map: &SubnetMap, opts: &CharzOptions) -> bool {
+    fast::KSim::new(sub, map, opts).is_some()
+}
+
+/// The fast path's `T(state, old, new)` = `(next state, quiescent, latency)`, or `None` if the
+/// sub-netlist does not qualify for the fast path. Must equal [`KernelSim::transition`] exactly
+/// (differential tests).
+#[doc(hidden)]
+pub fn fast_transition(
+    sub: &FlatNetlist,
+    map: &SubnetMap,
+    opts: &CharzOptions,
+    state: &[Logic],
+    old: u32,
+    new: u32,
+) -> Option<(Vec<Logic>, bool, u32)> {
+    let mut sim = fast::KSim::new(sub, map, opts)?;
+    Some(fast::sim_transition(&mut sim, state, old, new))
+}
+
+/// Hit counts of the fast path's rarely taken exact-fallback branches, process-wide and
+/// monotonic: `[period-2 collapses, resolver evaluations in simulated ticks, order-pass entries
+/// on the sequential path, on-the-fly steps simulated, streamed exhaustive-order entries,
+/// bit-parallel batches with lanes handed to the scalar simulator]`. For coverage tests.
+#[doc(hidden)]
+pub fn fast_path_coverage() -> [u64; 6] {
+    fast::cov::snapshot()
+}
+
+/// Feedback cut of the kernel's state nets (always containing keeper outputs) and the
+/// evaluation order of the remaining state nets (topological once the cut is removed).
+fn cut_and_order(sub: &FlatNetlist, k: usize, m: usize) -> (Vec<usize>, Vec<usize>) {
+    let mut driver: Vec<Option<Drv>> = (0..m).map(|_| None).collect();
+    for (i, g) in sub.gates.iter().enumerate() {
+        driver[g.output as usize - k] = Some(Drv::Gate(i));
+    }
+    for (i, r) in sub.resolvers.iter().enumerate() {
+        driver[r.output as usize - k] = Some(Drv::Res(i));
+    }
+    let deps = |j: usize| -> Vec<usize> {
+        let ins: &[NetIdx] = match driver[j].as_ref().expect("state net has a driver") {
+            Drv::Gate(i) => &sub.gates[*i].inputs,
+            Drv::Res(i) => &sub.resolvers[*i].drivers,
+        };
+        ins.iter()
+            .filter(|&&n| n as usize >= k)
+            .map(|&n| n as usize - k)
+            .collect()
+    };
+    let succ = crate::graph::Csr::from_fn(m, |j, buf| {
+        // edges dep → j are built below via transpose; here rows are deps of j
+        buf.extend(deps(j as usize).iter().map(|&d| d as u32));
+    })
+    .transpose();
+    let is_keeper = |j: u32| matches!(driver[j as usize], Some(Drv::Res(i)) if sub.resolvers[i].termination == Termination::Keeper);
+    let all: Vec<u32> = (0..m as u32).collect();
+    let cut: Vec<usize> = crate::graph::feedback_vertex_set(&succ, &all, is_keeper, m)
+        .expect("limit m always suffices")
+        .into_iter()
+        .map(|j| j as usize)
+        .collect();
+    let mut is_cut = vec![false; m];
+    for &j in &cut {
+        is_cut[j] = true;
+    }
+    let order = crate::graph::topo_order(&succ, |j| !is_cut[j as usize])
+        .expect("cut makes the kernel acyclic")
+        .into_iter()
+        .map(|j| j as usize)
+        .collect();
+    (cut, order)
 }
 
 /// How a node computes its state net from the others (local evaluation during enumeration).
@@ -502,12 +636,17 @@ enum Cur {
 }
 
 impl<'a> Characterizer<'a> {
-    fn new(sub: Arc<FlatNetlist>, map: SubnetMap, opts: &'a CharzOptions) -> Self {
+    fn with_cut(
+        sub: Arc<FlatNetlist>,
+        map: SubnetMap,
+        opts: &'a CharzOptions,
+        cut: Vec<usize>,
+        order: Vec<usize>,
+    ) -> Self {
         let k = map.num_inputs();
         let m = map.num_state();
         let ks = KernelSim::from_subnet(sub.clone(), map, opts);
         let bound = ks.default_bound();
-        // Local graph over state nets: j → readers.
         let mut driver: Vec<Option<Drv>> = (0..m).map(|_| None).collect();
         for (i, g) in sub.gates.iter().enumerate() {
             driver[g.output as usize - k] = Some(Drv::Gate(i));
@@ -515,37 +654,9 @@ impl<'a> Characterizer<'a> {
         for (i, r) in sub.resolvers.iter().enumerate() {
             driver[r.output as usize - k] = Some(Drv::Res(i));
         }
-        let deps = |j: usize| -> Vec<usize> {
-            let ins: &[NetIdx] = match driver[j].as_ref().expect("state net has a driver") {
-                Drv::Gate(i) => &sub.gates[*i].inputs,
-                Drv::Res(i) => &sub.resolvers[*i].drivers,
-            };
-            ins.iter()
-                .filter(|&&n| n as usize >= k)
-                .map(|&n| n as usize - k)
-                .collect()
-        };
-        let succ = crate::graph::Csr::from_fn(m, |j, buf| {
-            // edges dep → j are built below via transpose; here rows are deps of j
-            buf.extend(deps(j as usize).iter().map(|&d| d as u32));
-        })
-        .transpose();
-        let is_keeper = |j: u32| matches!(driver[j as usize], Some(Drv::Res(i)) if sub.resolvers[i].termination == Termination::Keeper);
-        let all: Vec<u32> = (0..m as u32).collect();
-        let cut: Vec<usize> = crate::graph::feedback_vertex_set(&succ, &all, is_keeper, m)
-            .expect("limit m always suffices")
+        let order = order
             .into_iter()
-            .map(|j| j as usize)
-            .collect();
-        let mut is_cut = vec![false; m];
-        for &j in &cut {
-            is_cut[j] = true;
-        }
-        let topo = crate::graph::topo_order(&succ, |j| !is_cut[j as usize])
-            .expect("cut makes the kernel acyclic");
-        let order = topo
-            .into_iter()
-            .map(|j| (j as usize, driver[j as usize].take().expect("driver")))
+            .map(|j| (j, driver[j].take().expect("driver")))
             .collect();
         Characterizer {
             sub,
@@ -922,67 +1033,6 @@ impl XorShift {
         x ^= x << 17;
         self.0 = x;
         x
-    }
-}
-
-/// Cache of kernel tables keyed by the structural key of the kernel sub-netlist
-/// ([`structural_key`]): identical kernels (e.g. 200 D latches) are characterized once. A cache
-/// must only be used with one [`CharzOptions`] value.
-#[derive(Default)]
-pub struct TableCache {
-    /// `None` = the kernel exceeded the size guards (cached too).
-    map: HashMap<Vec<u32>, Option<Arc<KernelTable>>>,
-    hits: u64,
-    misses: u64,
-}
-
-impl TableCache {
-    /// An empty cache.
-    pub fn new() -> TableCache {
-        TableCache::default()
-    }
-
-    /// The table of `kernel` (`None` unless it is a Table kernel within the size guards of
-    /// [`characterize`]), characterizing it on a miss.
-    pub fn get_or_characterize(
-        &mut self,
-        flat: &FlatNetlist,
-        kernel: &Kernel,
-        opts: &CharzOptions,
-    ) -> Option<Arc<KernelTable>> {
-        if kernel.kind != KernelKind::Table {
-            return None;
-        }
-        let (sub, map) = kernel_subnet(flat, kernel);
-        let key = structural_key(&sub);
-        if let Some(t) = self.map.get(&key) {
-            self.hits += 1;
-            return t.clone();
-        }
-        self.misses += 1;
-        let t = characterize_subnet(Arc::new(sub), map, opts).map(Arc::new);
-        self.map.insert(key, t.clone());
-        t
-    }
-
-    /// Lookups answered from the cache.
-    pub fn hits(&self) -> u64 {
-        self.hits
-    }
-
-    /// Lookups that characterized a kernel.
-    pub fn misses(&self) -> u64 {
-        self.misses
-    }
-
-    /// Number of distinct tables.
-    pub fn len(&self) -> usize {
-        self.map.len()
-    }
-
-    /// True if the cache holds no table.
-    pub fn is_empty(&self) -> bool {
-        self.map.is_empty()
     }
 }
 

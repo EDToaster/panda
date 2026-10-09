@@ -30,8 +30,14 @@ pub const FLUSH: usize = 5;
 pub const TIMED: usize = 6;
 /// Count (not cycles): net changes propagated.
 pub const NOTIFIES: usize = 7;
+/// Round-boundary fast paths (`fast_round`; part of [`DECIDE`]).
+pub const FAST: usize = 8;
+/// Writes of the fast-path kernel outputs (part of [`WRITE`], including their [`FLUSH`]).
+pub const WFAST: usize = 9;
+/// Native event functions (`native::EventFn`, including their sweeps).
+pub const NATIVE: usize = 10;
 /// Number of slots.
-pub const SLOTS: usize = 8;
+pub const SLOTS: usize = 11;
 
 /// Accumulated cycles per slot (process-wide).
 pub static COUNTERS: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];

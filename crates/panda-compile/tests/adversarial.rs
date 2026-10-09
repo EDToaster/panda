@@ -370,7 +370,7 @@ fn check_design(flat: &Arc<FlatNetlist>, opts: &FastOptions, seed: u64, events: 
         o.charz.max_order_work = 20;
         o
     };
-    let mut cache = TableCache::new();
+    let cache = TableCache::new();
     let tight_tables: Vec<_> = ks
         .kernels
         .iter()

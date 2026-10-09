@@ -249,16 +249,15 @@ impl FastRef {
     /// Compile `flat` (kernel extraction + characterization) and power it on (processes the
     /// tick-0 event). Errors if the extracted kernel set is inconsistent (an internal error).
     pub fn new(flat: Arc<FlatNetlist>, opts: FastOptions) -> Result<FastRef, Vec<Diagnostic>> {
-        let mut cache = TableCache::new();
-        FastRef::with_cache(flat, opts, &mut cache)
+        FastRef::with_cache(flat, opts, &TableCache::new())
     }
 
     /// [`FastRef::new`] with a caller-provided table cache (reusable across netlists compiled
-    /// with the same [`CharzOptions`]).
+    /// with the same [`CharzOptions`]; internally synchronized, `&mut` is not required).
     pub fn with_cache(
         flat: Arc<FlatNetlist>,
         opts: FastOptions,
-        cache: &mut TableCache,
+        cache: &TableCache,
     ) -> Result<FastRef, Vec<Diagnostic>> {
         let kopts = KernelOptions {
             extract: opts.extract.clone(),

@@ -179,7 +179,7 @@ fn register8_is_sixteen_latch_kernels_with_cache_hits() {
             .iter()
             .all(|k| k.kind == KernelKind::Table && k.bits() <= 12)
     );
-    let mut cache = TableCache::new();
+    let cache = TableCache::new();
     let opts = CharzOptions::default();
     for k in &ks.kernels {
         let t = cache
@@ -682,7 +682,7 @@ fn panda8_all_state_in_small_table_kernels() {
             let h = ks.histogram();
             let max_bits = ks.kernels.iter().map(Kernel::bits).max().unwrap_or(0);
             let t1 = Instant::now();
-            let mut cache = TableCache::new();
+            let cache = TableCache::new();
             let opts = CharzOptions::default();
             let tables: Vec<_> = ks
                 .kernels

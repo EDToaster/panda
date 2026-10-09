@@ -1,18 +1,34 @@
 //! `panda-cli` — the Panda command-line tool as a library (SPEC §2.1, M1 in §13).
 //!
-//! The `panda` binary is a thin wrapper around [`main_with_args`]. Modules:
+//! The `panda` binary is a thin wrapper around [`main_with_args`]. It exposes the whole kernel:
+//! Timing mode (`panda_timing`), Fast mode through the `panda_kernel` facade (FastRef or the
+//! compiled FastSim backend), static timing analysis (`panda_sta`), classification and kernel
+//! statistics (`panda_compile`), design generators (`panda_circuits`, `panda_cpu8`) and engine
+//! benchmarks. Modules:
 //!
 //! * [`signals`] — resolving user-given signal names to flat nets; default signal selection;
-//! * [`vcd`] — a VCD writer for [`panda_timing::TimingSim`], usable by other crates;
-//! * [`vectors`] — the line-based test-vector format and its runner;
-//! * [`commands`] — `run`, `test`, `info`, `flat`, `example` (argument parsing and output);
+//! * [`vcd`] — a VCD writer for [`panda_timing::TimingSim`] (and value snapshots), usable by
+//!   other crates;
+//! * [`vectors`] — the line-based test-vector format and its runners (Timing engine, facade);
+//! * [`clock`] — the reference clock and cycle stepping of the Timing engine;
+//! * [`fastmode`] — building and driving a `panda_kernel::Kernel` from the command line;
+//! * [`commands`] — dispatch, `info`, `flat`, `example` and the usage text;
+//! * `run` (`run`, `test`), [`analysis`] (`sta`, `classify`, `kernels`), [`generators`] (`gen`),
+//!   [`bench`](mod@bench) (`bench`) — the other commands;
 //! * [`examples`] — example designs (the sources of `examples-data/*.json`).
 //!
 //! Exit codes: `0` success, `1` failure (test failures, design errors, I/O errors),
 //! `2` command-line usage errors.
 
+mod args;
+pub mod analysis;
+pub mod bench;
+pub mod clock;
 pub mod commands;
 pub mod examples;
+pub mod fastmode;
+pub mod generators;
+mod run;
 pub mod signals;
 pub mod vcd;
 pub mod vectors;

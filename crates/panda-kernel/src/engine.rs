@@ -2,6 +2,10 @@
 //!
 //! Adding a backend takes one [`FastBackend`] variant, one `impl_fast_engine!(Type)` line and one
 //! arm in [`build_engine`].
+//!
+//! [`FastBackend::Jit`] is the compiled engine plus the native tier: the `FastSim` starts
+//! interpreting at once while `panda_jit` compiles its program (in the background with
+//! [`JitTier::background`]), and installs the native code at its next event boundary.
 
 use std::sync::Arc;
 
@@ -19,8 +23,13 @@ pub enum FastBackend {
     Reference,
     /// The compiled engine `panda_fast::FastSim` (bit-identical to FastRef, much faster). While
     /// its program compiles, a Reference engine (built from the same kernel tables) serves.
-    #[default]
     Compiled,
+    /// Tiered: Reference while the kernels compile, then the `FastSim` interpreter as soon as its
+    /// program is compiled, then the Cranelift JIT (`panda_jit`) hot-swapped in at an event
+    /// boundary once its native code is ready (SPEC §8.9). Bit-identical to the others at every
+    /// tier. Without the `jit` cargo feature this is [`FastBackend::Compiled`].
+    #[default]
+    Jit,
 }
 
 /// Outcome of [`FastEngine::load_state`].
@@ -52,6 +61,16 @@ pub(crate) trait FastEngine: Send {
     fn read(&self, name: &str) -> Option<Value>;
     /// Drain diagnostics.
     fn take_diagnostics(&mut self) -> Vec<Diagnostic>;
+    /// Install native code that became ready (normally done at the next event); true if the
+    /// engine runs native code.
+    fn native_active(&mut self) -> bool {
+        false
+    }
+    /// True while the engine's native code is still being compiled in the background (false
+    /// once it is installed, or if the compilation failed: the engine keeps interpreting).
+    fn native_pending(&mut self) -> bool {
+        false
+    }
 }
 
 /// Implement [`FastEngine`] for a type with FastRef's method names.
@@ -82,6 +101,12 @@ macro_rules! impl_fast_engine {
             fn take_diagnostics(&mut self) -> Vec<Diagnostic> {
                 <$t>::take_diagnostics(self)
             }
+            fn native_active(&mut self) -> bool {
+                <$t as LoadState>::native_active(self)
+            }
+            fn native_pending(&mut self) -> bool {
+                <$t as LoadState>::native_pending(self)
+            }
         }
     };
 }
@@ -95,10 +120,23 @@ impl LoadState for RefEngine {
     }
 }
 
-/// The `load_state` half of [`FastEngine`] (implemented per type; the rest by the macro).
+/// The per-type half of [`FastEngine`] (`load_state`, the native tier; the rest by the macro).
 pub(crate) trait LoadState {
     fn load_state(&mut self, tick: u64, values: &[Logic], inputs: &[Value]) -> LoadReport;
+    fn native_active(&mut self) -> bool {
+        false
+    }
+    fn native_pending(&mut self) -> bool {
+        false
+    }
 }
+
+/// A background JIT compilation (its result: statistics or the reason it failed).
+#[cfg(feature = "jit")]
+pub(crate) type JitJob = std::thread::JoinHandle<Result<panda_jit::JitStats, String>>;
+/// A background JIT compilation (never started without the `jit` feature).
+#[cfg(not(feature = "jit"))]
+pub(crate) type JitJob = std::thread::JoinHandle<Result<(), String>>;
 
 /// [`FastSim`] plus a [`RefEngine`] used to load states.
 ///
@@ -114,6 +152,8 @@ pub(crate) struct CompiledEngine {
     art: Artifacts,
     /// Diagnostics of the loader's settling events.
     diags: Vec<Diagnostic>,
+    /// The background compilation of the native tier, until it finished.
+    jit_job: Option<JitJob>,
 }
 
 impl CompiledEngine {
@@ -174,6 +214,26 @@ impl LoadState for CompiledEngine {
         debug_assert_eq!(self.sim.values(), loader.values());
         report
     }
+
+    fn native_active(&mut self) -> bool {
+        self.sim.poll_native_slot()
+    }
+
+    fn native_pending(&mut self) -> bool {
+        match &self.jit_job {
+            None => false,
+            Some(h) if !h.is_finished() => true,
+            Some(_) => {
+                // Finished: on success the code waits in the engine's slot (install it now);
+                // on failure the engine keeps interpreting.
+                let job = self.jit_job.take().expect("checked");
+                if matches!(job.join(), Ok(Ok(_))) {
+                    self.sim.poll_native_slot();
+                }
+                false
+            }
+        }
+    }
 }
 
 /// Kernel extraction + characterization results shared by the engines, STA and classification.
@@ -183,6 +243,50 @@ pub(crate) struct Artifacts {
     pub(crate) tables: Arc<Vec<Option<Arc<KernelTable>>>>,
 }
 
+/// The JIT tier of [`FastBackend::Jit`].
+#[derive(Clone, Debug)]
+pub(crate) struct JitTier {
+    /// The compiler (shared by every compilation of one `Kernel`, so edits only recompile the
+    /// partitions they change).
+    #[cfg(feature = "jit")]
+    pub(crate) jit: panda_jit::Jit,
+    /// Compile on a separate thread and hot-swap (else compile before the engine is returned).
+    pub(crate) background: bool,
+}
+
+impl JitTier {
+    pub(crate) fn new(background: bool) -> JitTier {
+        JitTier {
+            #[cfg(feature = "jit")]
+            jit: panda_jit::Jit::default(),
+            background,
+        }
+    }
+
+    /// Give `sim` its native tier; returns the background compilation, if one was started.
+    fn attach(&self, sim: &mut FastSim) -> Option<JitJob> {
+        #[cfg(feature = "jit")]
+        {
+            if self.background {
+                // The engine keeps interpreting; the code is installed at an event boundary
+                // after it is ready. A JIT failure (e.g. a program beyond its limits) leaves
+                // the interpreter running.
+                Some(self.jit.attach(sim))
+            } else {
+                // Functions the JIT cannot compile stay interpreted; a total failure leaves the
+                // interpreter running.
+                let _ = self.jit.install(sim);
+                None
+            }
+        }
+        #[cfg(not(feature = "jit"))]
+        {
+            let _ = (sim, self.background);
+            None
+        }
+    }
+}
+
 /// Build (and power on) the engine of `backend` for `flat`.
 pub(crate) fn build_engine(
     backend: FastBackend,
@@ -190,6 +294,7 @@ pub(crate) fn build_engine(
     opts: &FastOptions,
     compile: &FastCompileOptions,
     art: &Artifacts,
+    jit: &JitTier,
 ) -> Result<Box<dyn FastEngine>, Vec<Diagnostic>> {
     match backend {
         FastBackend::Reference => {
@@ -201,17 +306,22 @@ pub(crate) fn build_engine(
             )?;
             Ok(Box::new(e))
         }
-        FastBackend::Compiled => {
+        FastBackend::Compiled | FastBackend::Jit => {
             let sopts = FastSimOptions {
                 fast: opts.clone(),
                 compile: compile.clone(),
             };
-            let sim = FastSim::from_parts(
+            let mut sim = FastSim::from_parts(
                 flat.clone(),
                 sopts,
                 (*art.kernels).clone(),
                 (*art.tables).clone(),
             )?;
+            let jit_job = if backend == FastBackend::Jit {
+                jit.attach(&mut sim)
+            } else {
+                None
+            };
             Ok(Box::new(CompiledEngine {
                 sim,
                 loader: None,
@@ -219,6 +329,7 @@ pub(crate) fn build_engine(
                 opts: opts.clone(),
                 art: art.clone(),
                 diags: Vec::new(),
+                jit_job,
             }))
         }
     }
