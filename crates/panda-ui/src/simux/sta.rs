@@ -276,7 +276,7 @@ impl StaModel {
                 severity: d.severity,
                 kind: d.kind,
                 location: d.location.clone(),
-                message: d.message.clone(),
+                message: super::glyph_safe(&d.message),
             })
             .collect();
         findings.sort_by_key(|f| severity_rank(f.severity));
@@ -305,7 +305,7 @@ impl StaModel {
             .phase_settle
             .iter()
             .map(|p| SettleRow {
-                event: p.event.clone(),
+                event: super::glyph_safe(&p.event),
                 settle: p.settle.map_or("never".into(), |v| v.to_string()),
                 gap: p.gap.map_or("—".into(), |v| v.to_string()),
                 rounds: p.rounds,

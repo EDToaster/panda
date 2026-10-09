@@ -518,6 +518,8 @@ impl SimThread {
     fn run_chunk(&mut self) {
         let t0 = Instant::now();
         let tick0 = self.kernel.tick();
+        // Time spent sleeping to keep a target rate is not "busy" (HUD busy %).
+        let mut slept = Duration::ZERO;
         let (cycles, idle) = match self.speed {
             Speed::Unlimited => {
                 let s = if self.wave.is_empty() {
@@ -541,9 +543,11 @@ impl SimThread {
                     let wait = Duration::from_secs_f64(
                         (next_due - self.pace_start.elapsed().as_secs_f64()).clamp(0.0, 0.01),
                     );
+                    let s0 = Instant::now();
                     std::thread::sleep(
                         wait.min(self.next_publish.saturating_duration_since(Instant::now())),
                     );
+                    slept = s0.elapsed();
                     (0, false)
                 } else {
                     // Cap a burst at about one chunk at the measured cost per cycle.
@@ -569,7 +573,7 @@ impl SimThread {
         self.cycles += cycles;
         self.win_cycles += cycles;
         self.win_ticks += self.kernel.tick().saturating_sub(tick0);
-        self.win_busy += dt;
+        self.win_busy += dt.saturating_sub(slept);
         self.idle = idle;
         self.dirty = true;
         self.cp_dirty |= cycles > 0;

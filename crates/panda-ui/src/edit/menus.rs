@@ -795,14 +795,19 @@ impl CanvasTool for ContextMenu {
                 });
             });
         // Clicks on other foreground layers (e.g. a popup of the sim UX menu) are not outside.
-        let outside = ui.input(|i| {
-            i.pointer.any_pressed()
-                && i.pointer.interact_pos().is_some_and(|p| {
-                    !area.response.rect.contains(p)
-                        && ctx
-                            .layer_id_at(p)
-                            .is_none_or(|l| l.order != Order::Foreground)
-                })
+        // `layer_id_at` locks the context, so it must not run inside the `ui.input` closure
+        // (which already holds that lock): read the press position first.
+        let press = ui.input(|i| {
+            i.pointer
+                .any_pressed()
+                .then(|| i.pointer.interact_pos())
+                .flatten()
+        });
+        let outside = press.is_some_and(|p| {
+            !area.response.rect.contains(p)
+                && ctx
+                    .layer_id_at(p)
+                    .is_none_or(|l| l.order != Order::Foreground)
         });
         // The edit tool (earlier in the frame) consumes Escape; look at the raw events.
         let escape = ui.input(|i| {

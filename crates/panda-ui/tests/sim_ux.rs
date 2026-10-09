@@ -448,7 +448,6 @@ fn panda8_flat_out_hud() {
 /// The canvas context menu (editing module) has "Add to waveform" and, for top-level inputs,
 /// this module's "Set input value…" entry.
 #[test]
-#[ignore = "edit::menus::ContextMenu deadlocks (ctx.layer_id_at inside ui.input) on a click while open"]
 fn context_menu_wave_and_set_value() {
     let mut state = AppState::new(examples::counter(), SimOptions::default());
     state.wait_layout();

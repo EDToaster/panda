@@ -7,12 +7,13 @@ use panda_ui::simhost::SimOptions;
 
 fn main() -> eframe::Result {
     let doc = match std::env::args().nth(1) {
-        Some(path) => {
-            let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
-            let mut d = Document::from_json(&text).unwrap_or_else(|e| panic!("{path}: {e}"));
-            d.path = Some(path.into());
-            d
-        }
+        Some(path) => match panda_ui::files::read_document(std::path::Path::new(&path)) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("panda-ui: {e}");
+                std::process::exit(1);
+            }
+        },
         None => Document::new(examples::counter()),
     };
     let options = eframe::NativeOptions {

@@ -1307,3 +1307,25 @@ fn wire_from_free_space_onto_a_port_and_a_wire_end() {
             .contains(&(p - gp(6, 0)))
     );
 }
+
+#[test]
+fn opening_another_document_clears_history_and_selection() {
+    // Regression: the history used to be cleared only when the new document's revision was
+    // lower than the old one's, so a freshly opened (and quickly laid-out) document could inherit
+    // undo steps that belong to the previous design.
+    let (mut ed, t) = fixture();
+    ed.sync(&t.doc, "", "top");
+    ed.selection.items.insert(ItemRef::Pin("in1".into()));
+    assert!(ed.history.undo_len() > 0);
+    let mut other = Document::new(empty_design());
+    other.revision = t.doc.revision + 100;
+    ed.sync(&other, "", "top");
+    assert_eq!(ed.history.undo_len(), 0, "history of the previous document survived");
+    assert!(ed.selection.is_empty());
+    // Same document again (e.g. a clone): nothing is lost.
+    let (mut ed, t) = fixture();
+    ed.sync(&t.doc, "", "top");
+    let n = ed.history.undo_len();
+    ed.sync(&t.doc.clone(), "", "top");
+    assert_eq!(ed.history.undo_len(), n);
+}

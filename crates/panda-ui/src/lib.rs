@@ -15,10 +15,10 @@
 //! | [`layout`] | foundation | automatic layered layout + orthogonal routing |
 //! | [`canvas`] | foundation | read-only schematic view: pan/zoom, glyphs, live wire colours |
 //! | [`app`] | foundation | eframe shell, [`app::AppState`], panel/tool registry |
-//! | [`examples`] | foundation (hierarchy/files extends) | built-in designs |
+//! | [`examples`] | foundation (files extends) | built-in designs |
 //! | [`edit`] | **editing** | selection, move, wires, palette, inspector, undo/redo |
-//! | [`hier`] | **hierarchy/files** | enter/exit, packaging, library, file menu, examples menu |
-//! | [`files`] | **hierarchy/files** | open/save `.panda.json`, recent files, ROM import |
+//! | [`hier`] | **hierarchy** | enter/exit, breadcrumbs, packaging, library palette, classification badges |
+//! | [`files`] | **files** | *File* menu: new/open/save(-as), unsaved-changes prompt, recent files, ROM import, examples |
 //! | [`simux`] | **sim UX** | run controls, inputs, waveforms, diagnostics, STA, perf HUD |
 //!
 //! # Extension points
@@ -44,11 +44,4 @@ pub mod geom;
 pub mod hier;
 pub mod layout;
 pub mod simhost;
-/// Former placeholder of the sim UX stream, superseded by [`simux`]. Empty; kept only so that
-/// existing callers of `simui::register` still compile (remove once none are left).
-#[doc(hidden)]
-pub mod simui {
-    /// Does nothing (see [`crate::simux::register`]).
-    pub fn register(_reg: &mut crate::app::Registry) {}
-}
 pub mod simux;

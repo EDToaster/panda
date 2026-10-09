@@ -163,6 +163,14 @@ pub struct Document {
     pub revision: u64,
     /// Changed since the last save.
     pub dirty: bool,
+    /// Unique per [`Document::new`] (clones share it): tells per-document state such as the
+    /// undo history that a different document was opened, whatever the revisions are.
+    pub id: u64,
+}
+
+fn next_document_id() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 impl Document {
@@ -179,6 +187,7 @@ impl Document {
             path: None,
             revision: 1,
             dirty: false,
+            id: next_document_id(),
         }
     }
 

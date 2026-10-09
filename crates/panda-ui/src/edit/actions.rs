@@ -485,6 +485,8 @@ pub struct Editor {
     pub message: Option<String>,
     view: Option<(String, DefId)>,
     revision: u64,
+    /// [`Document::id`] of the document the history and selection belong to.
+    doc_id: u64,
 }
 
 impl Editor {
@@ -497,12 +499,14 @@ impl Editor {
     /// when the view changes, drops items that no longer exist after other changes. Clears the
     /// history too when a different document was opened.
     pub fn sync(&mut self, doc: &Document, path: &str, def: &str) {
-        // Revisions only grow within one document: a smaller one means another document was
-        // opened, whose history this is not.
-        if doc.revision < self.revision {
-            self.history.clear();
-            self.selection.clear();
-            self.view = None;
+        // Another document was opened: its history and selection are not this one's.
+        if doc.id != self.doc_id {
+            if self.doc_id != 0 {
+                self.history.clear();
+                self.selection.clear();
+                self.view = None;
+            }
+            self.doc_id = doc.id;
         }
         let view = (path.to_string(), def.to_string());
         if self.view.as_ref() != Some(&view) {

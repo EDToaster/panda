@@ -595,10 +595,20 @@ fn parallel_shadow_replay_is_exact() {
     let mut v = vec![Logic::X; nets.len()];
     k.copy_values(&nets, &mut v);
     rec.prime(k.tick(), &v);
-    k.step_observed(s.tick - k.tick(), StepUnit::Tick, &mut rec);
-    assert_eq!(k.tick(), s.tick);
+    // Record the reference in slices: one recorder chunk holds at most
+    // `WaveRecorder::DEFAULT_CAP` changes, and a truncated reference would make `value_at`
+    // report stale values for every later tick.
     let mut reference = WaveStore::new(cfg);
-    reference.append(&rec.take_chunk().unwrap());
+    reference.cap = usize::MAX;
+    while k.tick() < s.tick {
+        let n = (s.tick - k.tick()).min(1 << 16);
+        k.step_observed(n, StepUnit::Tick, &mut rec);
+        if let Some(c) = rec.take_chunk() {
+            assert!(!c.gap, "reference recording lost changes");
+            reference.append(&c);
+        }
+    }
+    assert_eq!(k.tick(), s.tick);
     let total: usize = store.history.iter().map(|q| q.len()).sum();
     eprintln!(
         "{} cycles, {} recorded changes ({} in the reference), {} gap chunks",

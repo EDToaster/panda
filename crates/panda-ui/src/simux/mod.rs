@@ -136,3 +136,25 @@ pub fn register(reg: &mut Registry) {
     reg.tool(diag::JumpOverlay::new(shared.clone()));
     reg.tool(canvas_tool::SimTool::new(shared));
 }
+
+/// Kernel/STA text for display: egui's built-in fonts lack the arrow glyphs the kernel uses for
+/// clock edges (`clk↑`), which would render as boxes. Rewrites them as words.
+pub fn glyph_safe(text: &str) -> String {
+    if !text.contains(['↑', '↓', '→', '←']) {
+        return text.to_string();
+    }
+    text.replace('↑', " rise")
+        .replace('↓', " fall")
+        .replace('→', "->")
+        .replace('←', "<-")
+}
+
+#[cfg(test)]
+mod glyph_tests {
+    #[test]
+    fn arrows_become_words() {
+        assert_eq!(super::glyph_safe("clk↑: settle 36"), "clk rise: settle 36");
+        assert_eq!(super::glyph_safe("a → b"), "a -> b");
+        assert_eq!(super::glyph_safe("plain"), "plain");
+    }
+}

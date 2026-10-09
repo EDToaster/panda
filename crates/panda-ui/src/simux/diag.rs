@@ -268,7 +268,7 @@ impl DiagModel {
                         severity: d.severity,
                         jumpable: d.location.as_deref().is_some_and(is_jumpable),
                         location: d.location.clone(),
-                        message: d.message.clone(),
+                        message: super::glyph_safe(&d.message),
                         meta,
                     }
                 })
