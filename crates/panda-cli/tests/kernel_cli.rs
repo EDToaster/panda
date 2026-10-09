@@ -64,7 +64,9 @@ fn gen_to(dir: &Path, name: &str, args: &[&str]) -> String {
 fn help_lists_every_command() {
     let out = ok(&["help"]);
     for s in [
-        "panda run <design.json> [--mode timing|fast] [--backend reference|compiled]",
+        "panda run <design.json> [--mode timing|fast] [--backend jit|compiled|reference]",
+        "jit (the default)",
+        "jit = FastSim with the",
         "[--ticks N | --cycles N]",
         "panda sta <design.json>",
         "panda classify <design.json> [DEF]",
@@ -85,18 +87,22 @@ fn run_fast_matches_timing_at_cycle_ends() {
     assert!(timing.contains("ran 12 cycles of clk"), "{timing}");
     assert!(timing.contains("mode: timing"), "{timing}");
     assert!(timing.contains("cycles/s"), "{timing}");
-    for backend in ["compiled", "reference"] {
+    for backend in ["jit", "compiled", "reference"] {
         let fast = ok(&["run", &d, "--cycles", "12", "--mode", "fast", "--backend", backend]);
         assert_eq!(tick(&fast), tick(&timing), "{fast}");
         assert_eq!(watched(&fast), watched(&timing), "{backend}:\n{fast}\nvs\n{timing}");
         assert!(fast.contains(&format!("mode: fast ({backend} backend; engine fast/{backend}; compiled in")), "{fast}");
         assert!(fast.contains("cycles of clk = "), "{fast}");
     }
-    // Q after 12 cycle steps (tick 229): edges 50..210 counted = 9.
+    // The facade's default backend is the JIT.
+    let fast = ok(&["run", &d, "--cycles", "12", "--mode", "fast"]);
+    assert!(fast.contains("mode: fast (jit backend; engine fast/jit; compiled in"), "{fast}");
+    // Q after 12 cycle steps (tick 459): edges 100..420 counted = 9.
+    assert_eq!(tick(&timing), 459, "{timing}");
     assert_eq!(watched(&timing)["Q"], "0b1001 (0x9 = 9)");
     // --ticks counts from power-on in both modes; Fast mode ends at the end of the phase.
     let t = ok(&["run", &d, "--ticks", "100", "--mode", "fast"]);
-    assert_eq!(tick(&t), 109, "{t}");
+    assert_eq!(tick(&t), 119, "{t}");
     assert!(t.contains("ran to the end of the phase containing tick 100"), "{t}");
 }
 
@@ -121,7 +127,7 @@ fn run_usage_errors() {
     for (args, msg) in [
         (vec!["run", &d, "--backend", "compiled"], "--backend needs --mode fast"),
         (vec!["run", &d, "--mode", "warp"], "--mode: expected one of timing, fast"),
-        (vec!["run", &d, "--mode", "fast", "--backend", "jit"], "--backend: expected reference or compiled"),
+        (vec!["run", &d, "--mode", "fast", "--backend", "turbo"], "--backend: expected jit, compiled or reference, got 'turbo'"),
         (vec!["run", &d, "--ticks", "5", "--cycles", "5"], "either --ticks or --cycles"),
         (vec!["run", &d, "--cycles", "5", "--clock", "nope"], "--clock: no net named 'nope'"),
         (vec!["run", &d, "--cycles", "5", "--clock", "rst"], "not driven by a running Clock"),
@@ -143,8 +149,9 @@ fn run_fast_writes_phase_sampled_vcd() {
     let text = std::fs::read_to_string(&vcd).unwrap();
     assert!(text.contains("$enddefinitions $end"), "{text}");
     assert!(text.contains("$dumpvars"), "{text}");
-    // Phase ends of the clock (edges every 10 ticks) up to the last cycle end, tick 89.
-    for t in ["#19", "#29", "#59", "#69", "#89"] {
+    // Phase ends of the clock (edges every 20 ticks) and of the reset release (tick 90) up to the
+    // last cycle end, tick 179.
+    for t in ["#19", "#39", "#59", "#89", "#99", "#179"] {
         assert!(text.lines().any(|l| l == t), "missing {t}:\n{text}");
     }
     assert!(text.contains("b0010 "), "Q reaches 2:\n{text}");
@@ -154,15 +161,15 @@ fn run_fast_writes_phase_sampled_vcd() {
 fn vector_files_switch_modes() {
     let d = data("counter4_clocked.json");
     let v = data("counter4_clocked_modes.vec");
-    for extra in [&[][..], &["--backend", "reference"], &["--mode", "fast"]] {
+    for extra in [&[][..], &["--backend", "reference"], &["--backend", "jit"], &["--mode", "fast"]] {
         let mut args = vec!["test", d.as_str(), v.as_str(), "-v"];
         args.extend_from_slice(extra);
         let out = ok(&args);
         assert!(out.contains("PASS: 9 of 9 checks passed"), "{extra:?}:\n{out}");
     }
-    // Every example passes in Fast mode with both backends (times count from power-on).
+    // Every example passes in Fast mode with every backend (times count from power-on).
     for name in panda_cli::examples::NAMES {
-        for backend in ["compiled", "reference"] {
+        for backend in ["jit", "compiled", "reference"] {
             let out = ok(&[
                 "test",
                 &data(&format!("{name}.json")),
@@ -192,7 +199,7 @@ fn vector_cycle_and_mode_errors() {
     std::fs::write(&vec, "cycle 4\nexpect Q=1\ncycle\nexpect Q=3\n").unwrap();
     let (c, out, _) = panda(&["test", &data("counter4_clocked.json"), vec.to_str().unwrap()]);
     assert_eq!(c, 1, "{out}");
-    assert!(out.contains("bad.vec:4: [t=89] Q: expected 0b0011, got 0b0010"), "{out}");
+    assert!(out.contains("bad.vec:4: [t=179] Q: expected 0b0011, got 0b0010"), "{out}");
 
     // Settling a clocked design fails in Timing mode, passes (inputs applied) in Fast mode.
     std::fs::write(&vec, "settle 50\n").unwrap();
@@ -216,18 +223,20 @@ fn vector_vcd_through_the_kernel() {
     assert!(out.contains("PASS"), "{out}");
     let text = std::fs::read_to_string(&vcd).unwrap();
     assert!(text.contains("$enddefinitions $end"));
-    // Timing-mode stretch sampled per tick (tick 12 is mid-phase), Fast-mode stretch per phase.
+    // Timing-mode stretch sampled per tick (Q is reset mid-phase, a few ticks after the edge at
+    // tick 20), Fast-mode stretch per phase.
     let times: Vec<u64> = text.lines().filter_map(|l| l.strip_prefix('#')?.parse().ok()).collect();
     assert!(times.windows(2).all(|w| w[0] < w[1]), "VCD time must increase: {times:?}");
-    assert!(times.contains(&12) || times.contains(&13), "{times:?}");
+    assert!(times.iter().any(|t| (21..=30).contains(t)), "{times:?}");
 }
 
 #[test]
 fn sta_reports_periods_paths_and_diagnostics() {
-    // The example clock (period 20) is faster than STA's conservative minimum.
-    let out = ok(&["sta", &data("counter4_clocked.json")]);
-    for s in ["static timing analysis:", "clocks:", "  clk: period 20, min period 24, suggested 24: TOO FAST",
-        "min periods:", "phase settle (3 event signature(s))", "critical path (", "result: NOT clean", "analysis time:"]
+    // The example clock (period 40) meets STA's minimum and the example is clean.
+    let out = ok(&["sta", &data("counter4_clocked.json"), "--strict"]);
+    for s in ["static timing analysis:", "clocks:", "  clk: period 40, min period 20, suggested 20: ok",
+        "min periods:", "phase settle (3 event signature(s))", "critical path (", "diagnostics: none", "result: clean",
+        "analysis time:"]
     {
         assert!(out.contains(s), "lacks {s:?}:\n{out}");
     }
@@ -263,7 +272,7 @@ fn classify_every_def_or_one() {
     assert!(out.contains("  clock-like pins: clk"), "{out}");
     assert!(out.contains("  edge-triggered: clk rising"), "{out}");
     assert!(out.contains("counter4 (top): sequential"), "{out}");
-    assert!(out.contains("cyclic: yes; state bits: 4; kernels: 4"), "{out}");
+    assert!(out.contains("cyclic: yes; state bits: 8; kernels: 8"), "{out}");
 
     let out = ok(&["classify", &data("adder4.json"), "full_adder"]);
     assert!(out.starts_with("full_adder: combinational"), "{out}");
@@ -291,16 +300,17 @@ fn classify_every_def_or_one() {
 fn kernels_statistics() {
     let d = data("counter4.json");
     let out = ok(&["kernels", &d]);
-    assert!(out.contains("  kernels:    4 (table 4, sim 0, keeper 0)"), "{out}");
+    // Master and slave latch of each flip-flop are separate kernels.
+    assert!(out.contains("  kernels:    8 (table 8, sim 0, keeper 0)"), "{out}");
     assert!(out.contains("size histogram"), "{out}");
-    assert!(out.contains("tables:     4 kernels with a table, 2 distinct (2 shared)"), "{out}");
+    assert!(out.contains("tables:     8 kernels with a table, 4 distinct (4 shared)"), "{out}");
     assert!(!out.contains("location"), "no list without --list:\n{out}");
     let out = ok(&["kernels", &d, "--list", "--program"]);
     assert!(out.contains("location"), "{out}");
-    assert_eq!(out.lines().filter(|l| l.contains("  table  ")).count(), 4, "{out}");
+    assert_eq!(out.lines().filter(|l| l.contains("  table  ")).count(), 8, "{out}");
     assert!(out.contains("FastSim program (compiled in"), "{out}");
     assert!(out.contains("phase specialization:"), "{out}");
-    let out = ok(&["kernels", &d, "--limit", "3"]);
+    let out = ok(&["kernels", &d, "--limit", "7"]);
     assert!(out.contains("... 1 more (use --limit N)"), "{out}");
     let out = ok(&["kernels", &data("adder4.json")]);
     assert!(out.contains("kernels:    0"), "{out}");
@@ -439,13 +449,18 @@ fn gen_cpu8_runs_programs_in_both_modes() {
 #[test]
 fn bench_compares_engines() {
     let d = data("counter4_clocked.json");
-    let out = ok(&["bench", &d, "--cycles", "300", "--engines", "timing,fastref,fastsim,kernel"]);
-    for s in ["bench: ", "kernels: 4 (table 4", "  timing ", "  fastref ", "  fastsim ", "  kernel ", "speedup vs timing:",
-        "outputs agree at tick 5989 across 4 engines"]
+    let out = ok(&["bench", &d, "--cycles", "300", "--engines", "timing,fastref,fastsim,jit,kernel"]);
+    for s in ["bench: ", "kernels: 8 (table 8", "  timing ", "  fastref ", "  fastsim ", "  jit ", "  kernel ",
+        "speedup vs timing:", "jit ", "outputs agree at tick 11979 across 5 engines"]
     {
         assert!(out.contains(s), "lacks {s:?}:\n{out}");
     }
-    assert_eq!(out.matches("300 cycles in").count(), 4, "{out}");
+    assert_eq!(out.matches("300 cycles in").count(), 5, "{out}");
+    assert!(out.contains("native)"), "{out}");
+    // The default engine set includes the JIT.
+    let out = ok(&["bench", &d, "--cycles", "20"]);
+    assert!(out.contains("  jit "), "{out}");
+    assert!(out.contains("across 4 engines"), "{out}");
     assert!(out.contains("gate evals/cycle"), "{out}");
     assert!(out.contains("ops, "), "{out}");
 

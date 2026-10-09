@@ -1,8 +1,8 @@
 //! `panda-cli` — the Panda command-line tool as a library (SPEC §2.1, M1 in §13).
 //!
 //! The `panda` binary is a thin wrapper around [`main_with_args`]. It exposes the whole kernel:
-//! Timing mode (`panda_timing`), Fast mode through the `panda_kernel` facade (FastRef or the
-//! compiled FastSim backend), static timing analysis (`panda_sta`), classification and kernel
+//! Timing mode (`panda_timing`), Fast mode through the `panda_kernel` facade (FastRef, the
+//! compiled FastSim backend or FastSim with the Cranelift JIT), static timing analysis (`panda_sta`), classification and kernel
 //! statistics (`panda_compile`), design generators (`panda_circuits`, `panda_cpu8`) and engine
 //! benchmarks. Modules:
 //!
@@ -18,7 +18,7 @@
 //! * [`examples`] — example designs (the sources of `examples-data/*.json`).
 //!
 //! Exit codes: `0` success, `1` failure (test failures, design errors, I/O errors),
-//! `2` command-line usage errors.
+//! `2` command-line usage errors. Writing to a closed pipe (`EPIPE`) ends a command with `0`.
 
 mod args;
 pub mod analysis;
@@ -67,6 +67,12 @@ impl CliError {
             CliError::Usage(_) => 2,
             _ => 1,
         }
+    }
+
+    /// True if this is a write to a closed pipe (`EPIPE`), e.g. stdout piped into `head`. The
+    /// CLI treats it as a normal end of the command.
+    pub fn is_broken_pipe(&self) -> bool {
+        matches!(self, CliError::Io { error, .. } if error.kind() == std::io::ErrorKind::BrokenPipe)
     }
 }
 

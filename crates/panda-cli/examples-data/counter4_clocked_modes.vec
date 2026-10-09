@@ -1,19 +1,19 @@
-# counter4_clocked in both modes: Clock period 20 (rising edges at 10, 30, 50, ...),
-# PowerOnReset released at tick 45. Times count from power-on in both modes; Fast mode samples
+# counter4_clocked in both modes: Clock period 40 (rising edges at 20, 60, 100, ...),
+# PowerOnReset released at tick 90. Times count from power-on in both modes; Fast mode samples
 # at the end of the phase containing each target tick.
-cycle 4                   # tick 69: edges 10 and 30 in reset, edge 50 counts
+cycle 4                   # tick 139: edges 20 and 60 in reset, edge 100 counts
 expect Q=1 rst=0
 mode fast                 # compile; state carried over from Timing mode
-cycle 1                   # tick 89
+cycle 1                   # tick 179
 expect Q=2
-cycle 10                  # tick 289
+cycle 10                  # tick 579
 expect Q=12 clk=0
 mode timing
-cycle 2                   # tick 329
+cycle 2                   # tick 659
 expect Q=14
 mode fast
-run 30                    # target 359: end of the phase [350, 359]
+run 60                    # target 719: end of the phase [700, 719]
 expect Q=0 clk=1
 reset                     # power on again (Fast mode: at the end of the first phase)
-cycle 4                   # tick 69 again
+cycle 4                   # tick 139 again
 expect Q=1

@@ -94,9 +94,9 @@ fn run_command_settles_and_prints_watched() {
     assert!(out.contains("carry[1:0] = 0b11 (0x3 = 3)"), "{out}");
 
     // Default watch = top outputs.
-    let (c, out, _) = panda(&["run", &data("counter4_clocked.json"), "--ticks", "100"]);
+    let (c, out, _) = panda(&["run", &data("counter4_clocked.json"), "--ticks", "200"]);
     assert_eq!(c, 0);
-    assert!(out.starts_with("tick 100: ran 100 ticks\n"), "{out}");
+    assert!(out.starts_with("tick 200: ran 200 ticks\n"), "{out}");
     assert!(out.contains("Q   = 0b0011"), "{out}");
     assert!(out.contains("clk = "), "{out}");
 
@@ -125,14 +125,14 @@ fn run_command_settles_and_prints_watched() {
 fn run_and_test_write_vcd() {
     let dir = scratch("vcd");
     let vcd = dir.join("c.vcd");
-    let (c, _, err) = panda(&["run", &data("counter4_clocked.json"), "--ticks", "120", "--vcd", vcd.to_str().unwrap()]);
+    let (c, _, err) = panda(&["run", &data("counter4_clocked.json"), "--ticks", "240", "--vcd", vcd.to_str().unwrap()]);
     assert_eq!(c, 0, "{err}");
     let text = std::fs::read_to_string(&vcd).unwrap();
     assert!(text.contains("$timescale 1ns $end"));
     assert!(text.contains("$var wire 4 ! Q [3:0] $end"), "{text}");
     assert!(text.contains("$var wire 1 # rst $end"), "{text}");
-    assert!(text.contains("#45\n0#"), "reset release at tick 45: {text}");
-    assert!(text.contains("\n#120\n"), "final timestamp: {text}");
+    assert!(text.contains("#90\n0#"), "reset release at tick 90: {text}");
+    assert!(text.contains("\n#240\n"), "final timestamp: {text}");
 
     let vcd2 = dir.join("t.vcd");
     let (c, _, err) = panda(&[
@@ -165,7 +165,7 @@ fn info_command() {
     assert!(out.contains("defs:   4"), "{out}");
     assert!(out.contains("counter4_clocked (top)"), "{out}");
     assert!(out.contains("instances: 5 (atoms: nand 4, not 1; defs: none)"), "{out}");
-    assert!(out.contains("gates:     56 (and 7, nand 32, not 14, xor 3)"), "{out}");
+    assert!(out.contains("gates:     60 (and 7, buf 4, nand 32, not 14, xor 3)"), "{out}");
     assert!(out.contains("sources:   2 (clock 1, power-on-reset 1)"), "{out}");
     assert!(out.contains("d_latch 8"), "{out}");
     assert!(out.contains("diagnostics: none"), "{out}");
@@ -228,4 +228,55 @@ fn library_entry_point_matches_binary() {
         let a: Vec<&str> = args.iter().map(String::as_str).collect();
         assert_eq!(lib(&a), panda(&a), "{args:?}");
     }
+}
+
+/// A writer whose reader has gone away: every write fails with `BrokenPipe` (`EPIPE`).
+struct ClosedPipe;
+
+impl std::io::Write for ClosedPipe {
+    fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+        Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn broken_pipe_on_stdout_is_a_normal_exit() {
+    // In process: the first write to stdout fails with EPIPE; nothing is reported, exit code 0.
+    for args in [&["info", &data("counter4_clocked.json")][..], &["flat", &data("adder4.json"), "--json"], &["help"]] {
+        let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        let mut err = Vec::new();
+        let code = panda_cli::main_with_args(&args, &mut ClosedPipe, &mut err);
+        assert_eq!(code, 0, "{args:?}: {}", String::from_utf8_lossy(&err));
+        assert!(err.is_empty(), "{args:?}: {}", String::from_utf8_lossy(&err));
+    }
+    // Other output errors still fail.
+    struct Full;
+    impl std::io::Write for Full {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("disk full"))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut err = Vec::new();
+    let code = panda_cli::main_with_args(&["help".to_string()], &mut Full, &mut err);
+    assert_eq!(code, 1);
+    assert!(String::from_utf8_lossy(&err).contains("disk full"));
+
+    // The binary with its stdout pipe closed by the reader (`panda flat --json x | head -c0`).
+    let mut child = Command::new(env!("CARGO_BIN_EXE_panda"))
+        .args(["flat", &data("counter4_clocked.json"), "--json"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn panda");
+    drop(child.stdout.take());
+    let o = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&o.stderr);
+    assert_eq!(o.status.code(), Some(0), "{stderr}");
+    assert!(!stderr.contains("Broken pipe"), "{stderr}");
 }

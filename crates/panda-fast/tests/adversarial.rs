@@ -1461,9 +1461,9 @@ fn huge_fanout_net_compiles() {
     );
 }
 
-/// `load_state` with perturbed (unsettled, partly `X`/`Z`) states: an optimized engine and an
-/// unoptimized one (no specialization, LUTs, fusion; one-op partitions) built from the same
-/// kernels stay identical afterwards (values of all nets, tick, schedule, fallback count,
+/// `load_state` with perturbed (unsettled, partly `X`/`Z`) states: an optimized engine, an
+/// unoptimized one (no specialization, LUTs, fusion; one-op partitions) and FastRef built from
+/// the same kernels stay identical afterwards (values of all nets, tick, schedule, fallback count,
 /// diagnostic kinds), including loads in the middle of a phase and at arbitrary ticks.
 #[test]
 fn load_perturbed_states() {
@@ -1486,7 +1486,7 @@ fn load_perturbed_states() {
             ..FastOptions::default()
         };
         let compile = random_compile(&mut rng, &[1, 3, 8, 64]);
-        let (_, mut a) = pair(&flat, &fast, &compile);
+        let (mut r, mut a) = pair(&flat, &fast, &compile);
         let mut b = FastSim::from_parts(
             flat.clone(),
             panda_fast::FastSimOptions {
@@ -1511,8 +1511,10 @@ fn load_perturbed_states() {
                     let v = random_value(&mut rng, w, 20);
                     a.set_input(&name, &v).unwrap();
                     b.set_input(&name, &v).unwrap();
+                    r.set_input(&name, &v).unwrap();
                 }
                 assert_eq!(a.step_event(), b.step_event(), "{ctx}");
+                r.step_event();
             }
             // A perturbed state.
             let mut vals = a.values().to_vec();
@@ -1535,6 +1537,8 @@ fn load_perturbed_states() {
             }
             let fa = a.load_state(tick, &vals, &inputs);
             let fb = b.load_state(tick, &vals, &inputs);
+            let fr = r.load_state(tick, &vals, &inputs);
+            assert_eq!(fa, fr, "{ctx}: load report (FastRef)");
             for e in [&a, &b] {
                 e.check_invariants()
                     .unwrap_or_else(|m| panic!("{ctx}: after load: {m}"));
@@ -1543,6 +1547,15 @@ fn load_perturbed_states() {
             for e in 0..40 {
                 let ectx = format!("{ctx} event {e}");
                 assert_eq!(a.values(), b.values(), "{ectx}: values");
+                assert_eq!(a.values(), r.values(), "{ectx}: values (FastRef)");
+                assert_eq!(a.tick(), r.tick(), "{ectx}: tick (FastRef)");
+                assert_eq!(a.next_event_tick(), r.next_event_tick(), "{ectx} (FastRef)");
+                let mut kr: Vec<String> = r
+                    .take_diagnostics()
+                    .iter()
+                    .map(|d| format!("{:?}", d.kind))
+                    .collect();
+                kr.sort();
                 assert_eq!(a.tick(), b.tick(), "{ectx}");
                 assert_eq!(a.next_event_tick(), b.next_event_tick(), "{ectx}");
                 let mut ka: Vec<String> = a
@@ -1558,13 +1571,17 @@ fn load_perturbed_states() {
                 ka.sort();
                 kb.sort();
                 assert_eq!(ka, kb, "{ectx}: diagnostics");
+                assert_eq!(ka, kr, "{ectx}: diagnostics (FastRef)");
                 if !pins.is_empty() && rng.chance(25) {
                     let (name, w) = rng.pick(&pins).clone();
                     let v = random_value(&mut rng, w, 20);
                     a.set_input(&name, &v).unwrap();
                     b.set_input(&name, &v).unwrap();
+                    r.set_input(&name, &v).unwrap();
                 }
-                assert_eq!(a.step_event(), b.step_event(), "{ectx}: step");
+                let sa = a.step_event();
+                assert_eq!(sa, b.step_event(), "{ectx}: step");
+                assert_eq!(sa, r.step_event(), "{ectx}: step (FastRef)");
                 for e in [&a, &b] {
                     e.check_invariants()
                         .unwrap_or_else(|m| panic!("{ectx}: after step: {m}"));

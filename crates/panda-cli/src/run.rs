@@ -28,7 +28,7 @@ fn mode_and_backend(a: &Args) -> Result<(Option<Mode>, Option<FastBackend>), Cli
     let mode = a.choice("mode", &["timing", "fast"])?.and_then(fastmode::parse_mode);
     let backend = match a.last("backend") {
         Some(b) => Some(fastmode::parse_backend(b).ok_or_else(|| {
-            CliError::Usage(format!("--backend: expected reference or compiled, got '{b}'"))
+            CliError::Usage(format!("--backend: expected jit, compiled or reference, got '{b}'"))
         })?),
         None => None,
     };

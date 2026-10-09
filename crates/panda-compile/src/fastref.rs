@@ -42,6 +42,11 @@
 //! (`Z`, pull-up `1`, pull-down `0`, keeper `X`), sources take their tick-0 values. Every kernel
 //! transitions once at tick 0 (from its all-`X` state), and all combinational logic is evaluated.
 //!
+//! State loading ([`FastRef::load_state`], used by the `panda-kernel` facade for mode switches,
+//! edits and snapshots): kernels whose loaded state is consistent with their inputs keep it;
+//! the others *finish* their transition from the loaded values (only a kernel that does not
+//! settle restarts from `X`). `panda_fast::FastSim::load_state` has exactly these semantics.
+//!
 //! # Diagnostics
 //!
 //! * `DelaySensitive` (warning): a table entry was used for a transition in which ≥ 2 kernel
@@ -119,6 +124,15 @@ pub struct FastRefStats {
     pub sim_fallbacks: u64,
     /// Combinational gate/resolver evaluations.
     pub comb_evals: u64,
+}
+
+/// Outcome of [`FastRef::load_state`] (and of `panda_fast::FastSim::load_state`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LoadReport {
+    /// Kernels whose loaded state was not consistent with their inputs.
+    pub inconsistent: usize,
+    /// Of those, kernels that did not settle and restarted from `X`.
+    pub fallen: usize,
 }
 
 /// A time-varying source.
@@ -215,6 +229,8 @@ pub struct FastRef {
     timed: Vec<(NetIdx, Timed)>,
     /// Top-level input sources: (net, pin, bit).
     input_srcs: Vec<(NetIdx, u32, u32)>,
+    /// Nets without any driver and their (constant) value: `Z`, or their termination's.
+    undriven: Vec<(NetIdx, Logic)>,
     /// On-the-fly simulators, shared by structurally identical kernels.
     sims: Vec<KernelSim>,
     sim_by_key: HashMap<Vec<u32>, u32>,
@@ -349,6 +365,27 @@ impl FastRef {
             }
         }
 
+        let mut driven = vec![false; n];
+        for g in &flat.gates {
+            driven[g.output as usize] = true;
+        }
+        for r in &flat.resolvers {
+            driven[r.output as usize] = true;
+        }
+        for src in &flat.sources {
+            driven[src.output as usize] = true;
+        }
+        let undriven = (0..flat.num_nets)
+            .filter(|&net| !driven[net as usize])
+            .map(|net| {
+                let v = match flat.undriven_termination.get(&net) {
+                    Some(&term) => terminate(term, Logic::X),
+                    None => Logic::Z,
+                };
+                (net, v)
+            })
+            .collect();
+
         let mut off = 0usize;
         let kst = ks
             .kernels
@@ -387,6 +424,7 @@ impl FastRef {
             kern_rd,
             timed,
             input_srcs,
+            undriven,
             sims: Vec::new(),
             sim_by_key: HashMap::new(),
             order_memo: HashMap::new(),
@@ -629,6 +667,141 @@ impl FastRef {
     /// Counters since the last reset.
     pub fn stats(&self) -> FastRefStats {
         self.stats
+    }
+
+    /// Load a state (mode switches, edits and snapshots of the `panda-kernel` facade).
+    ///
+    /// * The engine's time becomes `tick`: the next event is the first source change after
+    ///   `tick`, and the loaded values are taken as the settled values of the phase containing
+    ///   `tick`.
+    /// * `inputs[i]` becomes the value of top-level input pin `i` (pins whose width does not match
+    ///   keep their value); no input change is pending afterwards.
+    /// * `values` (one per net) is loaded; sources then take their values at `tick`, nets without
+    ///   a driver their constant value (`Z`, or that of their termination), and all
+    ///   combinational logic is re-evaluated from the kernel nets and the sources.
+    /// * Kernels are then visited in index order. Every kernel whose loaded state is consistent
+    ///   with its current inputs (a table state that the table maps to itself under the binary
+    ///   input vector, or else a fixed point of the kernel's gates and resolvers) keeps it and
+    ///   records the current inputs as those of its last transition.
+    /// * Every other kernel is in the middle of a transition (e.g. a Timing-mode state taken
+    ///   before the design was quiescent, or a poked net): it *finishes* it, i.e. its gates are
+    ///   simulated with Timing-mode semantics (period-2 collapse included) from the loaded state
+    ///   under its current inputs until quiescent — the same simulation that defines `T` — and
+    ///   the current inputs are recorded as those of its last transition. The finished state is
+    ///   written at once, so kernels visited later see it on their inputs (kernels visited
+    ///   earlier see it as an input change). No diagnostic and no statistic comes from this
+    ///   simulation. Only a kernel that does not settle within the characterization bound falls
+    ///   back to all-`X` and transitions from there (exactly like at power-on).
+    /// * Changed kernel nets then propagate as part of a settling event processed at `tick`.
+    ///
+    /// Statistics and the "already reported" state of diagnostics are kept. Returns how many
+    /// kernels were inconsistent and how many of them fell back to `X`.
+    ///
+    /// # Panics
+    ///
+    /// If `values.len()` differs from the number of nets.
+    pub fn load_state(&mut self, tick: u64, values: &[Logic], inputs: &[Value]) -> LoadReport {
+        assert_eq!(
+            values.len(),
+            self.values.len(),
+            "load_state: one value per net"
+        );
+        for (slot, v) in self.input_values.iter_mut().zip(inputs) {
+            if slot.width() == v.width() {
+                *slot = v.clone();
+            }
+        }
+        self.inputs_pending = false;
+        self.tick = tick;
+        self.values.copy_from_slice(values);
+        for &(net, v) in &self.undriven {
+            self.values[net as usize] = v;
+        }
+        let flat = self.flat.clone();
+        for s in &flat.sources {
+            if let SourceKind::Constant(v) = s.kind {
+                self.values[s.output as usize] = v;
+            }
+        }
+        for &(net, t) in &self.timed {
+            self.values[net as usize] = t.value_at(tick);
+        }
+        for &(net, pin, bit) in &self.input_srcs {
+            self.values[net as usize] = self.input_values[pin as usize].get(bit);
+        }
+        for k in &mut self.kst {
+            k.frozen = false;
+        }
+        self.frozen_list.clear();
+        // Combinational logic from the loaded kernel nets and sources.
+        self.heap.clear();
+        self.scheduled.fill(true);
+        for pos in 0..self.ks.comb_order.len() as u32 {
+            self.heap.push(Reverse(pos));
+        }
+        self.eval_comb();
+        for &k in &self.cand {
+            self.is_cand[k as usize] = false;
+        }
+        self.cand.clear();
+        // Kernel consistency.
+        let mut report = LoadReport::default();
+        for k in 0..self.ks.kernels.len() as u32 {
+            let ki = k as usize;
+            let state = self.state_vec(k);
+            let table_id = self.tables[ki].as_deref().and_then(|t| t.lookup(&state));
+            let inputs: Vec<Logic> = self.ks.kernels[ki]
+                .inputs
+                .iter()
+                .map(|&n| self.values[n as usize])
+                .collect();
+            let consistent = match (
+                self.tables[ki].as_deref(),
+                table_id,
+                self.current_input_index(k),
+            ) {
+                (Some(t), Some(id), Some(v)) => t.transition(id, v).next == Some(id),
+                _ => {
+                    let si = self.sim_index(k);
+                    self.sims[si].is_fixed_point(&state, &inputs)
+                }
+            };
+            if consistent {
+                self.record_inputs(k);
+                self.kst[ki].state_id = table_id.unwrap_or(NONE);
+                continue;
+            }
+            report.inconsistent += 1;
+            // Finish the transition under the current inputs (every kernel gate is evaluated at
+            // the first simulated tick, so internal inconsistencies resolve too).
+            let si = self.sim_index(k);
+            let (next, settled) = self.sims[si].transition(&state, &inputs, &inputs);
+            if settled.quiescent {
+                for (j, &v) in next.iter().enumerate() {
+                    let net = self.ks.kernels[ki].nets[j];
+                    self.set_net(net, v);
+                }
+                self.record_inputs(k);
+                self.kst[ki].state_id = self.tables[ki]
+                    .as_deref()
+                    .and_then(|t| t.lookup(&next))
+                    .unwrap_or(NONE);
+            } else {
+                report.fallen += 1;
+                self.kst[ki].ever = false;
+                self.kst[ki].state_id = NONE;
+                for j in 0..self.ks.kernels[ki].nets.len() {
+                    let net = self.ks.kernels[ki].nets[j];
+                    self.set_net(net, Logic::X);
+                }
+                if !self.is_cand[ki] {
+                    self.is_cand[ki] = true;
+                    self.cand.push(k);
+                }
+            }
+        }
+        self.process_event();
+        report
     }
 
     // -----------------------------------------------------------------------------------------

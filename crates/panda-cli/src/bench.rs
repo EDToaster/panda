@@ -1,19 +1,24 @@
 //! `panda bench`: clock-cycle throughput of the engines on one design.
 //!
-//! Engines (`--engines`, comma-separated; default `timing,fastref,fastsim`):
+//! Engines (`--engines`, comma-separated; default `timing,fastref,fastsim,jit`):
 //!
 //! * `timing` — the unit-delay reference engine ([`TimingSim`]);
 //! * `fastref` — the Fast-mode oracle ([`FastRef`], SPEC §6.2);
-//! * `fastsim` — the compiled Fast-mode engine ([`FastSim`]);
-//! * `kernel` — the `panda_kernel` facade in Fast mode with the compiled backend (FastSim plus
-//!   the facade's per-step bookkeeping).
+//! * `fastsim` — the compiled Fast-mode engine ([`FastSim`], bytecode interpreter);
+//! * `jit` — [`FastSim`] with its program compiled to native code by the Cranelift JIT
+//!   ([`panda_jit`], SPEC §8.9) and installed before the run (the setup time includes the JIT
+//!   compilation);
+//! * `kernel` — the `panda_kernel` facade in Fast mode with its default backend
+//!   ([`FastBackend::Jit`](panda_kernel::FastBackend::Jit): FastSim plus the JIT, plus the
+//!   facade's per-step bookkeeping).
 //!
 //! A *cycle* is one period of the reference clock (`--clock`, default the first running clock);
 //! every engine is advanced to the same sample points (one tick before a rising edge). With
 //! `--cycles N` every engine runs exactly `N` cycles from power-on and the top-level outputs are
 //! compared at the end (exit code 1 on a mismatch); otherwise each engine runs for `--seconds S`
 //! (default 1) after a one-cycle warm-up, in chunks of cycles sized to the remaining time.
-//! Kernel extraction and characterization are done once and shared by `fastref` and `fastsim`.
+//! Kernel extraction and characterization are done once and shared by `fastref`, `fastsim` and
+//! `jit`.
 
 use std::io::Write;
 use std::sync::Arc;
@@ -33,13 +38,18 @@ use crate::commands::{load_netlist, out_err, timing_options};
 use crate::fastmode::{self, KernelSettings, dur, rate, si};
 
 /// Engine names accepted by `--engines`.
-pub const ENGINES: &[&str] = &["timing", "fastref", "fastsim", "kernel"];
+pub const ENGINES: &[&str] = &["timing", "fastref", "fastsim", "jit", "kernel"];
+
+/// Engines run when `--engines` is not given.
+pub const DEFAULT_ENGINES: &[&str] = &["timing", "fastref", "fastsim", "jit"];
 
 /// One benchmarked engine.
 enum Engine {
     Timing(Box<TimingSim>),
     FastRef(Box<FastRef>),
     FastSim(Box<FastSim>),
+    /// A [`FastSim`] with JIT-compiled native code installed.
+    Jit(Box<FastSim>),
     Kernel(Box<Kernel>),
 }
 
@@ -58,7 +68,7 @@ impl Engine {
             // The fast engines' values at a sample point are those of Timing mode at
             // `next_event - 1`; run_to targets are always such points.
             Engine::FastRef(s) => s.next_event_tick().map_or(s.tick(), |e| e - 1),
-            Engine::FastSim(s) => s.next_event_tick().map_or(s.tick(), |e| e - 1),
+            Engine::FastSim(s) | Engine::Jit(s) => s.next_event_tick().map_or(s.tick(), |e| e - 1),
             Engine::Kernel(k) => k.tick(),
         }
     }
@@ -72,7 +82,7 @@ impl Engine {
                 }
             }
             Engine::FastRef(s) => s.run_until(t),
-            Engine::FastSim(s) => s.run_until(t),
+            Engine::FastSim(s) | Engine::Jit(s) => s.run_until(t),
             Engine::Kernel(k) => k.run_to(t),
         }
     }
@@ -81,7 +91,7 @@ impl Engine {
         match self {
             Engine::Timing(s) => s.values().to_vec(),
             Engine::FastRef(s) => s.values().to_vec(),
-            Engine::FastSim(s) => s.values().to_vec(),
+            Engine::FastSim(s) | Engine::Jit(s) => s.values().to_vec(),
             Engine::Kernel(k) => fastmode::values(k),
         }
     }
@@ -99,6 +109,10 @@ impl Engine {
             Engine::FastSim(s) => {
                 let st = s.stats();
                 Work { a: st.ops, b: st.partitions, c: st.transitions }
+            }
+            Engine::Jit(s) => {
+                let st = s.stats();
+                Work { a: st.rounds, b: st.native_rounds, c: st.native_bails }
             }
             Engine::Kernel(_) => Work::default(),
         }
@@ -125,7 +139,13 @@ impl Engine {
                 per(before.b, after.b),
                 per(before.c, after.c)
             ),
-            Engine::Kernel(_) => "facade over FastSim".into(),
+            Engine::Jit(_) => format!(
+                "{:.1} kernel rounds ({:.1} native), {:.2} native bails per cycle",
+                per(before.a, after.a),
+                per(before.b, after.b),
+                per(before.c, after.c)
+            ),
+            Engine::Kernel(_) => "facade, default backend".into(),
         }
     }
 }
@@ -165,7 +185,7 @@ pub(crate) fn cmd_bench(args: &[String], out: &mut dyn Write, err: &mut dyn Writ
                 })
             })
             .collect::<Result<_, _>>()?,
-        None => vec!["timing", "fastref", "fastsim"],
+        None => DEFAULT_ENGINES.to_vec(),
     };
     if engines.is_empty() {
         return Err(CliError::Usage("--engines: no engine given".into()));
@@ -202,7 +222,7 @@ pub(crate) fn cmd_bench(args: &[String], out: &mut dyn Write, err: &mut dyn Writ
     .map_err(out_err)?;
 
     // Kernel tables, shared by FastRef and FastSim.
-    let needs_tables = engines.iter().any(|e| *e == "fastref" || *e == "fastsim");
+    let needs_tables = engines.iter().any(|e| matches!(*e, "fastref" | "fastsim" | "jit"));
     let fopts = FastOptions::default();
     let parts = if needs_tables {
         let t0 = Instant::now();
@@ -364,10 +384,22 @@ fn build(
             }
             Engine::FastSim(Box::new(s))
         }
+        "jit" => {
+            let (ks, tables) = parts();
+            let mut s =
+                FastSim::from_parts(nl.clone(), FastSimOptions::from(fopts.clone()), ks, tables).map_err(CliError::Design)?;
+            panda_jit::Jit::new(panda_jit::JitOptions::default())
+                .install(&mut s)
+                .map_err(|e| CliError::Other(format!("JIT compilation failed: {e}")))?;
+            for (p, v) in sets {
+                s.set_input(p, v).map_err(CliError::Other)?;
+            }
+            Engine::Jit(Box::new(s))
+        }
         "kernel" => {
             let settings = KernelSettings {
                 timing: topts.clone(),
-                backend: panda_kernel::FastBackend::Compiled,
+                backend: panda_kernel::FastBackend::default(),
                 cycle_clock: Some(clock.name.clone()),
                 max_settle_ticks: crate::vectors::DEFAULT_SETTLE_MAX,
             };

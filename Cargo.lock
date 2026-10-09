@@ -330,6 +330,7 @@ dependencies = [
  "panda-compile",
  "panda-cpu8",
  "panda-fast",
+ "panda-jit",
  "panda-kernel",
  "panda-netlist",
  "panda-sta",

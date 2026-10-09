@@ -137,7 +137,9 @@ fn counter4_def(db: &mut DesignBuilder) -> DefRef {
             Some(c) => b.and(&[c, qi]),
         });
         let d = b.and(&[n, rst_n]);
-        let out = b.inst_named(&format!("ff{i}"), &dff, &[d, clk]);
+        // Hold buffer: delays D so that it changes only after the master latch has closed.
+        let d_hold = b.buf(d);
+        let out = b.inst_named(&format!("ff{i}"), &dff, &[d_hold, clk]);
         b.connect(out[0], qi);
         next.push(d);
     }
@@ -149,21 +151,27 @@ fn counter4_def(db: &mut DesignBuilder) -> DefRef {
 }
 
 /// 4-bit synchronous up-counter with synchronous active-high reset: `clk`, `rst` → `Q[4]`.
-/// The state changes a few ticks after a rising edge of `clk`.
+/// The state changes a few ticks after a rising edge of `clk`. Each flip-flop's `D` passes through
+/// a hold buffer, so data changes caused by an edge reach a master latch only after it has closed
+/// (STA hold check, SPEC §9.2); this also keeps each flip-flop's master and slave latches separate
+/// kernels.
 pub fn counter4() -> Design {
     let mut db = DesignBuilder::new();
     let top = counter4_def(&mut db);
     db.build(&top)
 }
 
-/// [`counter4`] wrapped in a top def that drives it from a `Clock` (period 20, high 10, rising at
-/// tick 10) and a `PowerOnReset` held for 45 ticks. Outputs `Q[4]` and the clock as `clk`.
+/// [`counter4`] wrapped in a top def that drives it from a `Clock` (period 40, high 20, rising at
+/// tick 20) and a `PowerOnReset` held for 90 ticks. Outputs `Q[4]` and the clock as `clk`.
+///
+/// The period is at least the STA minimum (20), and the reset is released mid-way between a falling
+/// and a rising edge, so `panda sta` reports the design clean.
 pub fn counter4_clocked() -> Design {
     let mut db = DesignBuilder::new();
     let counter = counter4_def(&mut db);
     let mut b = DefBuilder::new("counter4_clocked");
-    let clk = b.clock(20, 10, 10);
-    let rst = b.power_on_reset(45);
+    let clk = b.clock(40, 20, 20);
+    let rst = b.power_on_reset(90);
     b.name(rst, "rst");
     let q = b.inst_named("cnt", &counter, &[clk, rst]);
     b.output("Q", q[0]);

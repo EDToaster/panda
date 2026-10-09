@@ -20,6 +20,7 @@ panda-compile.workspace = true
 panda-fast.workspace = true
 panda-sta.workspace = true
 panda-kernel.workspace = true
+panda-jit.workspace = true
 panda-circuits.workspace = true
 panda-cpu8.workspace = true
 serde_json.workspace = true

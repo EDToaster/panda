@@ -286,15 +286,8 @@ impl Chain {
         }
         self.events += 1;
         self.check_fast("clock event");
-        let last = self.fr.next_event_tick().is_none();
         for (_, k) in &mut self.facade {
             k.step(1, StepUnit::Phase);
-            if last {
-                // Known facade bug (see `facade_fast_phase_step_processes_the_last_event`):
-                // with no source change after the next event, `step(1, Phase)` in Fast mode does
-                // not process that event. `run_to` does.
-                k.run_to(self.fr.tick());
-            }
         }
         self.check_facade("clock event");
     }
@@ -716,7 +709,6 @@ fn panda8_full_chain_long() {
 /// semantics; panda-kernel docs "Time": "Without any future source change, `Phase` and `Cycle`
 /// let pending input changes settle").
 #[test]
-#[ignore = "known bug in panda-kernel (advance_fast ignores Target::Settle); reported by the audit"]
 fn facade_fast_phase_step_processes_the_last_event() {
     use panda_netlist::{DefBuilder, DesignBuilder};
     let mut db = DesignBuilder::new();

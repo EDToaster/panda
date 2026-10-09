@@ -958,6 +958,16 @@ fn verify_kfast(prog: &Program) -> Result<(), String> {
     {
         return Err("per-tuple kernel tables have the wrong size".into());
     }
+    // The fast paths (and native code) index `vact` by the kernel's input vector.
+    for (c, cl) in prog.kclasses.iter().enumerate() {
+        if cl.num_inputs >= 32 || cl.vact.len() as u64 != 1u64 << cl.num_inputs {
+            return Err(format!(
+                "kernel class {c}: {} specialized actions for {} inputs",
+                cl.vact.len(),
+                cl.num_inputs
+            ));
+        }
+    }
     for t in 0..nt {
         for (k, kop) in prog.kernel_ops.iter().enumerate() {
             let (tout, pure) = (prog.ktout[t * nk + k], prog.kpure[t * nk + k]);

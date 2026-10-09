@@ -3,11 +3,11 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use panda_compile::{CharzOptions, FastOptions, KernelKind, KernelOptions, KernelSim, TableCache};
+use panda_compile::{
+    CharzOptions, FastOptions, FastRef, KernelKind, KernelOptions, KernelSim, TableCache,
+};
 use panda_netlist::flat::FlatNetlist;
 use panda_netlist::{DefId, Logic, Value};
-
-use crate::refengine::RefEngine;
 
 /// The class of a package (SPEC §4.4).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -91,7 +91,7 @@ pub(crate) fn classify(
     def: &str,
     flat: Arc<FlatNetlist>,
     fopts: &FastOptions,
-    cache: &mut TableCache,
+    cache: &TableCache,
 ) -> Classification {
     let kopts = KernelOptions {
         extract: fopts.extract.clone(),
@@ -159,7 +159,7 @@ pub(crate) fn classify(
         clock_analysis: false,
     };
     if kind == ClassKind::Sequential
-        && let Ok(engine) = RefEngine::from_parts(flat.clone(), fopts.clone(), ks, tables)
+        && let Ok(engine) = FastRef::from_parts(flat.clone(), fopts.clone(), ks, tables)
         && let Some((pins, edge)) = clock_like(&flat, engine)
     {
         c.clock_like_pins = pins;
@@ -286,7 +286,7 @@ fn ternary_combinational(
 #[allow(clippy::type_complexity)]
 fn clock_like(
     flat: &FlatNetlist,
-    mut eng: RefEngine,
+    mut eng: FastRef,
 ) -> Option<(Vec<String>, Option<(String, Edge)>)> {
     use panda_netlist::flat::SourceKind;
     if flat.sources.iter().any(|s| {

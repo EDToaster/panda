@@ -57,7 +57,7 @@ use std::sync::Arc;
 
 use panda_compile::subnet::{kernel_subnet, structural_key};
 use panda_compile::{
-    FastOptions, KernelOptions, KernelSet, KernelSim, KernelTable, TableCache,
+    FastOptions, KernelOptions, KernelSet, KernelSim, KernelTable, LoadReport, TableCache,
     compile_kernels_with_cache,
 };
 use panda_netlist::eval::terminate;
@@ -240,15 +240,16 @@ impl FastSim {
     /// Compile `flat` (kernel extraction, characterization, program) and power it on (processes
     /// the tick-0 event).
     pub fn new(flat: Arc<FlatNetlist>, opts: FastSimOptions) -> Result<FastSim, Vec<Diagnostic>> {
-        let mut cache = TableCache::new();
-        FastSim::with_cache(flat, opts, &mut cache)
+        FastSim::with_cache(flat, opts, &TableCache::new())
     }
 
-    /// [`FastSim::new`] with a caller-provided table cache.
+    /// [`FastSim::new`] with a caller-provided table cache (reusable across netlists compiled
+    /// with the same characterization options; internally synchronized, `&mut` is not
+    /// required).
     pub fn with_cache(
         flat: Arc<FlatNetlist>,
         opts: FastSimOptions,
-        cache: &mut TableCache,
+        cache: &TableCache,
     ) -> Result<FastSim, Vec<Diagnostic>> {
         let kopts = KernelOptions {
             extract: opts.fast.extract.clone(),
@@ -541,8 +542,8 @@ impl FastSim {
         self.process_event();
     }
 
-    /// Load a state (the facade's `load_state`, same semantics as `panda_kernel`'s reference
-    /// engine):
+    /// Load a state: exactly `panda_compile::FastRef::load_state` (the semantics the
+    /// `panda-kernel` facade uses for mode switches, edits and snapshots):
     ///
     /// * The engine's time becomes `tick`: the next event is the first source change after
     ///   `tick`, and the loaded values are taken as the settled values of the phase containing
@@ -552,19 +553,25 @@ impl FastSim {
     /// * `values` (one per net) is loaded; sources then take their values at `tick`, nets without
     ///   a driver their constant value (`Z`, or that of their termination), and all
     ///   combinational logic is re-evaluated from the kernel nets and the sources.
-    /// * Every kernel whose loaded state is consistent with its current inputs (a table state that
-    ///   the table maps to itself under the binary input vector, or else a fixed point of the
-    ///   kernel's gates and resolvers) keeps it and records the current inputs as those of its
-    ///   last transition. Every other kernel falls back to all-`X` and transitions from there
-    ///   (exactly like at power-on) as part of a settling event processed at `tick`.
+    /// * Kernels are then visited in index order. Every kernel whose loaded state is consistent
+    ///   with its current inputs (a table state that the table maps to itself under the binary
+    ///   input vector, or else a fixed point of the kernel's gates and resolvers) keeps it and
+    ///   records the current inputs as those of its last transition.
+    /// * Every other kernel *finishes* its transition: its gates are simulated with Timing-mode
+    ///   semantics from the loaded state under its current inputs until quiescent (no
+    ///   diagnostic, no statistic), the result is written at once (kernels visited later see it
+    ///   on their inputs, kernels visited earlier as an input change), and the current inputs are
+    ///   recorded. Only a kernel that does not settle within the characterization bound falls
+    ///   back to all-`X` and transitions from there (exactly like at power-on).
+    /// * Changed kernel nets then propagate as part of a settling event processed at `tick`.
     ///
-    /// Statistics and the "already reported" state of diagnostics are kept. Returns the number of
-    /// kernels that fell back to `X`.
+    /// Statistics and the "already reported" state of diagnostics are kept. Returns how many
+    /// kernels were inconsistent and how many of them fell back to `X`.
     ///
     /// # Panics
     ///
     /// If `values.len()` differs from the number of nets.
-    pub fn load_state(&mut self, tick: u64, values: &[Logic], inputs: &[Value]) -> usize {
+    pub fn load_state(&mut self, tick: u64, values: &[Logic], inputs: &[Value]) -> LoadReport {
         assert_eq!(
             values.len(),
             self.prog.num_nets as usize,
@@ -627,70 +634,101 @@ impl FastSim {
         m.bepoch.fill(u32::MAX);
         m.next_epoch(&self.prog);
         m.init_kin(&self.prog, self.values.get_mut());
-        // Kernel consistency.
-        let mut fallen = 0;
+        // Kernel consistency, in index order (FastRef's order: a finished kernel's new state is
+        // visible to the kernels checked after it).
+        let mut report = LoadReport::default();
         for k in 0..nk as u32 {
             let ki = k as usize;
-            let state = self.state_vec(k, None);
+            let mut state = self.state_vec(k, None);
             let v = self.current_index(k);
             let table_id = self.tables[ki].as_deref().and_then(|t| t.lookup(&state));
+            let inputs: Vec<Logic> = {
+                let vals = self.values.get_mut();
+                self.ks.kernels[ki]
+                    .inputs
+                    .iter()
+                    .map(|&n| vals[n as usize])
+                    .collect()
+            };
             let consistent = match (self.tables[ki].as_deref(), table_id, v) {
                 (Some(t), Some(id), Some(v)) => t.transition(id, v).next == Some(id),
                 _ => {
-                    let vals = self.values.get_mut();
-                    let inputs: Vec<Logic> = self.ks.kernels[ki]
-                        .inputs
-                        .iter()
-                        .map(|&n| vals[n as usize])
-                        .collect();
                     let si = self.sim_index(k);
                     self.sims[si].is_fixed_point(&state, &inputs)
                 }
             };
             self.kst[ki].state_id = NONE;
-            if consistent {
-                self.kst[ki].ever = true;
-                clear_bit(&mut self.unsynced, k);
-                self.glast[ki] = v.unwrap_or(NONE);
-                // A table state of a kernel with a class, reached under binary inputs.
-                if let (KernelOpKind::KTable { table }, Some(_)) =
-                    (self.prog.kernel_ops[ki].kind, v)
-                {
-                    self.kst[ki].state_id = self.prog.ktables[table as usize]
-                        .table
-                        .lookup(&state)
-                        .unwrap_or(NONE);
-                    if self.prog.kernel_class[ki] != NONE && self.kst[ki].state_id != NONE {
-                        set_bit(&mut self.rt.marks.fastok, k);
+            let kop = self.prog.kernel_ops[ki];
+            if !consistent {
+                report.inconsistent += 1;
+                let si = self.sim_index(k);
+                let (next, settled) = self.sims[si].transition(&state, &inputs, &inputs);
+                if !settled.quiescent {
+                    report.fallen += 1;
+                    self.kst[ki].ever = false;
+                    set_bit(&mut self.unsynced, k);
+                    clear_bit(&mut self.rt.marks.fastok, k);
+                    self.kob[ki] = NONE;
+                    let vals = self.values.get_mut();
+                    for &net in self.prog.kernel_state_nets(&kop) {
+                        exec::set_net(&self.prog, vals, &mut self.rt.marks, net, Logic::X);
                     }
+                    set_bit(&mut self.rt.marks.kpending, k);
+                    continue;
                 }
-                let kop = self.prog.kernel_ops[ki];
-                let vals = self.values.get_mut();
-                let outs = self.prog.kernel_out_nets(&kop);
-                // Kept for kernels with a class only (as `write_state` does): the others never
-                // update it.
-                self.kob[ki] = if self.prog.kernel_class[ki] != NONE
-                    && outs.len() <= 31
-                    && outs.iter().all(|&n| vals[n as usize].is_known())
-                {
-                    current_outputs(&self.prog, vals, k)
-                } else {
-                    NONE
-                };
-            } else {
-                fallen += 1;
-                self.kst[ki].ever = false;
-                set_bit(&mut self.unsynced, k);
-                let kop = self.prog.kernel_ops[ki];
-                let vals = self.values.get_mut();
-                for &net in self.prog.kernel_state_nets(&kop) {
-                    exec::set_net(&self.prog, vals, &mut self.rt.marks, net, Logic::X);
-                }
-                set_bit(&mut self.rt.marks.kpending, k);
+                // Finish the transition: write the settled state (readers are notified).
+                write_kernel_state(
+                    &self.prog,
+                    self.values.get_mut(),
+                    &mut self.rt.marks,
+                    self.prog.kernel_state_nets(&kop),
+                    self.prog.kernel_out_indices(&kop),
+                    &next,
+                );
+                state = next;
             }
+            self.kst[ki].ever = true;
+            self.glast[ki] = v.unwrap_or(NONE);
+            // The recorded inputs are the current ones. If one of them changed during this loop
+            // (a kernel finished before this one wrote it), they are not the boundary values a
+            // synced kernel's last inputs are recovered from: record them explicitly.
+            let moved = {
+                let vals = self.values.get_mut();
+                self.prog
+                    .kernel_inputs(&kop)
+                    .iter()
+                    .any(|&n| self.rt.marks.boundary_value(&self.prog, vals, n) != vals[n as usize])
+            };
+            if moved {
+                self.record_inputs_explicit(k);
+            } else {
+                clear_bit(&mut self.unsynced, k);
+            }
+            // A table state of a kernel with a class, reached under binary inputs.
+            if let (KernelOpKind::KTable { table }, Some(_)) = (kop.kind, v) {
+                self.kst[ki].state_id = self.prog.ktables[table as usize]
+                    .table
+                    .lookup(&state)
+                    .unwrap_or(NONE);
+                if self.prog.kernel_class[ki] != NONE && self.kst[ki].state_id != NONE && !moved {
+                    set_bit(&mut self.rt.marks.fastok, k);
+                }
+            }
+            let vals = self.values.get_mut();
+            let outs = self.prog.kernel_out_nets(&kop);
+            // Kept for kernels with a class only (as `write_state` does): the others never
+            // update it.
+            self.kob[ki] = if self.prog.kernel_class[ki] != NONE
+                && outs.len() <= 31
+                && outs.iter().all(|&n| vals[n as usize].is_known())
+            {
+                current_outputs(&self.prog, vals, k)
+            } else {
+                NONE
+            };
         }
         self.process_event();
-        fallen
+        report
     }
 
     /// Set a top-level input pin (by name). The width must match. The change is queued and

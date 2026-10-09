@@ -25,11 +25,11 @@ pub const USAGE: &str = "\
 panda — gate-level digital logic simulator (Timing mode, Fast mode, STA, generators)
 
 USAGE:
-    panda run <design.json> [--mode timing|fast] [--backend reference|compiled]
+    panda run <design.json> [--mode timing|fast] [--backend jit|compiled|reference]
                             [--ticks N | --cycles N] [--clock NET] [--max-ticks N] [--set PIN=VALUE]...
                             [--watch NAMES]... [--vcd FILE] [--trace NAMES]... [--stats]
                             [--p2-limit N] [--osc-limit N]
-    panda test <design.json> <vectors.txt> [--mode timing|fast] [--backend reference|compiled]
+    panda test <design.json> <vectors.txt> [--mode timing|fast] [--backend jit|compiled|reference]
                             [--clock NET] [--vcd FILE] [--trace NAMES]... [-v|--verbose]
                             [--p2-limit N] [--osc-limit N]
     panda sta <design.json> [--strict]
@@ -45,14 +45,16 @@ USAGE:
 
 COMMANDS:
     run       Simulate. Timing mode (default) is the unit-delay reference engine; --mode fast runs
-              the kernel-delta engine through the panda-kernel facade (--backend compiled = FastSim,
-              the default; reference = FastRef), compiling first. --ticks N advances N ticks (Fast
-              mode: to the end of the phase containing the target); --cycles N advances N cycles of
-              the reference clock (--clock, default the first running Clock) to the tick before a
-              rising edge; otherwise run until quiescent (at most --max-ticks, default 100000).
-              --set applies top-level input values at power-on. Prints the watched signals
-              (default: top-level outputs), diagnostics, and with --cycles, --stats or Fast mode the
-              throughput (ticks/s, cycles/s; Fast mode also the compile time).
+              the kernel-delta engine through the panda-kernel facade, compiling first. --backend:
+              jit (the default) = the FastSim interpreter with the Cranelift JIT installed once its
+              native code is compiled; compiled = the FastSim interpreter; reference = FastRef.
+              --ticks N advances N ticks (Fast mode: to the end of the phase containing the
+              target); --cycles N advances N cycles of the reference clock (--clock, default the
+              first running Clock) to the tick before a rising edge; otherwise run until quiescent
+              (at most --max-ticks, default 100000). --set applies top-level input values at
+              power-on. Prints the watched signals (default: top-level outputs), diagnostics, and
+              with --cycles, --stats or Fast mode the throughput (ticks/s, cycles/s; Fast mode
+              also the compile time).
     test      Run a test-vector file (format: see the panda_cli::vectors docs). Directives include
               'cycle N' (clocked designs) and 'mode timing|fast' (switch modes mid-file, state is
               carried over). --mode fast starts in Fast mode. Exit code 1 if any check fails.
@@ -72,8 +74,9 @@ COMMANDS:
               --bare. Panda-8: gen cpu8 [--program fib|countdown|multiply|bench | --asm FILE |
               --image HEXFILE] [--variant hierarchical|flat|gated] [--rom sop|mux|decoder]
               [--period P] [--reset-cycles N]. --flat inlines the hierarchy.
-    bench     Cycle throughput of the engines (timing, fastref, fastsim, kernel; default the first
-              three) for --seconds S each (default 1), or exactly --cycles N from power-on with the
+    bench     Cycle throughput of the engines (timing, fastref, fastsim, jit = FastSim with the
+              Cranelift JIT, kernel = the facade with its default backend; default the first four)
+              for --seconds S each (default 1), or exactly --cycles N from power-on with the
               top-level outputs compared (exit code 1 on a mismatch).
     info      Defs, instance counts, flat gate/net counts, sources, validation diagnostics.
     flat      Flat-netlist statistics; --json dumps nets, pins, gates, sources and resolvers.
@@ -88,9 +91,13 @@ EXIT CODES: 0 ok, 1 failure, 2 usage error.
 ";
 
 /// Run the CLI with `args` (excluding the program name). Returns the process exit code.
+///
+/// A closed output pipe (`EPIPE`, e.g. `panda info x.json | head`) ends the command quietly with
+/// exit code 0: the reader has seen all it wanted.
 pub fn main_with_args(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     match dispatch(args, out, err) {
         Ok(code) => code,
+        Err(e) if e.is_broken_pipe() => 0,
         Err(e) => {
             let _ = writeln!(err, "error: {e}");
             if matches!(e, CliError::Usage(_)) {

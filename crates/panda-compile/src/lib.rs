@@ -21,7 +21,7 @@ pub use charz::{
     CacheSnapshot, CharzOptions, KernelSim, KernelTable, Settled, TableCache, Transition,
     characterize,
 };
-pub use fastref::{FastOptions, FastRef, FastRefStats};
+pub use fastref::{FastOptions, FastRef, FastRefStats, LoadReport};
 pub use graph::Node;
 pub use kernels::{ExtractOptions, Kernel, KernelKind, KernelSet, extract};
 pub use subnet::{SubnetMap, kernel_subnet};

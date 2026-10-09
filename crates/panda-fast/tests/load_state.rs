@@ -12,14 +12,14 @@ fn native_hook(_: &mut panda_fast::FastSim) {}
 
 use std::sync::Arc;
 
-use common::random_value;
-use panda_compile::FastOptions;
+use common::{Coverage, check, pair, random_compile, random_value};
+use panda_compile::{FastOptions, LoadReport};
 use panda_cpu8::programs;
 use panda_cpu8::{Options, RomStyle, Variant, panda8_with};
 use panda_difftest::{GenConfig, Rng, generate};
 use panda_fast::{FastSim, FastSimOptions};
 use panda_netlist::flat::FlatNetlist;
-use panda_netlist::{Value, flatten};
+use panda_netlist::{Logic, Value, flatten};
 
 fn inputs_of(fs: &FastSim, flat: &FlatNetlist) -> Vec<Value> {
     flat.top_inputs
@@ -39,9 +39,10 @@ fn reload_and_compare(a: &mut FastSim, flat: &Arc<FlatNetlist>, events: u64, ctx
     )
     .unwrap();
     native_hook(&mut b);
-    let fallen = b.load_state(a.tick(), a.values(), &inputs_of(a, flat));
+    let report = b.load_state(a.tick(), a.values(), &inputs_of(a, flat));
     assert_eq!(
-        fallen, 0,
+        report,
+        LoadReport::default(),
         "{ctx}: every kernel of a settled state is consistent"
     );
     assert_eq!(a.values(), b.values(), "{ctx}: after load");
@@ -120,8 +121,8 @@ fn reload_seed(seed: u64) -> usize {
         )
         .unwrap();
         native_hook(&mut b);
-        let fallen = b.load_state(a.tick(), a.values(), &inputs_of(&a, &flat));
-        if fallen != 0 || a.values().iter().any(|v| !v.is_known()) {
+        let report = b.load_state(a.tick(), a.values(), &inputs_of(&a, &flat));
+        if report != LoadReport::default() || a.values().iter().any(|v| !v.is_known()) {
             continue;
         }
         reload_and_compare(&mut a, &flat, 40, &format!("seed {seed} round {round}"));
@@ -150,4 +151,117 @@ fn random_designs_reload() {
     });
     let checked = checked.into_inner();
     assert!(checked > 60, "only {checked} reloads checked");
+}
+
+/// Perturbed (unsettled, poked, partly `X`/`Z`) states loaded into FastRef and FastSim over the
+/// same kernels: both report the same inconsistent / fallen kernels and stay bit-exact afterwards
+/// (values, time, schedule, statistics, diagnostic kinds, FastSim's invariants). Kernels caught
+/// mid-transition finish it (`FastRef::load_state` semantics) — including kernels whose finished
+/// state changes the inputs of kernels checked before or after them.
+fn perturbed_load_seed(
+    flat: &Arc<FlatNetlist>,
+    seed: u64,
+    rounds: usize,
+    cov: &mut Coverage,
+) -> (usize, usize) {
+    let mut rng = Rng::new(seed ^ 0x5EED_10AD);
+    let fast = FastOptions {
+        delta_limit: *rng.pick(&[64, 64, 3]),
+        ..FastOptions::default()
+    };
+    let compile = random_compile(&mut rng, &[1, 4, 32]);
+    let (mut r, mut f) = pair(flat, &fast, &compile);
+    let pins: Vec<(String, u32)> = flat
+        .top_inputs
+        .iter()
+        .map(|p| (p.name.clone(), p.nets.len() as u32))
+        .collect();
+    let (mut finished, mut fallen) = (0, 0);
+    check(&mut r, &mut f, flat, &format!("seed {seed} power-on"), cov);
+    for round in 0..rounds {
+        let ctx = format!("seed {seed} round {round} ({compile:?})");
+        for e in 0..rng.below(25) {
+            if !pins.is_empty() && rng.chance(30) {
+                let (name, w) = rng.pick(&pins).clone();
+                let v = random_value(&mut rng, w, 10);
+                r.set_input(&name, &v).unwrap();
+                f.set_input(&name, &v).unwrap();
+            }
+            assert_eq!(r.step_event(), f.step_event(), "{ctx} event {e}");
+            check(&mut r, &mut f, flat, &format!("{ctx} event {e}"), cov);
+        }
+        // A perturbed state: mostly binary pokes (kernels that finish their transition), some
+        // X/Z.
+        let xz = rng.chance(30);
+        let pct = *rng.pick(&[2, 5, 15]);
+        let mut vals = r.values().to_vec();
+        for v in &mut vals {
+            if rng.chance(pct) {
+                *v = if xz {
+                    *rng.pick(&[Logic::Zero, Logic::One, Logic::X, Logic::Z])
+                } else {
+                    *rng.pick(&[Logic::Zero, Logic::One])
+                };
+            }
+        }
+        let inputs: Vec<Value> = pins
+            .iter()
+            .map(|(name, w)| {
+                if rng.chance(30) {
+                    random_value(&mut rng, *w, if xz { 20 } else { 0 })
+                } else {
+                    r.input_value(name).unwrap().clone()
+                }
+            })
+            .collect();
+        let tick = if rng.chance(50) {
+            r.tick()
+        } else {
+            r.tick() + rng.below(50) as u64
+        };
+        let rr = r.load_state(tick, &vals, &inputs);
+        let rf = f.load_state(tick, &vals, &inputs);
+        assert_eq!(rr, rf, "{ctx}: load reports");
+        finished += rr.inconsistent - rr.fallen;
+        fallen += rr.fallen;
+        check(&mut r, &mut f, flat, &format!("{ctx} after load"), cov);
+    }
+    (finished, fallen)
+}
+
+#[test]
+fn perturbed_loads_fastref_equals_fastsim_random_designs() {
+    let mut cov = Coverage::default();
+    let (mut finished, mut fallen) = (0, 0);
+    for seed in 0..60u64 {
+        let mut rng = Rng::new(seed ^ 0xF00D);
+        let g = generate(seed, &GenConfig::default(), 2 + 2 * rng.below(2) as u32);
+        let flat = Arc::new(flatten(&g.design).unwrap());
+        let (a, b) = perturbed_load_seed(&flat, seed, 6, &mut cov);
+        finished += a;
+        fallen += b;
+    }
+    assert!(
+        finished > 100,
+        "only {finished} kernels finished a transition"
+    );
+    assert!(fallen > 0, "no kernel fell back to X");
+}
+
+#[test]
+fn perturbed_loads_fastref_equals_fastsim_panda8() {
+    let mut cov = Coverage::default();
+    let mut finished = 0;
+    for (i, (rom, v)) in [
+        (RomStyle::SumOfProducts, Variant::Hierarchical),
+        (RomStyle::MuxTree, Variant::GatedClockRegfile),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let o = Options::new(v).with_rom(rom);
+        let flat = Arc::new(flatten(&panda8_with(&programs::BENCH_LOOP.image(), &o)).unwrap());
+        finished += perturbed_load_seed(&flat, i as u64, 4, &mut cov).0;
+    }
+    assert!(finished > 0, "no kernel finished a transition");
 }

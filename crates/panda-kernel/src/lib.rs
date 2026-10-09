@@ -114,15 +114,14 @@ mod classify;
 mod diag;
 mod edit;
 mod engine;
-mod refengine;
 mod schedule;
 mod timing;
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
-use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use panda_compile::{FastOptions, KernelOptions as CompileOptions, TableCache};
@@ -378,7 +377,10 @@ pub struct Kernel {
     /// Nothing happened since `load` (a fresh Fast engine can be used as is).
     pristine: bool,
     diags: DiagStore,
-    cache: Arc<Mutex<TableCache>>,
+    /// Kernel tables by structure (internally synchronized: shared with the compiler threads
+    /// without a lock, so `classify` / `timing_report` never wait for a background
+    /// characterization).
+    cache: Arc<TableCache>,
     /// The JIT tier of [`FastBackend::Jit`] (its function cache persists across edits).
     jit: JitTier,
     generation: u64,
@@ -396,12 +398,6 @@ impl Default for Kernel {
     fn default() -> Self {
         Kernel::new(KernelOptions::default())
     }
-}
-
-fn lock(cache: &Mutex<TableCache>) -> MutexGuard<'_, TableCache> {
-    cache
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Content hash of a design, ignoring editor data.
@@ -467,7 +463,7 @@ struct CompileJob {
     fopts: FastOptions,
     copts: panda_fast::CompileOptions,
     backend: FastBackend,
-    cache: Arc<Mutex<TableCache>>,
+    cache: Arc<TableCache>,
     art: Option<Artifacts>,
     jit: JitTier,
     /// The job's generation and the kernel's current one: once they differ, the result can never
@@ -494,15 +490,10 @@ impl CompileJob {
                     extract: self.fopts.extract.clone(),
                     charz: self.fopts.charz.clone(),
                 };
-                let (ks, tables) = {
-                    let cache = lock(&self.cache);
-                    // Checked again under the lock: stale jobs queued behind a long
-                    // characterization do not repeat it.
-                    if self.stale() {
-                        return;
-                    }
-                    panda_compile::compile_kernels_with_cache(&self.flat, &kopts, &cache)
-                };
+                // The cache is internally synchronized: concurrent compilations (and `classify` /
+                // `timing_report` on the caller's thread) share its tables without a lock.
+                let (ks, tables) =
+                    panda_compile::compile_kernels_with_cache(&self.flat, &kopts, &self.cache);
                 Artifacts {
                     kernels: Arc::new(ks),
                     tables: Arc::new(tables),
@@ -557,7 +548,7 @@ impl Kernel {
             fast_pending: false,
             pristine: true,
             diags: DiagStore::default(),
-            cache: Arc::new(Mutex::new(TableCache::new())),
+            cache: Arc::new(TableCache::new()),
             generation: 0,
             current: Arc::new(AtomicU64::new(0)),
             compiling: None,
@@ -1338,13 +1329,21 @@ impl Kernel {
 
     fn advance_fast(&mut self, target: Target) {
         self.flush_fast_inputs();
+        let now = self.tick();
+        let max = self.opts.max_settle_ticks;
         let Some(Active::Fast { engine, .. }) = &mut self.active else {
             return;
         };
-        if let Target::Tick(t) | Target::TickThenSettle(t) = target {
-            while engine.next_event_tick().is_some_and(|e| e <= t) {
-                engine.step_event();
-            }
+        // Fast mode ends at phase ends: process every event up to the target tick. `Settle`
+        // (no source change after the next event) processes the remaining events, bounded like
+        // Timing mode's settling.
+        let last = match target {
+            Target::Tick(t) => t,
+            Target::Settle => now.saturating_add(max),
+            Target::TickThenSettle(t) => t.saturating_add(max),
+        };
+        while engine.next_event_tick().is_some_and(|e| e <= last) {
+            engine.step_event();
         }
         self.drain_engine();
     }
@@ -1550,8 +1549,7 @@ impl Kernel {
         }
         let d = subdesign(&loaded.design, def);
         let flat = Arc::new(flatten(&d)?);
-        let mut cache = lock(&self.cache);
-        Ok(classify::classify(def, flat, &self.opts.fast, &mut cache))
+        Ok(classify::classify(def, flat, &self.opts.fast, &self.cache))
     }
 
     /// Static timing analysis of the loaded design (SPEC §9) with per-clock period checks: the
@@ -1576,7 +1574,7 @@ impl Kernel {
                     charz: self.opts.fast.charz.clone(),
                 };
                 let (ks, tables) =
-                    panda_compile::compile_kernels_with_cache(&flat, &kopts, &lock(&self.cache));
+                    panda_compile::compile_kernels_with_cache(&flat, &kopts, &self.cache);
                 let a = Artifacts {
                     kernels: Arc::new(ks),
                     tables: Arc::new(tables),

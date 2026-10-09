@@ -1,6 +1,6 @@
 # Panda — Digital Logic Sandbox: Design Spec
 
-> Status: **v0.4**: M1–M4 implemented, M5 (JIT) in progress. v0.3 defined Fast mode by the kernel-delta reference algorithm (§6); v0.4 records implementation outcomes (§0, §11, §14.5).
+> Status: **v0.4**: M1–M5 implemented (kernel complete); M6 (editor) not started. v0.3 defined Fast mode by the kernel-delta reference algorithm (§6); v0.4 records implementation outcomes (§0, §11, §14.5).
 > Implementation language: **Rust**.
 > Conventions: **MUST / SHOULD / MAY** are normative. `[OPEN]` marks unresolved questions.
 > Evidence behind each decision is summarized in §14.
@@ -56,13 +56,17 @@
 
 | Crate | Role |
 |---|---|
-| `panda-netlist` | Data model, serialization, validation, width inference, edit operations |
-| `panda-timing` | Timing-mode engine (reference semantics, §5) |
-| `panda-compile` | Analysis & lowering: classification, kernel extraction, characterization, phase compilation, STA, partitioning → `FastIR` |
-| `panda-fast` | `FastIR` bytecode interpreter |
-| `panda-jit` | `FastIR` → Cranelift native code (tier 2) |
-| `panda-kernel` | Facade: the API in §10; owns engines, background compilation, hot-swap |
-| `panda-cli` | Run netlists, test vectors, VCD dump, benchmarks, differential fuzzing |
+| `panda-netlist` | Values, design model, JSON format, builder, validation, flattening, **the gate semantics** (`eval`) |
+| `panda-timing` | Timing-mode engine (reference semantics, §5), ideal blocks, StuckX + X-source trace |
+| `panda-circuits` | Gate-level building-block library, ROM generator, testbenches, `inline_all` |
+| `panda-cpu8` | Panda-8 reference CPU: ISA, assembler, emulator, gate-level generator (§12) |
+| `panda-compile` | Kernel extraction, characterization (`TableCache`), **FastRef** (the §6.2 oracle) |
+| `panda-sta` | Static timing analysis (§9) |
+| `panda-fast` | FastSim: compiled Fast mode (LUTs, phase-specialized kernels, partitions, interpreter) |
+| `panda-jit` | Cranelift tier: native partition + per-clock-tuple event functions, hot-swapped |
+| `panda-kernel` | Facade (§10): modes, edits, snapshots, classification, background compile, tiering |
+| `panda-cli` | `panda` binary: run/test/sta/classify/kernels/gen/bench, VCD, test vectors |
+| `panda-difftest` | Random design generators and differential harnesses (Timing ↔ FastRef ↔ FastSim ↔ JIT) |
 | `panda-ui` | Editor/renderer (M6; tech choice deferred — egui/wgpu, Bevy, or web over WASM) |
 
 ---
@@ -104,13 +108,12 @@ There is **no separate 2-state code path**: the measured gain did not justify it
 | Logic | `AND OR NAND NOR XOR XNOR` | 1 | N inputs, width-polymorphic (bitwise); optional reduce mode (W-bit → 1-bit) |
 | | `NOT BUF` | 1 | width-polymorphic |
 | Tri-state | `TRI` | 1 | `en=1 → d`; `en=0 → Z`; `en ∈ {X,Z} → X` |
-| Wiring | `Splitter`, `Joiner` | 0 | one W-bit end ↔ bit-range ends |
+| Wiring | `Splitter` | 0 | one W-bit end ↔ bit-range ends; bidirectional aliasing (serves as joiner too) |
 | | `Constant` | 0 | W-bit value; may contain `X`/`Z` |
-| Sources | `Input` | 0 | user-driven; toggle / momentary / typed value |
-| | `Clock` | — | `period` (ticks, even, default = auto from STA §9.3), `duty`, `phase`, `enabled` |
-| | `PowerOnReset` | — | drives `1` for `N` ticks / `N` cycles after reset, then `0` |
-| Sinks | `Output` | — | LED / binary / hex / decimal |
-| | `Probe` | — | display only |
+| Sources | `Clock` | — | `period` (≥ 2), `high` (ticks high per period), `phase` (rise tick offset). The editor should default the period to the STA minimum (§9.4). |
+| | `PowerOnReset` | — | drives `1` for `ticks` ticks after reset, then `0` |
+
+Inputs, outputs and probes are not atoms. A def's `In` pins are its inputs (clickable at top level), its `Out`/`InOut` pins are its outputs, and any net can be read by name, which is all a probe needs.
 
 None hold state. `Clock` and `PowerOnReset` are sources, so they don't break the purist rule.
 
@@ -146,6 +149,8 @@ A NAND SR latch is **not** flagged as an oscillator. It has stable states for ev
 - This is what the user sees when stepping and probing. It shows glitches, races and oscillation.
 
 ### 5.2 Packaged combinational components are ideal blocks (D11)
+*Implementation note:* ideal blocks are an engine option (`TimingOptions::ideal_blocks`), off by default in the kernel, so Timing mode defaults to glass-box gates, which is what FastRef's equivalence contract is stated against. Turn them on for the editor's default view. STA has a matching `ideal_blocks` mode.
+
 A combinational package instance behaves as **out_j(t + L_j) = f_j(in(t))**, where L_j is the max gate depth of output j's cone. It is evaluated through its compiled form (§7), and glitches inside it are not produced.
 - Rationale: packaging is abstraction. Hiding internal hazards makes packaged behavior robust and makes it fast.
 - **Glass-box toggle** (per instance or global): simulate the package's gates instead. Use it to study hazards.
@@ -184,7 +189,7 @@ until no kernel input changed            (bound: DELTA_LIMIT rounds → affected
 publish S
 ```
 - One **phase** = the interval between consecutive events. `step(Phase)` processes one event.
-- UI input changes are applied as their own event right after the next clock event, never simultaneously with it. This mirrors "inputs change after the edge" (hold).
+- UI input changes are applied as their own event at the current tick, i.e. right after the most recently processed event and before the next scheduled one, never simultaneously with a clock event. This mirrors "inputs change after the edge" (hold).
 - Initial state: all nets `X`. Kernels with `X` in their state or inputs use on-the-fly transitions (exact; tables index binary values only).
 
 Why this matches hardware intuition: at an edge, the clock-derived kernel inputs change first (round 0 → first transitions), and data that depends on kernel outputs changes afterwards (later rounds). That is exactly the order a hold-time-clean circuit guarantees. A master-slave register costs one round at each edge. Combinational logic runs once per cycle, after the edge that opens the slave latches, because the master latches are opaque when its outputs arrive.
@@ -303,7 +308,7 @@ for each phase (or cycle, if fused):
 
 ### 8.9 Backends (tiered)
 - **Tier 1 — interpreter**: compact bytecode, struct-of-arrays state, branchless table ops. Available immediately after any edit.
-- **Tier 2 — Cranelift JIT**: compiles each partition to a native function in the background and **hot-swaps it at a cycle boundary**. Both tiers share the same flat state arrays, so swapping is free. Only edited partitions recompile.
+- **Tier 2 — Cranelift JIT**: compiles each partition to a native function, plus one *event function* per clock tuple (source writes, sweeps and the round loop with inlined kernel fast paths, bailing to the interpreter for general cases), in the background, and **hot-swaps them at an event boundary**. Both tiers share the same flat state arrays, so swapping is free. Only edited partitions recompile.
 - Code size note: 5k gates of straight-line code ≈ 60–100 KB, which exceeds L1I. Partition skipping reduces fetch pressure; keep partitions contiguous in schedule order.
 - A WASM-emitting backend (`wasm-encoder`) is the equivalent of tier 2 for a future browser build.
 
@@ -324,6 +329,7 @@ STA is what makes Fast mode trustworthy (D10). It runs on the per-phase graphs i
 ---
 
 ## 10. Kernel API (sketch)
+The authoritative API is `panda_kernel::Kernel`'s rustdoc. The sketch below gives the shape.
 
 ```rust
 pub struct Kernel { /* engines, caches, background compiler */ }
@@ -357,16 +363,20 @@ impl Kernel {
 {
   "format": "panda/1",
   "defs": [{
-    "id": "def:full_adder", "name": "Full Adder", "version": 3,
-    "pins": [{"name":"A","dir":"in","width":1}, /* ... */ {"name":"Cout","dir":"out","width":1}],
-    "instances": [{"id":"g1","def":"atom:XOR","params":{"inputs":2}} /* ... */],
-    "nets": [{"id":"n1","width":1,"termination":"none","ends":[["pin","A"],["g1","in0"]]}],
+    "id": "full_adder", "name": "Full Adder", "version": 3,
+    "pins": [{"name":"A","dir":"in","width":1}, /* ... */ {"name":"COUT","dir":"out","width":1}],
+    "instances": [
+      {"id":"g1","kind":{"atom":{"atom":"gate","op":"xor","inputs":2,"width":1,"reduce":false}}},
+      {"id":"u0","kind":{"def":"half_adder"}}
+    ],
+    "nets": [{"id":"n1","width":1,"ends":[["pin","A"],["g1","in0"]]}],   // optional "termination": "pull-up" | "pull-down" | "keeper"
     "editor": { /* geometry; ignored by the kernel */ }
   }],
-  "top": "def:cpu"
+  "top": "cpu"
 }
 ```
-Compiled artifacts are caches keyed by def content hash and are never part of the format. A plain-text netlist DSL for tests MAY be added to `panda-cli`.
+Constants serialize their value as `"<width>'<literal>"`, e.g. `"8'0xff"` or `"4'0b10xz"`. Ids may not contain `/`, `[` or `]`.
+Compiled artifacts are caches, never part of the format. Kernel tables are keyed by a structural hash of the kernel sub-netlist and can be persisted separately (`TableCache` snapshot). A plain-text netlist DSL for tests MAY be added to `panda-cli`.
 
 ---
 
@@ -456,6 +466,36 @@ Engineering rules from the start: struct-of-arrays state (Turing Complete hit a 
   - Ring oscillators start quiescent at all-X → detect statically (no binary stable state).
 
 ---
+
+### 14.5 Implementation outcomes (v0.4, measured on a Ryzen 7 3700X, single thread)
+
+**Panda-8 bench_loop throughput:**
+
+| Engine | SoP ROM Hierarchical | GatedClockRegfile |
+|---|---|---|
+| Timing (glass-box gates) | 46k cycles/s | 45k |
+| Timing + ideal blocks | 71k | 88k |
+| FastRef (oracle) | 25k | 31k |
+| FastSim interpreter | **1.1M** | 0.61M |
+| FastSim + Cranelift JIT | **1.9M** | 0.96–1.03M |
+
+- **Per cycle (FastSim):** 122 table kernels; 279 kernel transitions, all on phase-specialized opaque/transparent fast paths; 4 rounds; ~230 ops in ~8 partitions. The ROM (2,385 gates) becomes 2 LUTs.
+- **Compile latency** (Panda-8, cold): kernel extraction + characterization 14 ms on 16 threads (70 ms on 1); FastSim compile ~20 ms; JIT ~30 ms in the background.
+- **Correctness evidence:**
+  - FastRef = Timing at every phase end on STA-clean designs: 0 mismatches over 11k+ random designs plus all Panda-8 configurations.
+  - FastSim = FastRef bit-for-bit, including stats and diagnostic kinds: soaks of 1.5M+ events.
+  - JIT = interpreter, including internal state after every event.
+- **Not implemented (by measurement or deferred):**
+  - slice packing: measured ~3× slower than fused scalar ops;
+  - edge fusion and single-pass phases: unneeded for the target;
+  - constant folding and structural hashing beyond the LUT/fusion passes;
+  - random power-on;
+  - the ternary advisory lint.
+- **Known limits:**
+  - STA is conservative and often pessimistic on random designs; normal synchronous designs such as Panda-8 come out clean.
+  - The JIT reached 1.8× over the interpreter (target was 2×). The remaining cost is per-kernel round logic.
+  - STA reasons about binary values; persistently-X state is outside its scope.
+- **Tunables as shipped:** partition size 32 ops, `lut_max_bits` 10, `lut_min_gates` 16, `KERNEL_MAX_LOOP` 6, `KERNEL_MAX_BITS` 12, Sim-kernel settle bound 4·nets + 8 + 2·p2_limit, `P2_LIMIT` 4.
 
 ## 15. Open Questions (non-blocking)
 
