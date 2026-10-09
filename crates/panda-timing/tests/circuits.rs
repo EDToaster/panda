@@ -6,7 +6,7 @@ use common::*;
 use panda_netlist::{DefBuilder, DefRef, DiagKind, Logic, Value};
 use panda_timing::TimingSim;
 
-use Logic::{One, Zero, X};
+use Logic::{One, X, Zero};
 
 fn kinds(sim: &mut TimingSim) -> Vec<DiagKind> {
     sim.take_diagnostics().into_iter().map(|d| d.kind).collect()
@@ -329,7 +329,12 @@ fn unreset_toggle_ff_stays_x() {
         assert_eq!(bit(&s, "Q"), X);
         assert_eq!(bit(&s, "tff/Q_n"), X);
     }
-    assert!(s.take_diagnostics().is_empty());
+    // SPEC §5.4: still X after 16 clock periods -> exactly one StuckX naming the latch loop.
+    let d = s.take_diagnostics();
+    assert_eq!(d.len(), 1, "{d:?}");
+    assert_eq!(d[0].kind, DiagKind::StuckX);
+    assert_eq!(d[0].location.as_deref(), Some("Q"));
+    assert!(d[0].message.contains("loop"), "{}", d[0].message);
 
     // Forcing the slave state to a known value makes it toggle (power-on randomization use case).
     // After one tick the slave's steering NANDs are known (clock low), so the forced state holds.

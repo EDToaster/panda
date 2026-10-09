@@ -36,6 +36,8 @@ dependencies = [
 name = "panda-compile"
 version = "0.1.0"
 dependencies = [
+ "panda-circuits",
+ "panda-cpu8",
  "panda-netlist",
  "panda-timing",
 ]
@@ -94,14 +96,19 @@ dependencies = [
 name = "panda-sta"
 version = "0.1.0"
 dependencies = [
+ "panda-circuits",
  "panda-compile",
+ "panda-cpu8",
  "panda-netlist",
+ "panda-timing",
 ]
 
 [[package]]
 name = "panda-timing"
 version = "0.1.0"
 dependencies = [
+ "panda-circuits",
+ "panda-cpu8",
  "panda-netlist",
 ]
 

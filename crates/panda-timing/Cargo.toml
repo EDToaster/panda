@@ -6,3 +6,9 @@ license.workspace = true
 
 [dependencies]
 panda-netlist.workspace = true
+
+[dev-dependencies]
+# Integration tests only (dev-dependency cycle: both depend on panda-timing; integration tests link
+# the same panda-timing library, so the types agree).
+panda-circuits.workspace = true
+panda-cpu8.workspace = true

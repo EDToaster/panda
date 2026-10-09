@@ -17,6 +17,21 @@
 //!   The simulation keeps running faithfully.
 //! * Contention on a resolver raises a `Contention` diagnostic (see "Episodes").
 //! * Input changes via [`TimingSim::set_input`] are applied as source changes at the next tick.
+//! * **Ideal blocks** (§5.2, opt-in via [`TimingOptions::ideal_blocks`]): outermost acyclic package
+//!   instances behave as `out_j(t + L_j) = f_j(in(t))` (transport delay) instead of being
+//!   simulated gate by gate; see the [`ideal`] module for the selection rule, latencies and the
+//!   value of internal nets. [`TimingOptions::glass_box`] exempts instances (with their subtrees).
+//! * **Stuck X** (§5.4): see "Stuck-X diagnostic" below.
+//!
+//! # Stuck-X diagnostic
+//!
+//! Let `P` be the largest period of the running clocks and `R` the latest `PowerOnReset` release
+//! tick (0 if there is none). At tick `R + K·P` (`K` = [`TimingOptions::stuck_x_periods`], 0
+//! disables the check; never without a running clock) every top-level output pin with an `X` bit
+//! raises one `StuckX` warning, located at the pin, naming the X bits and the X origins found by
+//! [`x_sources`] (feedback loops of X nets, undriven nets, X sources, contention). The check runs
+//! once per reset; it requires stepping through that tick ([`TimingSim::run`] never fast-forwards
+//! while a clock is running, so it always does).
 //!
 //! # Implementation notes
 //!
@@ -62,6 +77,20 @@
 //! * [`TimingSim::run`] fast-forwards over quiescent stretches without evaluating anything; the
 //!   result is identical to stepping.
 //! * The tick counter is a `u64`; advancing it past `u64::MAX` panics.
+//! * **Ideal-block details.** Within a tick, ideal-block outputs due at `t` are applied right
+//!   after the gate outputs (they are delay-carrying); blocks whose inputs changed are evaluated at
+//!   the end of the tick (after sources, resolvers and collapse), so they see the final tick-`t`
+//!   input values. Ticks with pending block-output changes count as activity for the
+//!   `Oscillating` rule. For period-2 collapse a block output's "driver inputs" are the block
+//!   inputs in its cone, and such an input counts as quiet only if it did not change during the
+//!   last `L + L_j - 1` ticks (the output replays older input values for `L_j` ticks; for
+//!   `L_j = 1` this is the gate rule).
+//!   Collapsing a block output drops its changes still in flight and re-evaluates its driver
+//!   (as for gates): it holds X until the value computed from the tick-`t` inputs lands at
+//!   `t + L_j`.
+//!   [`TimingSim::force_net`] on a block output overrides it until the block next schedules a
+//!   change for it; on an internal net it is ignored (internal nets always show the value computed
+//!   from the block inputs). Internal nets never appear in [`TimingSim::last_changed`].
 //!
 //! # Performance
 //!
@@ -71,10 +100,17 @@
 //! live in a dense list with a per-gate `scheduled` mark. The hot loop does no allocation and no
 //! hashing.
 
+pub mod ideal;
+pub mod xtrace;
+
+use std::collections::HashSet;
 use std::sync::Arc;
 
+pub use ideal::{IdealBlock, select_ideal_blocks};
+pub use xtrace::{XSource, XSourceKind, x_sources};
+
 use panda_netlist::eval;
-use panda_netlist::flat::{FlatNetlist, FlatOp, NetIdx, SourceKind};
+use panda_netlist::flat::{FlatNetlist, FlatOp, GateIdx, NetIdx, SourceKind};
 use panda_netlist::{DiagKind, Diagnostic, Logic, Termination, Value};
 
 /// Sentinel for "no index".
@@ -91,11 +127,30 @@ pub struct TimingOptions {
     pub p2_limit: u32,
     /// Ticks of continuous activity without source change before `Oscillating`. Default 10_000.
     pub osc_limit: u64,
+    /// Evaluate packaged combinational instances as ideal blocks (SPEC §5.2, [`ideal`]).
+    /// Default `false` (every gate is simulated).
+    pub ideal_blocks: bool,
+    /// Instance paths simulated at gate level even when `ideal_blocks` is on (the glass-box
+    /// toggle). An entry covers the instance's whole subtree. Default empty.
+    pub glass_box: HashSet<String>,
+    /// Ideal blocks with at most this many variable inputs are evaluated through lazily filled
+    /// LUTs ([`ideal`] module docs). Default 12; `0` disables LUTs (gate evaluation only).
+    pub ideal_lut_bits: u32,
+    /// Clock periods after reset release before the `StuckX` check (module docs, "Stuck-X
+    /// diagnostic"). Default 16; `0` disables it.
+    pub stuck_x_periods: u32,
 }
 
 impl Default for TimingOptions {
     fn default() -> Self {
-        TimingOptions { p2_limit: 4, osc_limit: 10_000 }
+        TimingOptions {
+            p2_limit: 4,
+            osc_limit: 10_000,
+            ideal_blocks: false,
+            glass_box: HashSet::new(),
+            ideal_lut_bits: 12,
+            stuck_x_periods: 16,
+        }
     }
 }
 
@@ -110,6 +165,26 @@ impl TimingOptions {
         self.osc_limit = osc_limit;
         self
     }
+    /// Builder-style setter for [`TimingOptions::ideal_blocks`].
+    pub fn with_ideal_blocks(mut self, on: bool) -> Self {
+        self.ideal_blocks = on;
+        self
+    }
+    /// Builder-style: add an instance path to [`TimingOptions::glass_box`].
+    pub fn with_glass_box(mut self, path: impl Into<String>) -> Self {
+        self.glass_box.insert(path.into());
+        self
+    }
+    /// Builder-style setter for [`TimingOptions::ideal_lut_bits`].
+    pub fn with_ideal_lut_bits(mut self, bits: u32) -> Self {
+        self.ideal_lut_bits = bits;
+        self
+    }
+    /// Builder-style setter for [`TimingOptions::stuck_x_periods`].
+    pub fn with_stuck_x_periods(mut self, periods: u32) -> Self {
+        self.stuck_x_periods = periods;
+        self
+    }
 }
 
 /// Counters since the last reset.
@@ -117,8 +192,12 @@ impl TimingOptions {
 pub struct TimingStats {
     /// Ticks simulated (including fast-forwarded quiescent ticks).
     pub ticks: u64,
-    /// Gate evaluations performed.
+    /// Gate evaluations performed (gates simulated individually).
     pub gate_evals: u64,
+    /// Element (gate / resolver) evaluations performed inside ideal blocks.
+    pub block_evals: u64,
+    /// Ideal-block updates answered by a LUT row.
+    pub lut_hits: u64,
 }
 
 /// A time-varying source.
@@ -175,6 +254,103 @@ struct WideGate {
 
 /// Tag bit marking a resolver (rather than a gate) in the fanout list.
 const RES_BIT: u32 = 1 << 31;
+/// Tag bit marking an ideal-block input entry in the fanout list (never set together with
+/// [`RES_BIT`]). Plain gate entries are `< BLK_BIT`.
+const BLK_BIT: u32 = 1 << 30;
+
+/// Packed truth tables of every op, straight from the reference semantics.
+pub(crate) struct Tables {
+    tab1: [u32; 9],
+    tab2: [u32; 9],
+    /// Packed NOT table (used to invert wide NAND/NOR/XNOR folds).
+    pub(crate) not_tab: u32,
+}
+
+impl Tables {
+    fn new() -> Self {
+        let mut tab1 = [0u32; 9];
+        let mut tab2 = [0u32; 9];
+        for op in ALL_OPS {
+            let i = op_index(op);
+            if op != FlatOp::Tri {
+                tab1[i] = eval::table2(|a, _| eval::eval_gate(op, &[a]));
+            }
+            if !matches!(op, FlatOp::Not | FlatOp::Buf) {
+                tab2[i] = eval::table2(|a, b| eval::eval_gate(op, &[a, b]));
+            }
+        }
+        Tables { tab1, tab2, not_tab: eval::table2(|a, _| eval::not1(a)) }
+    }
+
+    /// Compile flat gate `gi` (`op` over value indices `ins`, writing `out`); wide gates append to
+    /// `wide` / `wide_inputs`.
+    ///
+    /// # Panics
+    ///
+    /// On a wrong number of inputs for the op.
+    pub(crate) fn compile(
+        &self,
+        op: FlatOp,
+        ins: &[u32],
+        out: u32,
+        wide: &mut Vec<WideGate>,
+        wide_inputs: &mut Vec<u32>,
+        gi: GateIdx,
+    ) -> GateRec {
+        // Arity check: a mis-sized NOT/BUF/TRI would otherwise compile to a zero table and be
+        // misread as a wide gate.
+        let arity_ok = match op {
+            FlatOp::Not | FlatOp::Buf => ins.len() == 1,
+            FlatOp::Tri => ins.len() == 2,
+            _ => !ins.is_empty(),
+        };
+        assert!(arity_ok, "flat gate {gi}: {op:?} with {} inputs", ins.len());
+        let rec = match ins.len() {
+            0 => panic!("flat gate {gi} has no inputs"),
+            1 => GateRec { tab: self.tab1[op_index(op)], a: ins[0], b: ins[0], out },
+            2 => GateRec { tab: self.tab2[op_index(op)], a: ins[0], b: ins[1], out },
+            _ => {
+                let (base, invert) = match op {
+                    FlatOp::And => (FlatOp::And, false),
+                    FlatOp::Nand => (FlatOp::And, true),
+                    FlatOp::Or => (FlatOp::Or, false),
+                    FlatOp::Nor => (FlatOp::Or, true),
+                    FlatOp::Xor => (FlatOp::Xor, false),
+                    FlatOp::Xnor => (FlatOp::Xor, true),
+                    op => panic!("flat gate {gi}: {op:?} with {} inputs", ins.len()),
+                };
+                let start = wide_inputs.len() as u32;
+                wide_inputs.extend_from_slice(ins);
+                let w = WideGate { tab: self.tab2[op_index(base)], start, end: wide_inputs.len() as u32, invert };
+                wide.push(w);
+                GateRec { tab: 0, a: wide.len() as u32 - 1, b: 0, out }
+            }
+        };
+        debug_assert!(ins.len() > 2 || rec.tab != 0);
+        rec
+    }
+}
+
+/// Evaluate compiled gate `g` over `values` (`wide` / `wide_inputs` hold the wide gates).
+#[inline(always)]
+fn eval_rec(g: GateRec, values: &[Logic], wide: &[WideGate], wide_inputs: &[u32], not_tab: u32) -> Logic {
+    if g.tab != 0 {
+        eval::lookup2(g.tab, values[g.a as usize], values[g.b as usize])
+    } else {
+        eval_wide(wide[g.a as usize], values, wide_inputs, not_tab)
+    }
+}
+
+/// Evaluate a gate with more than two inputs.
+#[inline(never)]
+fn eval_wide(w: WideGate, values: &[Logic], wide_inputs: &[u32], not_tab: u32) -> Logic {
+    let ins = &wide_inputs[w.start as usize..w.end as usize];
+    let mut acc = eval::lookup2(w.tab, values[ins[0] as usize], values[ins[1] as usize]);
+    for &i in &ins[2..] {
+        acc = eval::lookup2(w.tab, acc, values[i as usize]);
+    }
+    if w.invert { eval::lookup2(not_tab, acc, acc) } else { acc }
+}
 
 /// The flat netlist compiled into flat arrays. Immutable after construction.
 struct Compiled {
@@ -184,9 +360,15 @@ struct Compiled {
     wide_inputs: Vec<NetIdx>,
     /// Packed NOT table (used to invert wide NAND/NOR/XNOR folds).
     not_tab: u32,
+    /// Gates simulated individually (all gates not inside an ideal block).
+    sim_gates: Vec<u32>,
+    /// Resolvers simulated individually (all resolvers not inside an ideal block).
+    sim_res: Vec<u32>,
     // ---- per net ----
     /// CSR fanout: the readers of net `n` are `fanout[fo_start[n]..fo_start[n+1]]`; an entry is a
-    /// gate index, or a resolver index tagged with [`RES_BIT`]. Gates are deduplicated.
+    /// gate index, a resolver index tagged with [`RES_BIT`], or an ideal-block input entry tagged
+    /// with [`BLK_BIT`]. Gates are deduplicated. Gates and resolvers inside ideal blocks are not
+    /// listed (their block's input entries are).
     fo_start: Vec<u32>,
     fanout: Vec<u32>,
     /// Gate driving each net, or `NONE`.
@@ -235,28 +417,19 @@ const ALL_OPS: [FlatOp; 9] = [
 ];
 
 impl Compiled {
-    fn new(nl: &FlatNetlist) -> Self {
+    fn new(nl: &FlatNetlist, tabs: &Tables, blocks: &ideal::Blocks) -> Self {
         let n = nl.num_nets as usize;
-        assert!(nl.gates.len() < RES_BIT as usize && nl.resolvers.len() < RES_BIT as usize, "netlist too large");
-        // Truth tables straight from the reference semantics.
-        let mut tab1 = [0u32; 9];
-        let mut tab2 = [0u32; 9];
-        for op in ALL_OPS {
-            let i = op_index(op);
-            if op != FlatOp::Tri {
-                tab1[i] = eval::table2(|a, _| eval::eval_gate(op, &[a]));
-            }
-            if !matches!(op, FlatOp::Not | FlatOp::Buf) {
-                tab2[i] = eval::table2(|a, b| eval::eval_gate(op, &[a, b]));
-            }
-        }
-        let not_tab = eval::table2(|a, _| eval::not1(a));
+        assert!(nl.gates.len() < BLK_BIT as usize && nl.resolvers.len() < BLK_BIT as usize, "netlist too large");
+        let in_block_gate = |g: usize| blocks.gate_block.get(g).is_some_and(|&b| b != NONE);
+        let in_block_res = |r: usize| blocks.res_block.get(r).is_some_and(|&b| b != NONE);
 
         let mut c = Compiled {
             gates: Vec::with_capacity(nl.gates.len()),
             wide: Vec::new(),
             wide_inputs: Vec::new(),
-            not_tab,
+            not_tab: tabs.not_tab,
+            sim_gates: (0..nl.gates.len()).filter(|&g| !in_block_gate(g)).map(|g| g as u32).collect(),
+            sim_res: (0..nl.resolvers.len()).filter(|&r| !in_block_res(r)).map(|r| r as u32).collect(),
             fo_start: Vec::with_capacity(n + 1),
             fanout: Vec::new(),
             driver_gate: vec![NONE; n],
@@ -272,46 +445,24 @@ impl Compiled {
         };
         let mut driven = vec![false; n];
         for (gi, g) in nl.gates.iter().enumerate() {
-            let ins = &g.inputs;
-            // Arity check: a mis-sized NOT/BUF/TRI would otherwise compile to a zero table and be
-            // misread as a wide gate.
-            let arity_ok = match g.op {
-                FlatOp::Not | FlatOp::Buf => ins.len() == 1,
-                FlatOp::Tri => ins.len() == 2,
-                _ => !ins.is_empty(),
-            };
-            assert!(arity_ok, "flat gate {gi}: {:?} with {} inputs", g.op, ins.len());
-            let rec = match ins.len() {
-                0 => panic!("flat gate {gi} has no inputs"),
-                1 => GateRec { tab: tab1[op_index(g.op)], a: ins[0], b: ins[0], out: g.output },
-                2 => GateRec { tab: tab2[op_index(g.op)], a: ins[0], b: ins[1], out: g.output },
-                _ => {
-                    let (base, invert) = match g.op {
-                        FlatOp::And => (FlatOp::And, false),
-                        FlatOp::Nand => (FlatOp::And, true),
-                        FlatOp::Or => (FlatOp::Or, false),
-                        FlatOp::Nor => (FlatOp::Or, true),
-                        FlatOp::Xor => (FlatOp::Xor, false),
-                        FlatOp::Xnor => (FlatOp::Xor, true),
-                        op => panic!("flat gate {gi}: {op:?} with {} inputs", ins.len()),
-                    };
-                    let start = c.wide_inputs.len() as u32;
-                    c.wide_inputs.extend_from_slice(ins);
-                    let w = WideGate { tab: tab2[op_index(base)], start, end: c.wide_inputs.len() as u32, invert };
-                    c.wide.push(w);
-                    GateRec { tab: 0, a: c.wide.len() as u32 - 1, b: 0, out: g.output }
-                }
-            };
-            debug_assert!(ins.len() > 2 || rec.tab != 0);
+            let rec = tabs.compile(g.op, &g.inputs, g.output, &mut c.wide, &mut c.wide_inputs, gi as GateIdx);
             c.gates.push(rec);
             c.driver_gate[g.output as usize] = gi as u32;
             driven[g.output as usize] = true;
         }
         let fo = nl.fanout();
         c.fo_start.push(0);
-        for (gs, rs) in fo.gates.iter().zip(&fo.resolvers) {
-            c.fanout.extend_from_slice(gs);
-            c.fanout.extend(rs.iter().map(|&r| r | RES_BIT));
+        let mut entries = blocks.net_entries.iter().peekable();
+        for (net, (gs, rs)) in fo.gates.iter().zip(&fo.resolvers).enumerate() {
+            c.fanout.extend(gs.iter().copied().filter(|&g| !in_block_gate(g as usize)));
+            c.fanout.extend(rs.iter().filter(|&&r| !in_block_res(r as usize)).map(|&r| r | RES_BIT));
+            while let Some(&&(en, e)) = entries.peek() {
+                if en as usize != net {
+                    break;
+                }
+                c.fanout.push(e | BLK_BIT);
+                entries.next();
+            }
             c.fo_start.push(c.fanout.len() as u32);
         }
 
@@ -379,23 +530,7 @@ impl Compiled {
     /// Evaluate gate `g` over `values`.
     #[inline(always)]
     fn eval(&self, g: GateRec, values: &[Logic]) -> Logic {
-        if g.tab != 0 {
-            eval::lookup2(g.tab, values[g.a as usize], values[g.b as usize])
-        } else {
-            self.eval_wide(g.a as usize, values)
-        }
-    }
-
-    /// Evaluate a gate with more than two inputs.
-    #[inline(never)]
-    fn eval_wide(&self, w: usize, values: &[Logic]) -> Logic {
-        let w = self.wide[w];
-        let ins = &self.wide_inputs[w.start as usize..w.end as usize];
-        let mut acc = eval::lookup2(w.tab, values[ins[0] as usize], values[ins[1] as usize]);
-        for &i in &ins[2..] {
-            acc = eval::lookup2(w.tab, acc, values[i as usize]);
-        }
-        if w.invert { eval::lookup2(self.not_tab, acc, acc) } else { acc }
+        eval_rec(g, values, &self.wide, &self.wide_inputs, self.not_tab)
     }
 }
 
@@ -572,6 +707,12 @@ pub struct TimingSim {
     /// Diagnostics dropped because `diags` was full.
     suppressed: u64,
     stats: TimingStats,
+    // ---- ideal blocks / stuck X ----
+    blk: ideal::Blocks,
+    /// Scratch for contention reports from block-internal resolvers.
+    blk_contention: Vec<(NetIdx, Vec<Logic>)>,
+    /// Tick of the stuck-X check (`u64::MAX` = none).
+    stuck_check: u64,
 }
 
 impl TimingSim {
@@ -582,7 +723,9 @@ impl TimingSim {
     /// If the netlist is malformed (a gate with the wrong number of inputs, a net index out of
     /// range).
     pub fn new(netlist: Arc<FlatNetlist>, opts: TimingOptions) -> Self {
-        let c = Compiled::new(&netlist);
+        let tabs = Tables::new();
+        let blk = ideal::Blocks::new(&netlist, opts.ideal_blocks, &opts.glass_box, opts.ideal_lut_bits, &tabs);
+        let c = Compiled::new(&netlist, &tabs, &blk);
         let n = netlist.num_nets as usize;
         let ng = netlist.gates.len();
         let nr = netlist.resolvers.len();
@@ -615,6 +758,9 @@ impl TimingSim {
             diags: Vec::new(),
             suppressed: 0,
             stats: TimingStats::default(),
+            blk,
+            blk_contention: Vec::new(),
+            stuck_check: u64::MAX,
             netlist,
         };
         sim.reset();
@@ -666,22 +812,25 @@ impl TimingSim {
         self.next_epoch();
         self.stats = TimingStats::default();
 
-        // Power-on evaluation: every gate is evaluated for tick 1.
-        let ng = self.c.gates.len();
-        for (i, slot) in self.sched[..ng].iter_mut().enumerate() {
-            *slot = i as u32;
-        }
+        // Power-on evaluation: every (individually simulated) gate is evaluated for tick 1.
+        // Gates inside ideal blocks stay marked as scheduled, so they are never queued.
+        let ng = self.c.sim_gates.len();
+        self.sched[..ng].copy_from_slice(&self.c.sim_gates);
         self.sched_len = ng;
         self.scheduled.fill(true);
 
         self.contending.fill(false);
         self.res_hold.fill(false);
         self.res_dirty.clear();
-        self.res_dirty.extend(0..self.c.r_out.len() as u32);
+        self.res_dirty.extend_from_slice(&self.c.sim_res);
         self.res_marked.fill(true);
         self.trk.reset();
         self.process_resolvers(0);
+        // Ideal blocks: full evaluation from the tick-0 inputs.
+        self.blk.reset();
+        self.process_blocks(0);
         self.trk.begin_tick();
+        self.stuck_check = self.stuck_check_tick();
     }
 
     /// Set a top-level input pin (by name). Width must match. Takes effect at the next tick.
@@ -719,11 +868,17 @@ impl TimingSim {
     /// undriven net keeps the forced value; a forced source net gets its source value back at the
     /// next tick.
     /// [`TimingSim::last_changed`] is updated to include the forced change.
+    ///
+    /// With ideal blocks: forcing an internal net of a block is ignored; a forced block output keeps
+    /// its value until the block next schedules a change for it.
     pub fn force_net(&mut self, net: NetIdx, value: Logic) {
         let n = net as usize;
         let old = self.values[n];
-        if old == value {
+        if old == value || self.blk.is_internal(net) {
             return;
+        }
+        if !self.blk.is_empty() {
+            self.blk.forcing(net);
         }
         let t = self.tick;
         self.values[n] = value;
@@ -733,6 +888,9 @@ impl TimingSim {
             self.forced_sources.push(net);
         }
         self.process_resolvers(t);
+        if self.blk.has_work() {
+            self.process_blocks(t);
+        }
         // A forced change rewrites tick `t`: recompute its history from the final values.
         self.trk.fix(&self.values, t, false);
         self.trk.candidates.clear();
@@ -777,6 +935,8 @@ impl TimingSim {
             let trk = &mut self.trk;
             let res_marked = &mut self.res_marked;
             let res_dirty = &mut self.res_dirty;
+            let blk_marked = &mut self.blk.entry_marked;
+            let blk_changed = &mut self.blk.changed;
             gate_changes = new_vals.len();
             let mut n = 0usize;
             for &(out, v) in new_vals.iter() {
@@ -784,16 +944,22 @@ impl TimingSim {
                 values[out as usize] = v;
                 trk.record(out, old, v, t);
                 for &f in c.readers(out) {
-                    if f & RES_BIT == 0 {
+                    if f < BLK_BIT {
                         // Branch-free append: always write, advance only if newly scheduled.
                         sched[n] = f;
                         n += usize::from(!scheduled[f as usize]);
                         scheduled[f as usize] = true;
-                    } else {
+                    } else if f & RES_BIT != 0 {
                         let r = f & !RES_BIT;
                         if !res_marked[r as usize] {
                             res_marked[r as usize] = true;
                             res_dirty.push(r);
+                        }
+                    } else {
+                        let e = f & !BLK_BIT;
+                        if !blk_marked[e as usize] {
+                            blk_marked[e as usize] = true;
+                            blk_changed.push(e);
                         }
                     }
                 }
@@ -803,6 +969,9 @@ impl TimingSim {
         self.stats.gate_evals += cur_len as u64;
         self.tick = t;
         self.stats.ticks += 1;
+
+        // ---- ideal-block outputs due at t (delay-carrying, like gate outputs) ----
+        let gate_changes = if self.blk.pending > 0 { gate_changes + self.land_blocks(t) } else { gate_changes };
 
         // ---- sources take their tick-t values ----
         let src_changed = self.apply_sources(t);
@@ -824,12 +993,17 @@ impl TimingSim {
             }
         }
 
+        // ---- ideal blocks whose inputs changed ----
+        if self.blk.has_work() {
+            self.process_blocks(t);
+        }
+
         // ---- episodes and oscillation ----
         if src_changed {
             self.next_epoch();
             self.osc_reported = false;
         }
-        if gate_changes > 0 {
+        if gate_changes > 0 || self.blk.pending > 0 {
             self.active_run += 1;
             if !self.osc_reported
                 && self.active_run >= self.opts.osc_limit
@@ -840,6 +1014,10 @@ impl TimingSim {
             }
         } else {
             self.end_activity();
+        }
+
+        if t == self.stuck_check {
+            self.check_stuck_x(t);
         }
     }
 
@@ -883,6 +1061,7 @@ impl TimingSim {
     /// input changes are pending and no running clock / unreleased `PowerOnReset` exists.
     pub fn is_quiescent(&self) -> bool {
         self.sched_len == 0
+            && self.blk.pending == 0
             && !self.inputs_pending
             && self.forced_sources.is_empty()
             && !self.c.timed.iter().any(|&(_, s)| s.changes_after(self.tick))
@@ -894,13 +1073,54 @@ impl TimingSim {
     }
 
     /// Current value of a net.
+    ///
+    /// For an internal net of an ideal block this is the value computed from the block's current
+    /// input values (SPEC §5.2 probing), computed on demand if necessary ([`ideal`] module docs).
     pub fn get(&self, net: NetIdx) -> Logic {
-        self.values[net as usize]
+        self.blk.lazy_value(net, &self.values).unwrap_or(self.values[net as usize])
     }
 
     /// All net values (index = NetIdx).
+    ///
+    /// Internal nets of ideal blocks that were last updated through a LUT may hold older values
+    /// here; call [`TimingSim::refresh_ideal_internal`] first to bring them up to date
+    /// ([`TimingSim::get`] / [`TimingSim::read`] are always exact).
     pub fn values(&self) -> &[Logic] {
         &self.values
+    }
+
+    /// Recompute the internal nets of ideal blocks last updated through a LUT, so that
+    /// [`TimingSim::values`] shows them evaluated from the blocks' current inputs. Does not change
+    /// the simulation (outputs, schedule, diagnostics other than internal contention).
+    pub fn refresh_ideal_internal(&mut self) {
+        if self.blk.any_stale() {
+            let mut cont = std::mem::take(&mut self.blk_contention);
+            self.blk.refresh(&mut self.values, self.tick, &mut cont);
+            self.blk_contention = cont;
+            self.emit_block_contention();
+        }
+    }
+
+    /// The ideal blocks in use (empty unless [`TimingOptions::ideal_blocks`] is set).
+    pub fn ideal_blocks(&self) -> &[IdealBlock] {
+        &self.blk.info
+    }
+
+    /// True if `net` is an internal (not simulated, computed) net of an ideal block.
+    pub fn is_ideal_internal(&self, net: NetIdx) -> bool {
+        self.blk.is_internal(net)
+    }
+
+    /// X origins of the given nets under the current values (see [`x_sources`]); internal nets
+    /// of ideal blocks are taken at their exact (on-demand) values.
+    pub fn x_sources(&self, nets: &[NetIdx]) -> Vec<XSource> {
+        if self.blk.any_stale() {
+            let mut v = self.values.clone();
+            self.blk.fill_stale(&mut v);
+            x_sources(&self.netlist, &v, nets)
+        } else {
+            x_sources(&self.netlist, &self.values, nets)
+        }
     }
 
     /// Nets whose value changed during the most recent `step` (for VCD dumping), i.e. the nets
@@ -966,7 +1186,7 @@ impl TimingSim {
 
     /// Counters since the last reset.
     pub fn stats(&self) -> TimingStats {
-        self.stats
+        TimingStats { block_evals: self.blk.evals, lut_hits: self.blk.lut_hits, ..self.stats }
     }
 
     // -----------------------------------------------------------------------------------------
@@ -1016,20 +1236,141 @@ impl TimingSim {
         }
     }
 
-    /// Schedule the gates reading `net` for the next tick and mark the resolvers reading it dirty.
+    /// Schedule the gates reading `net` for the next tick, mark the resolvers reading it dirty and
+    /// the ideal-block inputs it feeds changed.
     fn schedule_fanout(&mut self, net: NetIdx) {
         let n = net as usize;
         for i in self.c.fo_start[n]..self.c.fo_start[n + 1] {
             let f = self.c.fanout[i as usize];
-            if f & RES_BIT == 0 {
+            if f < BLK_BIT {
                 self.push_sched(f);
-            } else {
+            } else if f & RES_BIT != 0 {
                 let r = (f & !RES_BIT) as usize;
                 if !self.res_marked[r] {
                     self.res_marked[r] = true;
                     self.res_dirty.push(r as u32);
                 }
+            } else {
+                let e = (f & !BLK_BIT) as usize;
+                if !self.blk.entry_marked[e] {
+                    self.blk.entry_marked[e] = true;
+                    self.blk.changed.push(e as u32);
+                }
             }
+        }
+    }
+
+    /// Apply the ideal-block output changes due at tick `t`. Returns the number of nets changed.
+    fn land_blocks(&mut self, t: u64) -> usize {
+        let due = self.blk.take_due(t);
+        let mut changed = 0;
+        for &(net, v) in &due {
+            changed += usize::from(self.set_net(net, v, t));
+        }
+        self.blk.restore_due(t, due);
+        changed
+    }
+
+    /// Evaluate the ideal blocks whose inputs changed at tick `t`.
+    fn process_blocks(&mut self, t: u64) {
+        if self.blk.is_empty() {
+            return;
+        }
+        let mut cont = std::mem::take(&mut self.blk_contention);
+        self.blk.process(&mut self.values, t, &mut cont);
+        self.blk_contention = cont;
+        self.emit_block_contention();
+    }
+
+    /// Report contention found on block-internal resolvers.
+    fn emit_block_contention(&mut self) {
+        if self.blk_contention.is_empty() {
+            return;
+        }
+        let t = self.tick;
+        let mut cont = std::mem::take(&mut self.blk_contention);
+        for (net, drv) in cont.drain(..) {
+            let drv: Vec<String> = drv.iter().map(|v| v.to_string()).collect();
+            self.emit(
+                Diagnostic::warning(
+                    DiagKind::Contention,
+                    format!("contention at tick {t} (inside ideal block): drivers [{}]", drv.join(", ")),
+                )
+                .at(self.netlist.net_names[net as usize].clone()),
+            );
+        }
+        self.blk_contention = cont;
+    }
+
+    /// Tick of the stuck-X check for the current options and sources (module docs).
+    fn stuck_check_tick(&self) -> u64 {
+        let k = u64::from(self.opts.stuck_x_periods);
+        let mut period = 0u64;
+        let mut release = 0u64;
+        for &(_, s) in &self.c.timed {
+            match s {
+                Timed::Clock { period: p, .. } if s.changes_after(0) => period = period.max(p),
+                Timed::PowerOnReset { ticks } => release = release.max(ticks),
+                Timed::Clock { .. } => {}
+            }
+        }
+        if k == 0 || period == 0 {
+            return u64::MAX;
+        }
+        release.saturating_add(k.saturating_mul(period))
+    }
+
+    /// Raise `StuckX` for every top-level output pin that still has X bits.
+    #[cold]
+    fn check_stuck_x(&mut self, t: u64) {
+        let k = self.opts.stuck_x_periods;
+        let mut found = Vec::new();
+        for p in &self.netlist.top_outputs {
+            let bits: Vec<usize> = p
+                .nets
+                .iter()
+                .enumerate()
+                .filter(|&(_, &n)| self.values[n as usize] == Logic::X)
+                .map(|(i, _)| i)
+                .collect();
+            if bits.is_empty() {
+                continue;
+            }
+            let nets: Vec<NetIdx> = bits.iter().map(|&b| p.nets[b]).collect();
+            let sources = self.x_sources(&nets);
+            let mut origins: Vec<String> = sources
+                .iter()
+                .take(MAX_NAMES)
+                .map(|s| {
+                    let kind = match s.kind {
+                        XSourceKind::Loop => "loop",
+                        XSourceKind::Undriven => "undriven",
+                        XSourceKind::Source => "source",
+                        XSourceKind::Contention => "contention",
+                        XSourceKind::Gate => "gate",
+                    };
+                    format!("{kind} [{}]", self.name_list(&s.nets))
+                })
+                .collect();
+            if sources.len() > MAX_NAMES {
+                origins.push("...".into());
+            }
+            let bit_list: Vec<String> = bits.iter().map(|b| b.to_string()).collect();
+            found.push(
+                Diagnostic::warning(
+                    DiagKind::StuckX,
+                    format!(
+                        "output '{}' bits [{}] still X after {k} clock periods (tick {t}); X origins: {}",
+                        p.name,
+                        bit_list.join(", "),
+                        origins.join("; ")
+                    ),
+                )
+                .at(p.name.clone()),
+            );
+        }
+        for d in found {
+            self.emit(d);
         }
     }
 
@@ -1131,6 +1472,14 @@ impl TimingSim {
     /// True if every input of the driver of `net` is in the collapse set or quiet (see
     /// [`TimingSim::p2_input_ok`]). Nets without a gate/resolver driver are never sustained.
     fn p2_sustained(&self, net: NetIdx, t: u64, limit: u64) -> bool {
+        if let Some((cone, lat)) = self.blk.output_cone_lat(net) {
+            // The output replays its inputs `lat` ticks later: a cone input is quiet only if it
+            // did not change during the window shifted back by `lat - 1` ticks (for a chain of
+            // `lat` gates this is exactly "the last gate's input is quiet"; `lat = 1` is the
+            // plain gate rule).
+            let quiet = limit + u64::from(lat.saturating_sub(1));
+            return cone.iter().all(|&i| self.p2_mark[i as usize] || self.trk.last[i as usize] + quiet <= t);
+        }
         let g = self.c.driver_gate[net as usize];
         if g != NONE {
             let rec = self.c.gates[g as usize];
@@ -1171,12 +1520,23 @@ impl TimingSim {
                 continue;
             }
             self.p2_mark[net as usize] = false;
+            let mut feeds_block = false;
             for &f in self.c.readers(net) {
-                let out =
-                    if f & RES_BIT == 0 { self.c.gates[f as usize].out } else { self.c.r_out[(f & !RES_BIT) as usize] };
+                let out = if f < BLK_BIT {
+                    self.c.gates[f as usize].out
+                } else if f & RES_BIT != 0 {
+                    self.c.r_out[(f & !RES_BIT) as usize]
+                } else {
+                    feeds_block = true;
+                    continue;
+                };
                 if self.p2_mark[out as usize] {
                     work.push(out);
                 }
+            }
+            if feeds_block {
+                // Some block output's cone contains `net`: re-check every remaining candidate.
+                work.extend(cands.iter().copied().filter(|&c| self.p2_mark[c as usize]));
             }
         }
         let mut report: Vec<NetIdx> = Vec::new();
@@ -1196,9 +1556,13 @@ impl TimingSim {
             // alternating drivers are collapsed too. Re-scheduling the driver and holding the
             // resolver therefore never change the outcome today; they keep the documented rule
             // true by construction.
-            let g = self.c.driver_gate[n];
-            if g != NONE {
-                self.push_sched(g);
+            if self.blk.output_cone(net).is_some() {
+                self.blk.reschedule_output(net);
+            } else {
+                let g = self.c.driver_gate[n];
+                if g != NONE {
+                    self.push_sched(g);
+                }
             }
             let r = self.c.driver_res[n];
             if r != NONE {
@@ -1287,7 +1651,7 @@ mod tests {
             };
             for &k in arities {
                 let nl = one_gate(op, k);
-                let c = Compiled::new(&nl);
+                let c = Compiled::new(&nl, &Tables::new(), &ideal::Blocks::default());
                 let total = 4usize.pow(k as u32);
                 for combo in 0..total {
                     let ins: Vec<Logic> = (0..k).map(|i| ALL[(combo >> (2 * i)) & 3]).collect();

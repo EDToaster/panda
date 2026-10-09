@@ -7,3 +7,7 @@ license.workspace = true
 [dependencies]
 panda-netlist.workspace = true
 panda-timing.workspace = true
+
+[dev-dependencies]
+panda-circuits.workspace = true
+panda-cpu8.workspace = true
