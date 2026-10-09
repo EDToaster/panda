@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use panda_compile::{FastOptions, FastRef, KernelSet, KernelTable};
 use panda_fast::{CompileOptions as FastCompileOptions, FastSim, FastSimOptions};
-use panda_netlist::flat::FlatNetlist;
+use panda_netlist::flat::{FlatNetlist, NetIdx};
 use panda_netlist::{Diagnostic, Logic, Value};
 
 /// Outcome of [`FastEngine::load_state`].
@@ -51,6 +51,32 @@ pub(crate) trait FastEngine: Send {
     fn values(&self) -> &[Logic];
     /// Read by hierarchical name / pin name.
     fn read(&self, name: &str) -> Option<Value>;
+    /// `out[i]` = value of net `nets[i]` (bulk read by flat index; same values as `values()`).
+    fn gather(&self, nets: &[NetIdx], out: &mut [Logic]) {
+        let v = self.values();
+        for (o, &n) in out.iter_mut().zip(nets) {
+            *o = v[n as usize];
+        }
+    }
+    /// Process every event up to tick `last`, appending per event its tick to `ticks` and the
+    /// values of `nets` to `values` (observer sampling; the loop runs in the concrete engine,
+    /// without a dynamic call per event).
+    fn run_sampled(
+        &mut self,
+        last: u64,
+        nets: &[NetIdx],
+        ticks: &mut Vec<u64>,
+        values: &mut Vec<Logic>,
+    ) {
+        while self.next_event_tick().is_some_and(|e| e <= last) {
+            if let Some(t) = self.step_event() {
+                ticks.push(t);
+                let at = values.len();
+                values.resize(at + nets.len(), Logic::X);
+                self.gather(nets, &mut values[at..]);
+            }
+        }
+    }
     /// Drain diagnostics.
     fn take_diagnostics(&mut self) -> Vec<Diagnostic>;
     /// Install native code that became ready (normally done at the next event); true if the
@@ -90,6 +116,23 @@ macro_rules! impl_fast_engine {
             fn read(&self, name: &str) -> Option<Value> {
                 <$t>::read(self, name)
             }
+            fn gather(&self, nets: &[NetIdx], out: &mut [Logic]) {
+                <$t as LoadState>::gather(self, nets, out)
+            }
+            fn run_sampled(
+                &mut self,
+                last: u64,
+                nets: &[NetIdx],
+                ticks: &mut Vec<u64>,
+                values: &mut Vec<Logic>,
+            ) {
+                while <$t>::next_event_tick(self).is_some_and(|e| e <= last) {
+                    if let Some(t) = <$t>::step_event(self) {
+                        ticks.push(t);
+                        <$t as LoadState>::sample_into(self, nets, values);
+                    }
+                }
+            }
             fn take_diagnostics(&mut self) -> Vec<Diagnostic> {
                 <$t>::take_diagnostics(self)
             }
@@ -110,11 +153,24 @@ impl LoadState for FastRef {
     fn load_state(&mut self, tick: u64, values: &[Logic], inputs: &[Value]) -> LoadReport {
         FastRef::load_state(self, tick, values, inputs)
     }
+    fn gather(&self, nets: &[NetIdx], out: &mut [Logic]) {
+        let v = FastRef::values(self);
+        for (o, &n) in out.iter_mut().zip(nets) {
+            *o = v[n as usize];
+        }
+    }
+    fn sample_into(&self, nets: &[NetIdx], out: &mut Vec<Logic>) {
+        let v = FastRef::values(self);
+        out.extend(nets.iter().map(|&n| v[n as usize]));
+    }
 }
 
 /// The per-type half of [`FastEngine`] (`load_state`, the native tier; the rest by the macro).
 pub(crate) trait LoadState {
     fn load_state(&mut self, tick: u64, values: &[Logic], inputs: &[Value]) -> LoadReport;
+    fn gather(&self, nets: &[NetIdx], out: &mut [Logic]);
+    /// Append the values of `nets` to `out`.
+    fn sample_into(&self, nets: &[NetIdx], out: &mut Vec<Logic>);
     fn native_active(&mut self) -> bool {
         false
     }
@@ -165,6 +221,18 @@ impl CompiledEngine {
 impl LoadState for CompiledEngine {
     fn load_state(&mut self, tick: u64, values: &[Logic], inputs: &[Value]) -> LoadReport {
         self.sim.load_state(tick, values, inputs)
+    }
+
+    /// Per net: lazy nets (LUT internals, lazy kernel internals) are materialized only when one
+    /// of `nets` is lazy, so sampling a few nets per event stays cheap.
+    fn gather(&self, nets: &[NetIdx], out: &mut [Logic]) {
+        for (o, &n) in out.iter_mut().zip(nets) {
+            *o = self.sim.get(n);
+        }
+    }
+
+    fn sample_into(&self, nets: &[NetIdx], out: &mut Vec<Logic>) {
+        out.extend(nets.iter().map(|&n| self.sim.get(n)));
     }
 
     fn native_active(&mut self) -> bool {

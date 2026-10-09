@@ -148,7 +148,7 @@ fn inst_mut<'a>(
 /// Apply `ops` to `design` in order. Stops at the first operation that cannot be applied
 /// (unknown def / instance / net, duplicate id); the design is then partially edited, so callers
 /// apply edits to a copy. Structural validity is checked separately (validation).
-pub(crate) fn apply(design: &mut Design, ops: &[EditOp]) -> Result<(), Diagnostic> {
+pub fn apply(design: &mut Design, ops: &[EditOp]) -> Result<(), Diagnostic> {
     for (i, op) in ops.iter().enumerate() {
         apply_one(design, i, op)?;
     }

@@ -1,0 +1,27 @@
+[package]
+name = "panda-ui"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "Panda editor UI (egui + wgpu, desktop)"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "panda-ui"
+path = "src/bin/panda-ui.rs"
+
+[dependencies]
+panda-netlist.workspace = true
+panda-kernel.workspace = true
+panda-circuits.workspace = true
+panda-cpu8.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+eframe = { version = "0.36", default-features = false, features = ["wgpu", "default_fonts", "wayland", "x11"] }
+egui = "0.36"
+
+[dev-dependencies]
+egui_kittest = { version = "0.36", features = ["wgpu", "snapshot"] }
+image = { version = "0.25", default-features = false, features = ["png"] }

@@ -125,7 +125,7 @@ use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::time::{Duration, Instant};
 
 use panda_compile::{FastOptions, KernelOptions as CompileOptions, TableCache};
-use panda_netlist::flat::{FlatNetlist, SourceKind};
+use panda_netlist::flat::{FlatNetlist, NetIdx, SourceKind};
 use panda_netlist::validate::{has_errors, validate};
 use panda_netlist::{DiagKind, Diagnostic, Logic, Severity, Value, flatten};
 use panda_sta::StaOptions;
@@ -134,6 +134,10 @@ use panda_timing::TimingOptions;
 pub use classify::{ClassKind, Classification, Edge, KernelSummary, MAX_EXPLORE_INPUT_BITS};
 pub use diag::{DiagEntry, DiagSource};
 pub use edit::EditOp;
+/// Apply [`EditOp`]s to a [`Design`] exactly as [`Kernel::edit`] does before validating (no
+/// validation; on error the design is partially edited, so apply to a copy). Lets an editor keep
+/// its own copy of the design in step with the kernel.
+pub use edit::apply as apply_edits;
 pub use engine::FastBackend;
 pub use panda_fast::CompileOptions as FastCompileOptions;
 pub use panda_netlist::Design;
@@ -390,9 +394,63 @@ pub struct Kernel {
     compiling: Option<u64>,
     tx: Sender<WorkerMsg>,
     rx: Receiver<WorkerMsg>,
+    /// Samples for the [`EventObserver`] of the current call, not delivered yet.
+    samples: Samples,
+}
+
+/// Observer of the simulation, driven by [`Kernel::run_observed`] / [`Kernel::step_observed`]
+/// (e.g. waveform capture).
+///
+/// A *sample* is taken
+/// * in Fast mode after **every event** (clock edge, source change, input change), at the
+///   event's tick (the values hold from that tick until the next event; the facade reports
+///   `next_event - 1` as its own [`Kernel::tick`]);
+/// * in Timing mode (and the Timing fallback of Fast mode while compiling) after every tick at
+///   which some net changed, at that tick.
+///
+/// Samples are buffered by the kernel and delivered in order through
+/// [`EventObserver::observe_batch`], at the latest when the `run_observed` / `step_observed`
+/// call returns (and whenever [`OBSERVER_BATCH`] samples are pending). Taking a sample costs
+/// one gather of [`EventObserver::nets`] inside the engine's event loop (no dynamic call per
+/// event); keep the list short.
+pub trait EventObserver {
+    /// The flat nets to sample (must not change during a `run_observed` / `step_observed`
+    /// call).
+    fn nets(&self) -> &[NetIdx];
+    /// One sample: `values[i]` is the value of `nets()[i]` at `tick`.
+    fn observe(&mut self, tick: u64, values: &[Logic]);
+    /// `ticks.len()` samples in order; sample `k` is `values[k * n..(k + 1) * n]` with
+    /// `n = nets().len()`. The default calls [`EventObserver::observe`] for each.
+    fn observe_batch(&mut self, ticks: &[u64], values: &[Logic]) {
+        let n = self.nets().len();
+        for (k, &t) in ticks.iter().enumerate() {
+            self.observe(t, &values[k * n..(k + 1) * n]);
+        }
+    }
 }
 
 use diag::DiagStore;
+
+/// Samples buffered before [`EventObserver::observe_batch`] is called mid-run.
+pub const OBSERVER_BATCH: usize = 4096;
+
+/// Samples taken for an [`EventObserver`] and not delivered yet.
+#[derive(Default)]
+struct Samples {
+    ticks: Vec<u64>,
+    values: Vec<Logic>,
+}
+
+impl Samples {
+    /// Deliver the pending samples.
+    fn flush(&mut self, obs: &mut dyn EventObserver) {
+        if !self.ticks.is_empty() {
+            obs.observe_batch(&self.ticks, &self.values);
+            self.ticks.clear();
+            self.values.clear();
+        }
+    }
+}
 
 impl Default for Kernel {
     fn default() -> Self {
@@ -554,6 +612,7 @@ impl Kernel {
             compiling: None,
             tx,
             rx,
+            samples: Samples::default(),
         }
     }
 
@@ -961,7 +1020,7 @@ impl Kernel {
             Some(e) => Target::Tick(e - 1),
             None => Target::Settle,
         };
-        self.advance_timing(target);
+        self.advance_timing(target, None);
     }
 
     /// Timing → Fast state transfer at the current tick (a phase end).
@@ -1169,12 +1228,23 @@ impl Kernel {
 
     /// Advance the simulation by `n` units (see the crate docs, "Time").
     pub fn step(&mut self, n: u64, unit: StepUnit) {
-        self.step_counted(n, unit);
+        self.step_counted(n, unit, None);
+    }
+
+    /// [`Kernel::step`] with an [`EventObserver`] called after every Fast-mode event and every
+    /// Timing-mode tick that changed a net (see [`EventObserver`]).
+    pub fn step_observed(&mut self, n: u64, unit: StepUnit, observer: &mut dyn EventObserver) {
+        self.step_counted(n, unit, Some(observer));
     }
 
     /// [`Kernel::step`], returning the number of units that advanced the time (`Phase` /
     /// `Cycle`; for `Tick`: the ticks advanced).
-    fn step_counted(&mut self, n: u64, unit: StepUnit) -> u64 {
+    fn step_counted<'o>(
+        &mut self,
+        n: u64,
+        unit: StepUnit,
+        mut obs: Option<&mut (dyn EventObserver + 'o)>,
+    ) -> u64 {
         if self.active.is_none() {
             return 0;
         }
@@ -1184,14 +1254,14 @@ impl Kernel {
         match unit {
             StepUnit::Tick => {
                 let t = start.saturating_add(n);
-                self.advance(Target::Tick(t));
+                self.advance(Target::Tick(t), obs.as_deref_mut());
                 done = self.tick() - start;
             }
             StepUnit::Phase | StepUnit::Cycle => {
                 for _ in 0..n {
                     let before = self.tick();
                     let target = self.unit_target(unit);
-                    self.advance(target);
+                    self.advance(target, obs.as_deref_mut());
                     if self.tick() > before {
                         done += 1;
                     } else if target == Target::Settle {
@@ -1199,6 +1269,9 @@ impl Kernel {
                     }
                 }
             }
+        }
+        if let Some(obs) = obs {
+            self.samples.flush(obs);
         }
         self.poll(false).ok();
         done
@@ -1210,7 +1283,7 @@ impl Kernel {
             return;
         }
         self.poll(false).ok();
-        self.advance(Target::Tick(tick));
+        self.advance(Target::Tick(tick), None);
         self.poll(false).ok();
     }
 
@@ -1232,6 +1305,21 @@ impl Kernel {
     /// Run until `budget` expires (or nothing can change any more), in steps of whole cycles
     /// (phases without a clock), sized so the budget is not overrun by more than about one step.
     pub fn run(&mut self, budget: Duration) -> RunStats {
+        self.run_impl(budget, None)
+    }
+
+    /// [`Kernel::run`] with an [`EventObserver`] called after every Fast-mode event and every
+    /// Timing-mode tick that changed a net (waveform sampling). [`Kernel::run`] itself has no
+    /// observer and pays nothing for this hook.
+    pub fn run_observed(&mut self, budget: Duration, observer: &mut dyn EventObserver) -> RunStats {
+        self.run_impl(budget, Some(observer))
+    }
+
+    fn run_impl<'o>(
+        &mut self,
+        budget: Duration,
+        mut obs: Option<&mut (dyn EventObserver + 'o)>,
+    ) -> RunStats {
         let start = Instant::now();
         let mut stats = RunStats {
             elapsed: Duration::ZERO,
@@ -1260,7 +1348,7 @@ impl Kernel {
             let remaining = budget - elapsed;
             let before = self.tick();
             let c0 = Instant::now();
-            stats.steps += self.step_counted(chunk, unit);
+            stats.steps += self.step_counted(chunk, unit, obs.as_deref_mut());
             let dt = c0.elapsed();
             if self.tick() == before {
                 stats.idle = true;
@@ -1281,7 +1369,7 @@ impl Kernel {
         stats
     }
 
-    fn advance(&mut self, target: Target) {
+    fn advance<'o>(&mut self, target: Target, obs: Option<&mut (dyn EventObserver + 'o)>) {
         match &self.active {
             Some(Active::Timing(_)) => {
                 let target = if self.mode == Mode::Fast {
@@ -1296,20 +1384,59 @@ impl Kernel {
                 } else {
                     target
                 };
-                self.advance_timing(target);
+                self.advance_timing(target, obs);
             }
-            Some(Active::Fast { .. }) => self.advance_fast(target),
+            Some(Active::Fast { .. }) => self.advance_fast(target, obs),
             None => {}
         }
         self.pristine = false;
     }
 
-    fn advance_timing(&mut self, target: Target) {
+    fn advance_timing<'o>(&mut self, target: Target, obs: Option<&mut (dyn EventObserver + 'o)>) {
         let max = self.opts.max_settle_ticks;
         let Some(Active::Timing(t)) = &mut self.active else {
             return;
         };
         let before = t.tick();
+        if let Some(obs) = obs {
+            // Observed: tick by tick, sampling after every tick that changed a net.
+            let samples = &mut self.samples;
+            let mut tick_to = |t: &mut TimingEngine, tick: u64| {
+                while t.tick() < tick {
+                    if t.sim.is_quiescent() {
+                        t.run_to(tick);
+                        break;
+                    }
+                    t.sim.step();
+                    if !t.sim.last_changed().is_empty() {
+                        samples.ticks.push(t.tick());
+                        samples
+                            .values
+                            .extend(obs.nets().iter().map(|&n| t.sim.get(n)));
+                        if samples.ticks.len() >= OBSERVER_BATCH {
+                            samples.flush(obs);
+                        }
+                    }
+                }
+            };
+            match target {
+                Target::Tick(tick) => tick_to(t, tick),
+                Target::Settle => {
+                    let end = t.tick().saturating_add(max);
+                    tick_to(t, end);
+                }
+                Target::TickThenSettle(tick) => {
+                    tick_to(t, tick);
+                    let end = t.tick().saturating_add(max);
+                    tick_to(t, end);
+                }
+            }
+            if t.tick() > before {
+                self.applied = self.inputs.clone();
+            }
+            self.drain_engine();
+            return;
+        }
         match target {
             Target::Tick(tick) => t.run_to(tick),
             Target::Settle => {
@@ -1327,7 +1454,8 @@ impl Kernel {
         self.drain_engine();
     }
 
-    fn advance_fast(&mut self, target: Target) {
+    fn advance_fast<'o>(&mut self, target: Target, obs: Option<&mut (dyn EventObserver + 'o)>) {
+        let flushed = self.fast_pending;
         self.flush_fast_inputs();
         let now = self.tick();
         let max = self.opts.max_settle_ticks;
@@ -1342,8 +1470,27 @@ impl Kernel {
             Target::Settle => now.saturating_add(max),
             Target::TickThenSettle(t) => t.saturating_add(max),
         };
-        while engine.next_event_tick().is_some_and(|e| e <= last) {
-            engine.step_event();
+        match obs {
+            None => {
+                while engine.next_event_tick().is_some_and(|e| e <= last) {
+                    engine.step_event();
+                }
+            }
+            Some(obs) => {
+                let samples = &mut self.samples;
+                let nets = obs.nets();
+                if flushed {
+                    // The input event processed by `flush_fast_inputs`.
+                    samples.ticks.push(engine.tick());
+                    let at = samples.values.len();
+                    samples.values.resize(at + nets.len(), Logic::X);
+                    engine.gather(nets, &mut samples.values[at..]);
+                }
+                engine.run_sampled(last, nets, &mut samples.ticks, &mut samples.values);
+                if samples.ticks.len() >= OBSERVER_BATCH {
+                    samples.flush(obs);
+                }
+            }
         }
         self.drain_engine();
     }
@@ -1378,6 +1525,38 @@ impl Kernel {
     /// [`Kernel::read`] as a number (`None` if unknown or not fully binary).
     pub fn read_u64(&self, net: &str) -> Option<u64> {
         self.read(net)?.to_u64()
+    }
+
+    /// Bulk read by flat index: `out[i]` = value of net `nets[i]` (indices of
+    /// [`Kernel::netlist`]), exactly what [`Kernel::read`] would report. Without a design every
+    /// value is `X`.
+    ///
+    /// # Panics
+    ///
+    /// If `nets` and `out` differ in length or an index is out of range.
+    pub fn copy_values(&self, nets: &[NetIdx], out: &mut [Logic]) {
+        assert_eq!(nets.len(), out.len(), "copy_values: length mismatch");
+        match &self.active {
+            Some(Active::Timing(t)) => {
+                for (o, &n) in out.iter_mut().zip(nets) {
+                    *o = t.sim.get(n);
+                }
+            }
+            Some(Active::Fast { engine, .. }) => engine.gather(nets, out),
+            None => out.fill(Logic::X),
+        }
+    }
+
+    /// Value of one flat net (index of [`Kernel::netlist`]); `None` without a design or if out
+    /// of range.
+    pub fn value(&self, net: NetIdx) -> Option<Logic> {
+        let flat = self.netlist()?;
+        if net >= flat.num_nets {
+            return None;
+        }
+        let mut v = [Logic::X];
+        self.copy_values(&[net], &mut v);
+        Some(v[0])
     }
 
     /// Every net value of the active engine (index = net of [`Kernel::netlist`]).
