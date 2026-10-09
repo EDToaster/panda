@@ -5,8 +5,13 @@
 //!   multi-bit input opens a small editor (decimal, `0x…`, `0b…` with `x`/`z`, negative
 //!   decimal). The command is sent without waiting; [`InputModel`] bridges the publication
 //!   delay so fast double clicks toggle twice.
+//!   While paused, a sent value applies at the next step; until then the pin carries a badge
+//!   with the pending value.
 //! * Hover a wire or pin: its name and live value (hex and decimal for buses).
-//! * Right-click a wire or pin: add it to / remove it from the waveform viewer, set an input.
+//! * The canvas context menu (owned by [`crate::edit::menus`], which also has "Add to
+//!   waveform") gets a "Set input value…" entry for top-level inputs.
+
+use std::cell::RefCell;
 
 use egui::{Color32, FontId, Id, Key, Order, Pos2, Rect, Ui, pos2, vec2};
 use panda_netlist::{Dir, Endpoint, PinDecl, Value};
@@ -14,13 +19,13 @@ use panda_netlist::{Dir, Endpoint, PinDecl, Value};
 use crate::app::{AppState, CanvasTool};
 use crate::canvas::{CanvasResponse, Palette, Scene};
 use crate::doc::ItemRef;
+use crate::edit::menus::{ContextEntry, Target, add_context_entry, context_menu_open};
 use crate::simhost::Packed;
 
+use super::SharedRef;
 use super::control::{InputModel, parse_input};
 use super::locate::Mark;
 use super::wave_view::{Radix, format_value};
-use super::waveform::{add_signal, remove_signal, signal_names};
-use super::SharedRef;
 
 /// What the pointer is over.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -76,6 +81,30 @@ pub fn value_text(v: &Value) -> String {
     }
 }
 
+/// Text of the hover label: `"Q = 0x5 (5)"`, `"EN = 1   · click to toggle"`; `input_width` is
+/// set for a clickable top-level input, `pending` is a value sent to it that the simulation has
+/// not applied yet (inputs take effect at the next tick / step, also while paused).
+pub fn hover_text(
+    name: &str,
+    value: Option<&Value>,
+    input_width: Option<u32>,
+    pending: Option<&Value>,
+) -> String {
+    let mut text = match value {
+        Some(v) => format!("{name} = {}", value_text(v)),
+        None => format!("{name}  (no live value)"),
+    };
+    if let Some(p) = pending {
+        text.push_str(&format!(" → {} at the next step", value_text(p)));
+    }
+    match input_width {
+        Some(1) => text.push_str("   · click to toggle"),
+        Some(_) => text.push_str("   · click to edit"),
+        None => {}
+    }
+    text
+}
+
 /// A top-level input pin of the viewed def (only in the top view).
 fn top_input<'a>(app: &'a AppState, name: &str) -> Option<&'a PinDecl> {
     if !app.view.path.is_empty() {
@@ -97,9 +126,24 @@ struct InputEdit {
     focus: bool,
 }
 
-struct Menu {
-    pos: Pos2,
-    probe: Probe,
+thread_local! {
+    /// Input pins whose editor the context-menu entry asked for (the entry's `run` is a plain
+    /// `fn` without access to the tool; UI thread only).
+    static EDIT_REQUESTS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+}
+
+/// The "Set input value…" entry of the canvas context menu (owned by the editing module).
+fn set_value_entry() -> ContextEntry {
+    ContextEntry {
+        key: "simux.set_input",
+        label: "Set input value…".into(),
+        applies: |app, t| matches!(t, Target::Pin(p) if top_input(app, p).is_some()),
+        run: |_, t| {
+            if let Target::Pin(p) = t {
+                EDIT_REQUESTS.with(|r| r.borrow_mut().push(p.clone()));
+            }
+        },
+    }
 }
 
 /// The canvas tool.
@@ -107,7 +151,9 @@ pub struct SimTool {
     shared: SharedRef,
     inputs: InputModel,
     edit: Option<InputEdit>,
-    menu: Option<Menu>,
+    /// Screen position of the last right click (where a requested editor opens).
+    menu_pos: Option<Pos2>,
+    entry_added: bool,
     design_gen: u64,
 }
 
@@ -118,7 +164,8 @@ impl SimTool {
             shared,
             inputs: InputModel::default(),
             edit: None,
-            menu: None,
+            menu_pos: None,
+            entry_added: false,
             design_gen: 0,
         }
     }
@@ -154,18 +201,24 @@ impl SimTool {
             let cmd = self.inputs.toggle(pin, live.as_ref());
             app.sim.send(cmd);
         } else {
-            let cur = self.inputs.current(pin, live.as_ref());
-            self.edit = Some(InputEdit {
-                pin: pin.to_string(),
-                width,
-                text: cur
-                    .and_then(|v| v.to_u64())
-                    .map_or(String::new(), |v| format!("0x{v:x}")),
-                pos: at,
-                error: None,
-                focus: true,
-            });
+            self.open_editor(app, pin, width, at);
         }
+    }
+
+    /// Open the value editor of input `pin` at screen position `at`.
+    fn open_editor(&mut self, app: &AppState, pin: &str, width: u32, at: Pos2) {
+        let live = Self::live_pin(app, pin);
+        let cur = self.inputs.current(pin, live.as_ref());
+        self.edit = Some(InputEdit {
+            pin: pin.to_string(),
+            width,
+            text: cur
+                .and_then(|v| v.to_u64())
+                .map_or(String::new(), |v| format!("0x{v:x}")),
+            pos: at,
+            error: None,
+            focus: true,
+        });
     }
 
     fn apply_focus(&self, app: &mut AppState, canvas: &CanvasResponse, scene: &Scene) {
@@ -192,115 +245,84 @@ impl SimTool {
         xf.origin = canvas.rect.center() - world.center().to_vec2() * xf.zoom;
     }
 
+    /// The hover label: name and live value next to the pointer (a non-interactive tooltip
+    /// layer, so it is also visible to accessibility / tests).
     fn hover_label(&self, ui: &Ui, app: &AppState, canvas: &CanvasResponse, probe: &Probe) {
         let Some(p) = canvas.response.hover_pos() else {
             return;
         };
         let (name, value) = match probe {
-            Probe::Net(n) => (n.clone(), Self::live_net(app, n)),
-            Probe::Pin(n) => (n.clone(), Self::live_pin(app, n)),
+            Probe::Net(n) => (n.as_str(), Self::live_net(app, n)),
+            Probe::Pin(n) => (n.as_str(), Self::live_pin(app, n)),
         };
-        let mut text = match &value {
-            Some(v) => format!("{name} = {}", value_text(v)),
-            None => format!("{name}  (no live value)"),
+        let (width, pending) = match probe {
+            Probe::Pin(n) => (
+                top_input(app, n).map(|d| d.width),
+                self.inputs.pending(n, value.as_ref()),
+            ),
+            Probe::Net(_) => (None, None),
         };
-        if let Probe::Pin(n) = probe
-            && top_input(app, n).is_some()
-        {
-            text.push_str("   · click to set");
+        let text = hover_text(name, value.as_ref(), width, pending);
+        let pal = Palette::for_dark_mode(ui.visuals().dark_mode);
+        let font = FontId::monospace(12.0);
+        // Keep the label inside the canvas (flip to the other side of the pointer at the edges).
+        let size = ui
+            .painter()
+            .layout_no_wrap(text.clone(), font.clone(), pal.text)
+            .size()
+            + vec2(12.0, 10.0);
+        let mut at = p + vec2(14.0, 14.0);
+        if at.x + size.x > canvas.rect.right() {
+            at.x -= size.x + 28.0;
+        }
+        if at.y + size.y > canvas.rect.bottom() {
+            at.y -= size.y + 28.0;
+        }
+        egui::Area::new(Id::new("simux_hover_value"))
+            .order(Order::Tooltip)
+            .interactable(false)
+            .fixed_pos(at)
+            .show(ui.ctx(), |ui| {
+                egui::Frame::new()
+                    .fill(pal.fill.gamma_multiply(0.95))
+                    .stroke(egui::Stroke::new(1.0, pal.accent.gamma_multiply(0.7)))
+                    .corner_radius(3.0)
+                    .inner_margin(egui::Margin::symmetric(6, 5))
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(text).font(font).color(pal.text))
+                                .extend(),
+                        );
+                    });
+            });
+    }
+
+    /// Mark inputs whose sent value is not applied yet (paused simulation): a badge with the
+    /// pending value next to the pin.
+    fn paint_pending(&self, ui: &Ui, app: &AppState, canvas: &CanvasResponse, scene: &Scene) {
+        if self.inputs.is_empty() || !app.view.path.is_empty() {
+            return;
         }
         let pal = Palette::for_dark_mode(ui.visuals().dark_mode);
         let painter = ui.painter_at(canvas.rect);
-        let g = painter.layout_no_wrap(text, FontId::monospace(12.0), pal.text);
-        let mut r = Rect::from_min_size(p + vec2(14.0, 14.0), g.size()).expand(4.0);
-        if r.right() > canvas.rect.right() {
-            r = r.translate(vec2(-(r.width() + 28.0), 0.0));
-        }
-        if r.bottom() > canvas.rect.bottom() {
-            r = r.translate(vec2(0.0, -(r.height() + 28.0)));
-        }
-        painter.rect_filled(r, 3.0, pal.fill.gamma_multiply(0.95));
-        painter.rect_stroke(
-            r,
-            3.0,
-            egui::Stroke::new(1.0, pal.accent.gamma_multiply(0.7)),
-            egui::StrokeKind::Inside,
-        );
-        painter.galley(r.min + vec2(4.0, 4.0), g, pal.text);
-    }
-
-    fn show_menu(&mut self, ui: &mut Ui, app: &mut AppState) {
-        let Some(m) = &self.menu else { return };
-        let path = app.view.path.clone();
-        let name = wave_name(app, &path, &m.probe);
-        let names = signal_names(app);
-        let shown = names.iter().position(|n| n == &name);
-        let input = match &m.probe {
-            Probe::Pin(p) => top_input(app, p).map(|d| (d.name.clone(), d.width)),
-            _ => None,
-        };
-        let mut close = false;
-        let mut action: Option<Box<dyn FnOnce(&mut SimTool, &mut AppState)>> = None;
-        let resp = egui::Area::new(Id::new("simux_canvas_menu"))
-            .order(Order::Foreground)
-            .fixed_pos(m.pos)
-            .show(ui.ctx(), |ui| {
-                egui::Frame::menu(ui.style()).show(ui, |ui| {
-                    ui.set_min_width(180.0);
-                    ui.weak(&name);
-                    match shown {
-                        None => {
-                            if ui.button("Add to waveform").clicked() {
-                                let n = name.clone();
-                                action = Some(Box::new(move |_, app| {
-                                    if !add_signal(app, &n) {
-                                        app.log.push(format!("cannot watch '{n}'"));
-                                    }
-                                }));
-                                close = true;
-                            }
-                        }
-                        Some(i) => {
-                            if ui.button("Remove from waveform").clicked() {
-                                action = Some(Box::new(move |_, app| remove_signal(app, i)));
-                                close = true;
-                            }
-                        }
-                    }
-                    if let Some((pin, width)) = &input {
-                        let (pin, width) = (pin.clone(), *width);
-                        if ui.button("Set value…").clicked() {
-                            let pos = m.pos;
-                            action = Some(Box::new(move |t, app| {
-                                let live = SimTool::live_pin(app, &pin);
-                                let cur = t.inputs.current(&pin, live.as_ref());
-                                t.edit = Some(InputEdit {
-                                    text: cur
-                                        .and_then(|v| v.to_u64())
-                                        .map_or(String::new(), |v| format!("0x{v:x}")),
-                                    pin,
-                                    width,
-                                    pos,
-                                    error: None,
-                                    focus: true,
-                                });
-                            }));
-                            close = true;
-                        }
-                    }
-                });
-            });
-        let outside = ui.input(|i| {
-            i.pointer.any_pressed()
-                && i.pointer
-                    .interact_pos()
-                    .is_some_and(|p| !resp.response.rect.contains(p))
-        });
-        if close || outside || ui.input(|i| i.key_pressed(Key::Escape)) {
-            self.menu = None;
-        }
-        if let Some(a) = action {
-            a(self, app);
+        let font = FontId::monospace(11.0);
+        for (pin, v) in self.inputs.sent() {
+            let live = Self::live_pin(app, pin);
+            if self.inputs.pending(pin, live.as_ref()).is_none() {
+                continue;
+            }
+            let Some(p) = scene.item(&ItemRef::Pin(pin.to_string())) else {
+                continue;
+            };
+            let r = canvas.xf.rect_to_screen(&p.rect());
+            if !canvas.rect.intersects(r) {
+                continue;
+            }
+            let g = painter.layout_no_wrap(format!("→{}", value_text(v)), font.clone(), pal.fill);
+            let badge = Rect::from_min_size(r.left_top() - vec2(0.0, g.size().y + 6.0), g.size())
+                .expand2(vec2(4.0, 2.0));
+            painter.rect_filled(badge, 3.0, pal.accent);
+            painter.galley(badge.min + vec2(4.0, 2.0), g, pal.fill);
         }
     }
 
@@ -345,7 +367,10 @@ impl SimTool {
                     app.sim.send(cmd);
                     self.edit = None;
                 }
-                Err(msg) => e.error = Some(msg),
+                Err(msg) => {
+                    e.error = Some(msg);
+                    e.focus = true;
+                }
             }
         } else if cancel {
             self.edit = None;
@@ -362,21 +387,26 @@ impl CanvasTool for SimTool {
         if app.live.design_gen != self.design_gen {
             self.design_gen = app.live.design_gen;
             self.edit = None;
-            self.menu = None;
+        }
+        if !self.entry_added {
+            add_context_entry(ui.ctx(), set_value_entry());
+            self.entry_added = true;
+        }
+        let requested = EDIT_REQUESTS.with(|r| r.borrow_mut().pop());
+        if let Some(pin) = requested
+            && let Some(width) = top_input(app, &pin).map(|d| d.width)
+        {
+            let at = self.menu_pos.unwrap_or(canvas.rect.center());
+            self.open_editor(app, &pin, width, at);
         }
         // Forget sent input values the snapshot confirms.
-        if app.view.path.is_empty()
+        if !self.inputs.is_empty()
+            && app.view.path.is_empty()
             && let Some(def) = app.doc.def(&app.view.def)
         {
-            let pins: Vec<String> = def
-                .pins
-                .iter()
-                .filter(|p| p.dir == Dir::In)
-                .map(|p| p.name.clone())
-                .collect();
-            for p in pins {
-                let live = Self::live_pin(app, &p);
-                self.inputs.confirm(&p, live.as_ref());
+            for p in def.pins.iter().filter(|p| p.dir == Dir::In) {
+                let live = Self::live_pin(app, &p.name);
+                self.inputs.confirm(&p.name, live.as_ref());
             }
         }
         self.apply_focus(app, canvas, scene);
@@ -391,18 +421,16 @@ impl CanvasTool for SimTool {
         {
             self.click_input(app, &pin, p);
         }
-        if r.secondary_clicked()
-            && let Some(p) = r.interact_pointer_pos()
-        {
-            self.menu = Self::probe_at(scene, xf.to_world(p), xf.zoom).map(|probe| Menu { pos: p, probe });
+        if r.secondary_clicked() {
+            self.menu_pos = r.interact_pointer_pos();
         }
-        if self.menu.is_none()
-            && self.edit.is_none()
+        if self.edit.is_none()
+            && !context_menu_open(ui.ctx())
             && let Some(pr) = &probe
         {
             self.hover_label(ui, app, canvas, pr);
         }
-        self.show_menu(ui, app);
+        self.paint_pending(ui, app, canvas, scene);
         self.show_editor(ui, app);
     }
 }
@@ -417,5 +445,23 @@ mod tests {
         assert_eq!(value_text(&Value::from_u64(8, 42)), "0x2a (42)");
         assert_eq!(value_text(&Value::xs(8)), "0xxx");
         assert_eq!(value_text(&Value::xs(1)), "x");
+        assert_eq!(
+            hover_text("EN", Some(&Value::from_bool(true)), Some(1), None),
+            "EN = 1   · click to toggle"
+        );
+        assert_eq!(
+            hover_text("WD", Some(&Value::from_u64(8, 90)), Some(8), None),
+            "WD = 0x5a (90)   · click to edit"
+        );
+        assert_eq!(hover_text("n3", None, None, None), "n3  (no live value)");
+        assert_eq!(
+            hover_text(
+                "EN",
+                Some(&Value::from_bool(false)),
+                Some(1),
+                Some(&Value::from_bool(true))
+            ),
+            "EN = 0 → 1 at the next step   · click to toggle"
+        );
     }
 }

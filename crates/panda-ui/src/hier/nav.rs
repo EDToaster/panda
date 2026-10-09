@@ -61,7 +61,10 @@ pub fn parent_path(path: &str) -> Option<String> {
     if path.is_empty() {
         return None;
     }
-    Some(path.rsplit_once('/').map_or(String::new(), |(p, _)| p.to_string()))
+    Some(
+        path.rsplit_once('/')
+            .map_or(String::new(), |(p, _)| p.to_string()),
+    )
 }
 
 /// Path of instance `inst` inside the instance at `path`.
@@ -89,6 +92,26 @@ pub fn package_instances(design: &Design, def: &str) -> Vec<(String, DefId)> {
         .unwrap_or_default()
 }
 
+/// `None` if the view (`path` showing `def`) still exists; else the deepest existing ancestor
+/// path to switch to (structural changes such as undoing a package can remove the viewed
+/// instance).
+pub fn valid_view(design: &Design, path: &str, def: &str) -> Option<String> {
+    match crate::app::def_at_path(design, path) {
+        Some(d) if d == def => return None,
+        // Same instance, now of another def: view that.
+        Some(_) => return Some(path.to_string()),
+        None => {}
+    }
+    let mut p = path.to_string();
+    while let Some(up) = parent_path(&p) {
+        if crate::app::def_at_path(design, &up).is_some() {
+            return Some(up);
+        }
+        p = up;
+    }
+    Some(String::new())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -102,15 +125,20 @@ mod tests {
         assert_eq!(c[0].path, "");
         assert_eq!(c[1].label, "cpu");
         assert_eq!(c[2].path, "cpu/alu");
-        assert_eq!(
-            c[2].def,
-            crate::app::def_at_path(&d, "cpu/alu").unwrap()
-        );
+        assert_eq!(c[2].def, crate::app::def_at_path(&d, "cpu/alu").unwrap());
         assert!(crumbs(&d, "cpu/nope").is_empty());
         assert_eq!(parent_path("cpu/alu").as_deref(), Some("cpu"));
         assert_eq!(parent_path("cpu").as_deref(), Some(""));
         assert_eq!(parent_path(""), None);
         assert_eq!(child_path("", "cpu"), "cpu");
         assert!(!package_instances(&d, &d.top).is_empty());
+        let alu = crate::app::def_at_path(&d, "cpu/alu").unwrap();
+        assert_eq!(valid_view(&d, "cpu/alu", &alu), None);
+        assert_eq!(valid_view(&d, "cpu/nope/x", "y").as_deref(), Some("cpu"));
+        assert_eq!(
+            valid_view(&d, "cpu/alu", "other").as_deref(),
+            Some("cpu/alu")
+        );
+        assert_eq!(valid_view(&d, "zz", "zz").as_deref(), Some(""));
     }
 }

@@ -4,10 +4,10 @@
 use std::collections::HashMap;
 
 use egui::{Align2, Pos2, Rect, pos2};
-use panda_netlist::{Dir, Endpoint};
+use panda_netlist::Endpoint;
 
 use crate::doc::{Document, ItemRef, Placed};
-use crate::geom::{GridPt, GridRect, SymbolKind, gp};
+use crate::geom::{GridPt, GridRect, gp};
 
 /// Text drawn with a symbol, in local grid coordinates.
 #[derive(Clone, Debug, PartialEq)]
@@ -22,6 +22,8 @@ pub struct SymText {
     pub align: Align2,
     /// Dimmed (pin labels).
     pub dim: bool,
+    /// Runs along the local y axis, reading upward (else along x, reading rightward).
+    pub vertical: bool,
 }
 
 /// One net's wires.
@@ -60,6 +62,8 @@ pub struct Scene {
     pub net_index: HashMap<String, usize>,
     /// Bounding box of everything.
     pub bounds: GridRect,
+    /// Free text labels (e.g. group names from auto-layout).
+    pub labels: Vec<crate::doc::Label>,
     /// Occupancy pyramid for overview zoom levels (built on first use).
     overview: std::sync::OnceLock<Overview>,
 }
@@ -119,6 +123,7 @@ impl Scene {
                 min: gp(0, 0),
                 max: gp(40, 30),
             });
+        let labels = doc.editor(def_id).map_or_else(Vec::new, |e| e.labels.clone());
         Scene {
             def: def_id.to_string(),
             revision: doc.revision,
@@ -128,6 +133,7 @@ impl Scene {
             nets,
             net_index,
             bounds,
+            labels,
             overview: std::sync::OnceLock::new(),
         }
     }
@@ -187,69 +193,9 @@ impl Scene {
     }
 }
 
-/// Text shown with a symbol (local coordinates).
+/// Text shown with a symbol (local coordinates; see [`super::shapes::symbol_texts`]).
 fn symbol_texts(p: &Placed) -> Vec<SymText> {
-    let s = &p.symbol;
-    let (w, h) = (s.size.x as f32, s.size.y as f32);
-    let t = |pos: [f32; 2], text: &str, size: f32, align: Align2, dim: bool| SymText {
-        pos,
-        text: text.to_string(),
-        size,
-        align,
-        dim,
-    };
-    match &s.kind {
-        SymbolKind::Constant { text } => {
-            vec![t([w / 2.0, 1.0], text, 1.1, Align2::CENTER_CENTER, false)]
-        }
-        SymbolKind::PowerOnReset => {
-            vec![t([w / 2.0, 1.0], "POR", 1.1, Align2::CENTER_CENTER, false)]
-        }
-        SymbolKind::Pin { name, dir } => {
-            let x = if *dir == Dir::In {
-                (w - 1.0) / 2.0
-            } else {
-                (w + 1.0) / 2.0
-            };
-            vec![t([x, 1.0], name, 1.1, Align2::CENTER_CENTER, false)]
-        }
-        SymbolKind::Package { title, .. } => {
-            let mut v = vec![t([w / 2.0, 1.0], title, 1.15, Align2::CENTER_CENTER, false)];
-            for port in &s.ports {
-                let (pos, align) = match port.side {
-                    crate::geom::Side::Left => ([0.6, port.pos.y as f32], Align2::LEFT_CENTER),
-                    crate::geom::Side::Right => {
-                        ([w - 0.6, port.pos.y as f32], Align2::RIGHT_CENTER)
-                    }
-                    crate::geom::Side::Top => ([port.pos.x as f32, 0.6], Align2::CENTER_TOP),
-                    crate::geom::Side::Bottom => {
-                        ([port.pos.x as f32, h - 0.6], Align2::CENTER_BOTTOM)
-                    }
-                };
-                v.push(t(pos, &port.name, 1.0, align, true));
-            }
-            v
-        }
-        SymbolKind::Splitter { parts } => parts
-            .iter()
-            .enumerate()
-            .map(|(i, (lo, hi))| {
-                let label = if lo == hi {
-                    format!("{lo}")
-                } else {
-                    format!("{hi}:{lo}")
-                };
-                t(
-                    [1.25, 1.0 + 2.0 * i as f32 - 0.15],
-                    &label,
-                    0.75,
-                    Align2::LEFT_BOTTOM,
-                    true,
-                )
-            })
-            .collect(),
-        _ => Vec::new(),
-    }
+    super::shapes::symbol_texts(&p.symbol)
 }
 
 /// One level of an [`Overview`]: a bitmap of `cell`-unit squares.

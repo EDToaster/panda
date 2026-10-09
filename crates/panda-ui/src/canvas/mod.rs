@@ -75,8 +75,8 @@ pub struct CanvasResponse {
 }
 
 /// A text queued while building the mesh: position, text, size, alignment, colour, optional
-/// background box.
-type CanvasText = (Pos2, String, f32, Align2, Color32, Option<Color32>);
+/// background box, clockwise rotation about the anchor (radians).
+type CanvasText = (Pos2, String, f32, Align2, Color32, Option<Color32>, f32);
 
 /// Per-frame drawing statistics.
 #[derive(Clone, Copy, Debug, Default)]
@@ -189,14 +189,14 @@ impl Canvas {
         self.stats.build_ms = t0.elapsed().as_secs_f64() * 1e3;
         painter.add(egui::Shape::mesh(mesh));
         self.stats.texts = texts.len();
-        for (pos, text, size, align, color, bg) in texts {
+        for (pos, text, size, align, color, bg, angle) in texts {
             if let Some(bg) = bg {
                 let galley = painter.layout_no_wrap(text, FontId::monospace(size), color);
                 let r = align.anchor_size(pos, galley.size()).expand(1.5);
                 painter.rect_filled(r, 2.0, bg);
                 painter.galley(r.min + vec2(1.5, 1.5), galley, color);
             } else {
-                painter.text(pos, align, text, FontId::proportional(size), color);
+                shapes::paint_text(&painter, pos, align, angle, text, FontId::proportional(size), color);
             }
         }
         CanvasResponse {
@@ -310,16 +310,42 @@ impl Canvas {
                     if size < 6.0 {
                         continue;
                     }
-                    let lp = p.geom.orient.apply_f(t.pos, p.symbol.size);
-                    let pos = at + vec2(lp[0], lp[1]) * z;
+                    let tp = shapes::place_text(t, p.geom.orient, p.symbol.size);
+                    let pos = at + vec2(tp.pos[0], tp.pos[1]) * z;
                     let color = if t.dim { pal.text_dim } else { pal.text };
                     texts.push((
                         pos,
                         t.text.clone(),
                         size * 0.8,
-                        oriented_align(t.align, p.geom.orient),
+                        tp.align,
                         color,
                         None,
+                        tp.angle,
+                    ));
+                }
+            }
+        }
+        // Free labels (group names): outer groups stay legible further out.
+        {
+            for l in &scene.labels {
+                // Outer groups stay legible further out.
+                let size = match l.text.matches('.').count() {
+                    0 => (z * 1.4).max(14.0),
+                    1 if z >= 0.6 => (z * 1.4).max(11.0),
+                    2 if z >= 2.0 => (z * 1.4).max(9.0),
+                    _ => z * 1.4,
+                }
+                .min(20.0);
+                let p = xf.grid_to_screen(l.pos + crate::geom::gp(0, 2));
+                if size >= 8.0 && rect.expand(300.0).contains(p) {
+                    texts.push((
+                        p,
+                        l.text.clone(),
+                        size,
+                        Align2::LEFT_BOTTOM,
+                        pal.text_dim,
+                        Some(pal.bg),
+                        0.0,
                     ));
                 }
             }
@@ -406,6 +432,7 @@ impl Canvas {
                         Align2::CENTER_BOTTOM,
                         look.color,
                         Some(pal.bg),
+                        0.0,
                     ));
                 }
             }
@@ -507,16 +534,6 @@ impl Density {
                 aa_rect(mesh, Rect::from_min_max(min, max), color, false);
             }
         }
-    }
-}
-
-/// Alignment of symbol text after orienting the symbol (left/right swap when mirrored).
-fn oriented_align(a: Align2, o: crate::geom::Orient) -> Align2 {
-    let mirrored = o.flip ^ (o.rot % 4 == 2);
-    match o.rot % 2 {
-        1 => Align2::CENTER_CENTER,
-        _ if mirrored => Align2([a.x().flip(), a.y()]),
-        _ => a,
     }
 }
 

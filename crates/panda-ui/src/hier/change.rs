@@ -1,25 +1,23 @@
-//! Undoable document changes made by the hierarchy/files features.
+//! Undoable document changes made by the hierarchy features (packaging, adding library defs).
 //!
 //! A [`DocChange`] is a structural edit as kernel [`EditOp`]s in both directions plus the
-//! geometry of the touched defs before and after. Applying it goes through
-//! [`AppState::submit_edit`] (document and sim thread in one step, the sim thread applies it
-//! between run chunks), so it never blocks on compilation.
-//!
-//! **Undo hook.** [`History`] is this module's undo/redo stack (the *Hierarchy* menu's
-//! Undo/Redo). An editor-wide undo stack can adopt these changes as they are: undo =
-//! [`DocChange::revert`], redo = [`DocChange::apply`]; every change made here is also offered
-//! through [`History::take_new`] so such a stack can pick them up.
+//! geometry of the touched defs before and after. In the app it is recorded through the edit
+//! module's undo API ([`crate::edit::History::commit`], see [`DocChange::commit`]): the
+//! structure goes through [`crate::edit::EditTarget::submit`] (document at once, kernel on the
+//! sim thread between run chunks, so nothing waits for compilation) and undo / redo restore the
+//! recorded def states exactly. [`DocChange::apply_doc`] / [`DocChange::revert_doc`] apply it to
+//! a bare [`Document`] (tests, headless tools).
 
 use panda_kernel::EditOp;
 use panda_netlist::{DefId, Diagnostic};
 
-use crate::app::AppState;
 use crate::doc::{Document, EditorData};
+use crate::edit::{EditTarget, History};
 
 /// One undoable change.
 #[derive(Clone, Debug, PartialEq)]
 pub struct DocChange {
-    /// Human-readable description ("Create package alu", "Place mux2_8").
+    /// Human-readable description ("Create package alu", "Add mux2_8").
     pub label: String,
     /// Forward edit.
     pub redo: Vec<EditOp>,
@@ -32,24 +30,46 @@ pub struct DocChange {
 }
 
 impl DocChange {
-    /// Apply forward to the app (document + kernel).
-    pub fn apply(&self, app: &mut AppState) -> Result<u64, Diagnostic> {
-        let id = app.submit_edit(self.redo.clone())?;
-        install(&mut app.doc, &self.geom_after);
-        Ok(id)
+    /// Ids of every def the change touches (structure or geometry), first-seen order.
+    pub fn touched(&self) -> Vec<DefId> {
+        let mut v: Vec<DefId> = Vec::new();
+        for (id, _) in self.geom_before.iter().chain(&self.geom_after) {
+            if !v.contains(id) {
+                v.push(id.clone());
+            }
+        }
+        v
     }
 
-    /// Apply backward to the app (document + kernel).
-    pub fn revert(&self, app: &mut AppState) -> Result<u64, Diagnostic> {
-        let id = app.submit_edit(self.undo.clone())?;
-        install(&mut app.doc, &self.geom_before);
-        Ok(id)
+    /// Apply forward to `t` and record it as one undoable action in `history` (the edit
+    /// module's undo/redo). Returns the kernel command id of the submission, if any.
+    pub fn commit(
+        &self,
+        history: &mut History,
+        t: &mut dyn EditTarget,
+    ) -> Result<Option<u64>, String> {
+        let before = history.undo_len();
+        history.commit(
+            t,
+            self.label.clone(),
+            &self.touched(),
+            self.redo.clone(),
+            |doc| {
+                install(doc, &self.geom_after);
+            },
+        )?;
+        Ok(if history.undo_len() > before {
+            history.last_kernel_id()
+        } else {
+            None
+        })
     }
 
     /// Apply forward to a bare document (tests, headless tools).
     pub fn apply_doc(&self, doc: &mut Document) -> Result<(), Diagnostic> {
         doc.apply_ops(&self.redo)?;
         install(doc, &self.geom_after);
+        doc.touch();
         Ok(())
     }
 
@@ -57,6 +77,7 @@ impl DocChange {
     pub fn revert_doc(&self, doc: &mut Document) -> Result<(), Diagnostic> {
         doc.apply_ops(&self.undo)?;
         install(doc, &self.geom_before);
+        doc.touch();
         Ok(())
     }
 }
@@ -72,7 +93,6 @@ fn install(doc: &mut Document, geom: &[(DefId, Option<EditorData>)]) {
             }
         }
     }
-    doc.touch();
 }
 
 impl From<&super::package::PackagePlan> for DocChange {
@@ -93,79 +113,43 @@ impl From<&super::package::PackagePlan> for DocChange {
     }
 }
 
-/// Undo/redo stack of [`DocChange`]s.
-#[derive(Default)]
-pub struct History {
-    undo: Vec<DocChange>,
-    redo: Vec<DocChange>,
-    fresh: Vec<DocChange>,
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::examples;
 
-impl History {
-    /// Apply `c` and record it. On error nothing is recorded.
-    pub fn apply(&mut self, app: &mut AppState, c: DocChange) -> Result<(), Diagnostic> {
-        c.apply(app)?;
-        self.redo.clear();
-        if self.fresh.len() >= 64 {
-            self.fresh.remove(0);
-        }
-        self.fresh.push(c.clone());
-        self.undo.push(c);
-        Ok(())
-    }
-
-    /// Undo the last change. Returns its label.
-    pub fn undo(&mut self, app: &mut AppState) -> Option<Result<String, Diagnostic>> {
-        let c = self.undo.pop()?;
-        Some(match c.revert(app) {
-            Ok(_) => {
-                let l = c.label.clone();
-                self.redo.push(c);
-                Ok(l)
-            }
-            Err(e) => {
-                // The document moved on in a way this change cannot be undone over.
-                self.undo.clear();
-                Err(e)
-            }
-        })
-    }
-
-    /// Redo the last undone change. Returns its label.
-    pub fn redo(&mut self, app: &mut AppState) -> Option<Result<String, Diagnostic>> {
-        let c = self.redo.pop()?;
-        Some(match c.apply(app) {
-            Ok(_) => {
-                let l = c.label.clone();
-                self.undo.push(c);
-                Ok(l)
-            }
-            Err(e) => {
-                self.redo.clear();
-                Err(e)
-            }
-        })
-    }
-
-    /// Label of the change [`History::undo`] would revert.
-    pub fn undo_label(&self) -> Option<&str> {
-        self.undo.last().map(|c| c.label.as_str())
-    }
-
-    /// Label of the change [`History::redo`] would apply.
-    pub fn redo_label(&self) -> Option<&str> {
-        self.redo.last().map(|c| c.label.as_str())
-    }
-
-    /// Changes recorded since the last call (for an editor-wide undo stack).
-    pub fn take_new(&mut self) -> Vec<DocChange> {
-        std::mem::take(&mut self.fresh)
-    }
-
-    /// Forget everything (a new document was opened).
-    pub fn clear(&mut self) {
-        self.undo.clear();
-        self.redo.clear();
-        self.fresh.clear();
+    #[test]
+    fn commit_undo_redo_through_edit_history() {
+        let mut doc = Document::new(examples::counter());
+        doc.layout_missing();
+        let orig = doc.clone();
+        let sel: Vec<String> = doc
+            .def("sync_counter_4")
+            .unwrap()
+            .instances
+            .iter()
+            .filter(|i| i.id != "reg")
+            .map(|i| i.id.clone())
+            .collect();
+        let plan =
+            super::super::package::plan_package(&doc, "sync_counter_4", &sel, "incr").unwrap();
+        let c = DocChange::from(&plan);
+        assert_eq!(
+            c.touched(),
+            vec!["sync_counter_4".to_string(), "incr".to_string()]
+        );
+        let mut h = History::default();
+        c.commit(&mut h, &mut doc).unwrap();
+        assert_eq!(h.undo_label(), Some("Create package incr"));
+        assert!(doc.def("incr").is_some() && doc.editor("incr").is_some());
+        assert_eq!(
+            h.undo(&mut doc).unwrap().as_deref(),
+            Some("Create package incr")
+        );
+        assert_eq!(doc.design, orig.design);
+        assert_eq!(doc.editors, orig.editors);
+        h.redo(&mut doc).unwrap();
+        assert_eq!(doc.def("incr"), Some(&plan.package));
+        assert_eq!(doc.editor("incr"), Some(&plan.package_editor));
     }
 }

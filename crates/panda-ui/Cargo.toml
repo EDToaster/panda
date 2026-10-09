@@ -19,8 +19,15 @@ panda-circuits.workspace = true
 panda-cpu8.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-eframe = { version = "0.36", default-features = false, features = ["wgpu", "default_fonts", "wayland", "x11"] }
+eframe = { version = "0.36", default-features = false, features = ["wgpu", "default_fonts", "wayland", "x11", "persistence"] }
 egui = "0.36"
+# Native file dialogs (feature `dialogs`, on by default; tests inject paths instead).
+rfd = { version = "0.17", optional = true }
+
+[features]
+default = ["dialogs"]
+# Native open/save dialogs via `rfd` (otherwise the File menu asks for paths in-app).
+dialogs = ["dep:rfd"]
 
 [dev-dependencies]
 egui_kittest = { version = "0.36", features = ["wgpu", "snapshot"] }

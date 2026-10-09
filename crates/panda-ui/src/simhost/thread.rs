@@ -27,6 +27,12 @@ const RATE_WINDOW: Duration = Duration::from_millis(500);
 const PAUSED_PUBLISH: Duration = Duration::from_millis(100);
 /// Sleep after an idle run (nothing can change) while "running".
 const IDLE_SLEEP: Duration = Duration::from_millis(5);
+/// Max fraction of the sim thread's time spent publishing (snapshot + checkpoint): when a
+/// publication is expensive (huge watch sets, huge designs) the rate drops below the cap.
+const PUBLISH_BUDGET: f64 = 0.01;
+/// Max lag of a speed-limited run behind its schedule (older debt is forgiven, so a slow phase
+/// is not followed by a long flat-out burst).
+const MAX_PACE_LAG: Duration = Duration::from_millis(100);
 
 pub(super) struct SimThread {
     opts: SimOptions,
@@ -50,6 +56,10 @@ pub(super) struct SimThread {
     cp_seq: u64,
     cp_dirty: bool,
     input_log: Vec<(u64, String, Value)>,
+    // A `Step` being carried out in chunks, and the order-sensitive commands queued behind it.
+    step: Option<(u64, StepUnit)>,
+    step_cost: f64,
+    deferred: VecDeque<Command>,
     seq: u64,
     publish_every: Duration,
     next_publish: Instant,
@@ -69,9 +79,12 @@ pub(super) struct SimThread {
     tps: f64,
     busy: f64,
     publish_total: Duration,
+    publish_cost: f64,
     // Speed limiting.
     pace_start: Instant,
     pace_cycles: u64,
+    /// Measured seconds per cycle of paced stepping (sizes bursts to about one chunk).
+    pace_cost: f64,
 }
 
 impl SimThread {
@@ -105,6 +118,9 @@ impl SimThread {
             cp_seq: 0,
             cp_dirty: false,
             input_log: Vec::new(),
+            step: None,
+            step_cost: 1e-6,
+            deferred: VecDeque::new(),
             seq: 0,
             publish_every,
             next_publish: now,
@@ -122,15 +138,17 @@ impl SimThread {
             tps: 0.0,
             busy: 0.0,
             publish_total: Duration::ZERO,
+            publish_cost: 0.0,
             pace_start: now,
             pace_cycles: 0,
+            pace_cost: 1e-5,
         }
     }
 
     pub(super) fn run(mut self) {
         loop {
-            // Commands: one atomic load per chunk while running; block while paused.
-            if self.running && !self.idle {
+            // Commands: one atomic load per chunk while busy; block while paused.
+            if self.busy() {
                 if self.pending.load(Ordering::Acquire) {
                     self.pending.store(false, Ordering::Release);
                     if !self.drain() {
@@ -161,8 +179,17 @@ impl SimThread {
                     self.idle = false;
                 }
             }
-            if self.running && !self.idle && self.kernel.design().is_some() {
-                self.run_chunk();
+            if self.kernel.design().is_some() {
+                if self.step.is_some() {
+                    self.step_chunk();
+                    if self.step.is_none() && !self.run_deferred() {
+                        return;
+                    }
+                } else if self.running && !self.idle {
+                    self.run_chunk();
+                }
+            } else if self.step.take().is_some() && !self.run_deferred() {
+                return;
             }
             let now = Instant::now();
             // While paused, still publish at a low rate: the kernel's background compilation
@@ -171,10 +198,31 @@ impl SimThread {
             if now >= self.next_publish && (self.dirty || self.running || stale) {
                 self.publish(now);
                 self.last_publish = now;
-                self.next_publish = now + self.publish_every;
+                // Rate cap, and the publication budget (cost-proportional interval).
+                let budget = Duration::from_secs_f64(self.publish_cost / PUBLISH_BUDGET);
+                self.next_publish = now + self.publish_every.max(budget);
             }
             self.flush_outbox();
         }
+    }
+
+    /// True while the loop must keep simulating (running, or a `Step` in progress).
+    fn busy(&self) -> bool {
+        (self.running && !self.idle) || self.step.is_some()
+    }
+
+    /// Carry out the commands deferred behind a finished `Step` (until another step starts).
+    /// False on `Quit`.
+    fn run_deferred(&mut self) -> bool {
+        while self.step.is_none() {
+            let Some(cmd) = self.deferred.pop_front() else {
+                break;
+            };
+            if !self.handle(cmd) {
+                return false;
+            }
+        }
+        true
     }
 
     /// Drain every queued command. False on `Quit` / disconnect.
@@ -194,8 +242,34 @@ impl SimThread {
 
     fn handle(&mut self, cmd: Command) -> bool {
         self.dirty = true;
+        if self.step.is_some() {
+            match cmd {
+                // Order-sensitive: they wait for the step to finish.
+                Command::Load(_)
+                | Command::Edit { .. }
+                | Command::SetInput { .. }
+                | Command::SetMode(_)
+                | Command::Step { .. }
+                | Command::Reset
+                | Command::SetWave(_)
+                | Command::Custom(_) => {
+                    self.deferred.push_back(cmd);
+                    return true;
+                }
+                // Pause aborts the step (and stops a run).
+                Command::Pause => {
+                    self.step = None;
+                    self.running = false;
+                    self.deferred.retain(|c| !matches!(c, Command::Step { .. }));
+                    return self.run_deferred();
+                }
+                _ => {}
+            }
+        }
         match cmd {
             Command::Quit => return false,
+            #[cfg(test)]
+            Command::Crash => panic!("requested crash"),
             Command::Load(design) => match self.kernel.load(*design) {
                 Ok(()) => self.new_generation(),
                 Err(d) => self.emit(SimEvent::LoadFailed(d)),
@@ -224,7 +298,7 @@ impl SimThread {
                 let pre = self.kernel.tick();
                 self.kernel.set_mode(m);
                 self.idle = false;
-                self.checkpoint(true, pre);
+                self.checkpoint(pre);
             }
             Command::Run => {
                 self.running = true;
@@ -233,18 +307,9 @@ impl SimThread {
             }
             Command::Pause => self.running = false,
             Command::Step { n, unit } => {
-                let t0 = Instant::now();
-                if self.wave.is_empty() {
-                    self.kernel.step(n, unit);
-                } else {
-                    self.kernel.step_observed(n, unit, &mut self.wave);
+                if n > 0 {
+                    self.step = Some((n, unit));
                 }
-                if unit == StepUnit::Cycle {
-                    self.cycles += n;
-                }
-                self.win_busy += t0.elapsed();
-                self.idle = false;
-                self.cp_dirty = true;
             }
             Command::SetSpeed(s) => {
                 self.speed = s;
@@ -270,12 +335,19 @@ impl SimThread {
             Command::SetChunk(d) => self.opts.chunk = d.max(Duration::from_micros(50)),
             Command::Custom(f) => {
                 let pre = self.kernel.tick();
-                if let Some(ev) = f(&mut self.kernel) {
-                    self.emit(ev);
+                // A failing panel extension must not take the simulation down.
+                let k = &mut self.kernel;
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || f(k))) {
+                    Ok(Some(ev)) => self.emit(ev),
+                    Ok(None) => {}
+                    Err(p) => {
+                        let msg = super::panic_message(p.as_ref());
+                        self.emit(SimEvent::Error(format!("custom command panicked: {msg}")));
+                    }
                 }
                 self.idle = false;
                 // The closure may have changed anything: the shadow reloads.
-                self.checkpoint(true, pre);
+                self.checkpoint(pre);
             }
         }
         true
@@ -311,44 +383,55 @@ impl SimThread {
             if !active {
                 return;
             }
-            self.shadow = Some(Shadow::spawn(self.opts.kernel.clone(), self.etx.clone()));
+            self.shadow = Some(Shadow::spawn(
+                self.opts.kernel.clone(),
+                self.etx.clone(),
+                self.opts.shadow_workers,
+            ));
         }
         let sh = self.shadow.as_ref().expect("spawned");
-        if self.shadow_gen != self.design_gen
+        // The design is cloned for the shadow only when a waveform needs it (not per edit).
+        if active
+            && self.shadow_gen != self.design_gen
             && let Some(d) = self.kernel.design().cloned()
         {
-            sh.send_blocking(ShadowMsg::Design {
+            sh.send(ShadowMsg::Design {
                 gen_: self.design_gen,
                 design: Box::new(d),
             });
             self.shadow_gen = self.design_gen;
         }
-        sh.send_blocking(ShadowMsg::Config(cfg));
+        sh.send(ShadowMsg::Config(cfg));
         self.shadow_active = active;
         self.input_log.clear();
         let tick = self.kernel.tick();
-        self.checkpoint(true, tick);
+        self.checkpoint(tick);
     }
 
-    /// Send the shadow a checkpoint: the interval since the previous one ends at `replay_to`;
-    /// `reload`: the current state is not that interval's end (a command changed it).
-    fn checkpoint(&mut self, reload: bool, replay_to: u64) {
+    /// Send the shadow a checkpoint: the interval since the previous one ends at `replay_to`,
+    /// the current state starts the next one (it differs from the interval's end when a command
+    /// changed it, e.g. a mode switch).
+    fn checkpoint(&mut self, replay_to: u64) {
         if !self.shadow_active || self.kernel.design().is_none() {
             return;
         }
-        let Some(sh) = &self.shadow else { return };
+        let Some(sh) = &mut self.shadow else { return };
         self.cp_seq += 1;
+        self.cp_dirty = false;
+        if !sh.has_room() {
+            // The coordinator is behind: skip (it notices the missing number: a gap).
+            sh.skipped += 1;
+            self.input_log.clear();
+            return;
+        }
         let c = Checkpoint {
             gen_: self.design_gen,
             seq: self.cp_seq,
             inputs: std::mem::take(&mut self.input_log),
             replay_to,
-            state: self.kernel.snapshot(),
-            reload,
+            state: sh.snapshot(&self.kernel),
         };
-        // Dropped when the shadow's queue is full: it notices the missing number and reloads.
-        sh.send(ShadowMsg::Checkpoint(Box::new(c)));
-        self.cp_dirty = false;
+        sh.send_checkpoint(c);
     }
 
     fn new_generation(&mut self) {
@@ -372,14 +455,8 @@ impl SimThread {
             self.wave = WaveRecorder::default();
         }
         if let Some(sh) = &self.shadow {
-            if let Some(d) = self.kernel.design().cloned() {
-                sh.send_blocking(ShadowMsg::Design {
-                    gen_: self.design_gen,
-                    design: Box::new(d),
-                });
-                self.shadow_gen = self.design_gen;
-            }
-            sh.send_blocking(ShadowMsg::Config(WaveConfig::default()));
+            // Idle until the UI sends a config for the new generation (with the design then).
+            sh.send(ShadowMsg::Config(WaveConfig::default()));
         }
         self.shadow_active = false;
         self.input_log.clear();
@@ -397,6 +474,47 @@ impl SimThread {
         self.pace_cycles = 0;
     }
 
+    /// Carry out up to one chunk's worth of the current `Step` (interruptible: commands are
+    /// checked between chunks, and snapshots keep being published during a long step).
+    fn step_chunk(&mut self) {
+        let Some((left, unit)) = self.step else {
+            return;
+        };
+        let t0 = Instant::now();
+        let budget = self.opts.chunk.as_secs_f64();
+        let mut done = 0u64;
+        let mut left = left;
+        while left > 0 {
+            // Units per batch: about a quarter chunk at the measured cost per unit.
+            let batch = ((budget / 4.0 / self.step_cost.max(1e-9)) as u64).clamp(1, left);
+            let before = self.kernel.tick();
+            let b0 = Instant::now();
+            if self.wave.is_empty() {
+                self.kernel.step(batch, unit);
+            } else {
+                self.kernel.step_observed(batch, unit, &mut self.wave);
+            }
+            let dt = b0.elapsed().as_secs_f64();
+            self.step_cost = 0.5 * self.step_cost + 0.5 * dt / batch as f64;
+            done += batch;
+            left -= batch;
+            if self.kernel.tick() == before {
+                left = 0; // nothing can change any more
+            }
+            if t0.elapsed().as_secs_f64() >= budget {
+                break;
+            }
+        }
+        if unit == StepUnit::Cycle {
+            self.cycles += done;
+        }
+        self.win_busy += t0.elapsed();
+        self.idle = false;
+        self.dirty = true;
+        self.cp_dirty = true;
+        self.step = (left > 0).then_some((left, unit));
+    }
+
     fn run_chunk(&mut self) {
         let t0 = Instant::now();
         let tick0 = self.kernel.tick();
@@ -411,29 +529,37 @@ impl SimThread {
             }
             Speed::CyclesPerSec(rate) => {
                 let due = (self.pace_start.elapsed().as_secs_f64() * rate) as u64;
+                // Forgive debt older than MAX_PACE_LAG (no catch-up burst after a slow phase).
+                let max_lag = ((rate * MAX_PACE_LAG.as_secs_f64()) as u64).max(1);
+                if due.saturating_sub(self.pace_cycles) > max_lag {
+                    self.pace_cycles = due - max_lag;
+                }
                 let n = due.saturating_sub(self.pace_cycles);
                 if n == 0 {
                     // Ahead of schedule: sleep until the next cycle is due (bounded).
-                    let wait = Duration::from_secs_f64((1.0 / rate.max(1e-3)).min(0.01));
+                    let next_due = (self.pace_cycles + 1) as f64 / rate.max(1e-9);
+                    let wait = Duration::from_secs_f64(
+                        (next_due - self.pace_start.elapsed().as_secs_f64()).clamp(0.0, 0.01),
+                    );
                     std::thread::sleep(
                         wait.min(self.next_publish.saturating_duration_since(Instant::now())),
                     );
                     (0, false)
                 } else {
-                    // Cap a burst at the chunk length's worth at the measured rate.
-                    let cap = if self.cps > 0.0 {
-                        ((self.cps * self.opts.chunk.as_secs_f64()) as u64).max(1)
-                    } else {
-                        1
-                    };
+                    // Cap a burst at about one chunk at the measured cost per cycle.
+                    let cap =
+                        ((self.opts.chunk.as_secs_f64() / self.pace_cost.max(1e-9)) as u64).max(1);
                     let n = n.min(cap);
                     let before = self.kernel.tick();
+                    let b0 = Instant::now();
                     if self.wave.is_empty() {
                         self.kernel.step(n, StepUnit::Cycle);
                     } else {
                         self.kernel
                             .step_observed(n, StepUnit::Cycle, &mut self.wave);
                     }
+                    let per = b0.elapsed().as_secs_f64() / n as f64;
+                    self.pace_cost = 0.75 * self.pace_cost + 0.25 * per;
                     self.pace_cycles += n;
                     (n, self.kernel.tick() == before)
                 }
@@ -519,14 +645,30 @@ impl SimThread {
         }
         if self.cp_dirty {
             let tick = self.kernel.tick();
-            self.checkpoint(false, tick);
+            self.checkpoint(tick);
         }
         self.dirty = false;
-        self.publish_total += t0.elapsed();
+        let cost = t0.elapsed();
+        self.publish_total += cost;
+        self.publish_cost = if self.seq <= 1 {
+            cost.as_secs_f64()
+        } else {
+            0.8 * self.publish_cost + 0.2 * cost.as_secs_f64()
+        };
     }
 
     fn emit(&mut self, ev: SimEvent) {
-        self.outbox.push_back(ev);
+        if let SimEvent::Diagnostics(_) = ev
+            && let Some(old) = self
+                .outbox
+                .iter_mut()
+                .find(|e| matches!(e, SimEvent::Diagnostics(_)))
+        {
+            // Only the newest full list matters (the UI is not draining).
+            *old = ev;
+        } else {
+            self.outbox.push_back(ev);
+        }
         self.flush_outbox();
     }
 

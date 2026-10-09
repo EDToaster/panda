@@ -309,6 +309,151 @@ fn place_wire_toggle_rotate_and_errors() {
     screenshot(&mut h, "net-inspector");
 }
 
+/// Library-palette style placement, a T junction onto an existing wire, keyboard copy / paste,
+/// delete and undo / redo through the real app (kernel included).
+#[test]
+fn junction_clipboard_delete_and_undo_redo() {
+    let mut d = doc();
+    d.apply_ops(&[panda_kernel::EditOp::AddPin {
+        def: "top".into(),
+        pin: PinDecl {
+            name: "y2".into(),
+            dir: Dir::Out,
+            width: 1,
+        },
+    }])
+    .unwrap();
+    d.editors.get_mut("top").unwrap().pins.insert(
+        "y2".into(),
+        InstGeom {
+            pos: gp(24, 8),
+            ..Default::default()
+        },
+    );
+    let state = AppState::from_document(d, SimOptions::default());
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(1100.0, 640.0))
+        .wgpu()
+        .build_ui_state(|ui, app: &mut PandaApp| app.show(ui), PandaApp::new(state));
+    step_until(&mut h, 10.0, |a| a.state.live.values().is_some());
+    h.state_mut().state.canvas.xf = XF;
+    h.step();
+    let top = |h: &Harness<'_, PandaApp>| h.state().state.doc.def("top").unwrap().clone();
+
+    // Place a NOT with a click (what the library palette's buttons do) and wire a → NOT → y.
+    request_place(&h.ctx, PlaceRequest::Atom(Atom::Not { width: 1 }));
+    h.step();
+    click(&mut h, sp(gp(14, 1)));
+    drag(&mut h, sp(gp(4, 1)), sp(gp(12, 1)));
+    drag(&mut h, sp(gp(16, 1)), sp(gp(24, 1)));
+    assert_eq!(top(&h).nets.len(), 2);
+
+    // 1. From y2's port onto the middle of the NOT → y wire: y2 joins that net, with a dot.
+    let y2 = gp(24, 9);
+    press(&mut h, sp(y2));
+    move_to(&mut h, sp(y2), sp(gp(20, 1)));
+    screenshot(&mut h, "junction-drag");
+    release(&mut h, sp(gp(20, 1)));
+    assert_eq!(
+        net_ends(h.state(), &pin("y2")),
+        Some(vec![port("not1", "out"), pin("y"), pin("y2")])
+    );
+    let net = top(&h)
+        .nets
+        .iter()
+        .find(|n| n.ends.contains(&pin("y2")))
+        .unwrap()
+        .id
+        .clone();
+    let g = &h.state().state.doc.editor("top").unwrap().wires[&net];
+    assert_eq!(g.junctions, vec![gp(20, 1)]);
+    // The kernel follows: a = 0 → y2 = 1.
+    {
+        let s = &mut h.state_mut().state;
+        s.sim.send(Command::SetInput {
+            pin: "a".into(),
+            value: Value::from_bool(false),
+        });
+        s.sim.send(Command::Step {
+            n: 10,
+            unit: StepUnit::Tick,
+        });
+    }
+    step_until(&mut h, 10.0, |a| {
+        a.state.live.values().is_some_and(|l| {
+            l.map.pin_value("y2", l.values).and_then(|v| v.to_u64()) == Some(1)
+        })
+    });
+    h.event(Event::PointerGone);
+    h.step();
+    screenshot(&mut h, "junction");
+
+    // 2. Select the NOT, Ctrl+C, Ctrl+V under the pointer: a fresh not2 there, selected.
+    click(&mut h, sp(gp(14, 1)));
+    h.key_press_modifiers(Modifiers::COMMAND, Key::C);
+    h.event(Event::PointerMoved(sp(gp(6, 5))));
+    h.step();
+    h.key_press_modifiers(Modifiers::COMMAND, Key::V);
+    h.step();
+    let g = h.state().state.doc.editor("top").unwrap().instances["not2"];
+    assert_eq!(g.pos, gp(6, 5));
+    assert_eq!(
+        current_selection(&h.ctx).items.iter().cloned().collect::<Vec<_>>(),
+        vec![ItemRef::Instance("not2".into())]
+    );
+    h.event(Event::PointerGone);
+    step_until(&mut h, 10.0, |a| a.state.live.values().is_some());
+    screenshot(&mut h, "pasted");
+
+    // 3. Delete removes it; Ctrl+Z brings it back; Ctrl+Shift+Z deletes it again.
+    h.event(Event::PointerMoved(sp(gp(0, 14))));
+    h.key_press(Key::Delete);
+    h.step();
+    let has_not2 = |h: &Harness<'_, PandaApp>| top(h).instances.iter().any(|i| i.id == "not2");
+    assert!(!has_not2(&h));
+    h.key_press_modifiers(Modifiers::COMMAND, Key::Z);
+    h.step();
+    assert!(has_not2(&h));
+    h.key_press_modifiers(Modifiers::COMMAND | Modifiers::SHIFT, Key::Z);
+    h.step();
+    assert!(!has_not2(&h));
+
+    // 4. Undo everything: back to the bare pins, and the kernel agrees: y2 no longer follows
+    //    a. (The kernel carries an undriven net's last value over an edit, so y2 keeps reading
+    //    1 rather than becoming Z; driving a = 1 would make a connected y2 read 0.)
+    let gen0 = h.state().state.live.design_gen;
+    for _ in 0..8 {
+        h.key_press_modifiers(Modifiers::COMMAND, Key::Z);
+        h.step();
+    }
+    let t = top(&h);
+    assert!(t.instances.is_empty() && t.nets.is_empty(), "{t:?}");
+    step_until(&mut h, 10.0, |a| a.state.live.design_gen > gen0);
+    {
+        let s = &mut h.state_mut().state;
+        s.sim.send(Command::SetInput {
+            pin: "a".into(),
+            value: Value::from_bool(true),
+        });
+        s.sim.send(Command::Step {
+            n: 10,
+            unit: StepUnit::Tick,
+        });
+    }
+    step_until(&mut h, 10.0, |a| {
+        a.state.live.values().is_some_and(|l| {
+            l.map.pin_value("a", l.values).and_then(|v| v.to_u64()) == Some(1)
+        })
+    });
+    for _ in 0..20 {
+        h.step();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let l = h.state().state.live.values().unwrap();
+    let y2 = l.map.pin_value("y2", l.values).and_then(|v| v.to_u64());
+    assert_ne!(y2, Some(0), "y2 still follows a after undoing its wires");
+}
+
 /// UI time per frame (ms) of the app showing Panda-8's `cpu` def with the pointer moving over
 /// the canvas, with and without the editing module registered. Run with
 /// `cargo test --release -p panda-ui --test edit_ui -- --ignored --nocapture`.

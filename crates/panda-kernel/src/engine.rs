@@ -58,13 +58,19 @@ pub(crate) trait FastEngine: Send {
             *o = v[n as usize];
         }
     }
+    /// True if reading `nets` needs lazily computed nets brought up to date (the `lazy`
+    /// argument of [`FastEngine::run_sampled`]).
+    fn needs_materialize(&self, _nets: &[NetIdx]) -> bool {
+        false
+    }
     /// Process every event up to tick `last`, appending per event its tick to `ticks` and the
     /// values of `nets` to `values` (observer sampling; the loop runs in the concrete engine,
-    /// without a dynamic call per event).
+    /// without a dynamic call per event). `lazy`: [`FastEngine::needs_materialize`] of `nets`.
     fn run_sampled(
         &mut self,
         last: u64,
         nets: &[NetIdx],
+        _lazy: bool,
         ticks: &mut Vec<u64>,
         values: &mut Vec<Logic>,
     ) {
@@ -119,17 +125,21 @@ macro_rules! impl_fast_engine {
             fn gather(&self, nets: &[NetIdx], out: &mut [Logic]) {
                 <$t as LoadState>::gather(self, nets, out)
             }
+            fn needs_materialize(&self, nets: &[NetIdx]) -> bool {
+                <$t as LoadState>::needs_materialize(self, nets)
+            }
             fn run_sampled(
                 &mut self,
                 last: u64,
                 nets: &[NetIdx],
+                lazy: bool,
                 ticks: &mut Vec<u64>,
                 values: &mut Vec<Logic>,
             ) {
                 while <$t>::next_event_tick(self).is_some_and(|e| e <= last) {
                     if let Some(t) = <$t>::step_event(self) {
                         ticks.push(t);
-                        <$t as LoadState>::sample_into(self, nets, values);
+                        <$t as LoadState>::sample_into(self, nets, lazy, values);
                     }
                 }
             }
@@ -159,7 +169,7 @@ impl LoadState for FastRef {
             *o = v[n as usize];
         }
     }
-    fn sample_into(&self, nets: &[NetIdx], out: &mut Vec<Logic>) {
+    fn sample_into(&self, nets: &[NetIdx], _lazy: bool, out: &mut Vec<Logic>) {
         let v = FastRef::values(self);
         out.extend(nets.iter().map(|&n| v[n as usize]));
     }
@@ -169,8 +179,13 @@ impl LoadState for FastRef {
 pub(crate) trait LoadState {
     fn load_state(&mut self, tick: u64, values: &[Logic], inputs: &[Value]) -> LoadReport;
     fn gather(&self, nets: &[NetIdx], out: &mut [Logic]);
-    /// Append the values of `nets` to `out`.
-    fn sample_into(&self, nets: &[NetIdx], out: &mut Vec<Logic>);
+    /// True if sampling `nets` needs lazily computed nets brought up to date (computed once per
+    /// sampled run, passed to [`LoadState::sample_into`]).
+    fn needs_materialize(&self, _nets: &[NetIdx]) -> bool {
+        false
+    }
+    /// Append the values of `nets` to `out` (`lazy`: [`LoadState::needs_materialize`]).
+    fn sample_into(&self, nets: &[NetIdx], lazy: bool, out: &mut Vec<Logic>);
     fn native_active(&mut self) -> bool {
         false
     }
@@ -231,8 +246,12 @@ impl LoadState for CompiledEngine {
         }
     }
 
-    fn sample_into(&self, nets: &[NetIdx], out: &mut Vec<Logic>) {
-        out.extend(nets.iter().map(|&n| self.sim.get(n)));
+    fn needs_materialize(&self, nets: &[NetIdx]) -> bool {
+        self.sim.needs_materialize(nets)
+    }
+
+    fn sample_into(&self, nets: &[NetIdx], lazy: bool, out: &mut Vec<Logic>) {
+        self.sim.sample_into(nets, lazy, out);
     }
 
     fn native_active(&mut self) -> bool {

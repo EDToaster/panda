@@ -7,13 +7,18 @@
 //! * instance paths (`"cpu/alu/g12"`: the atom `g12` inside instance `cpu/alu`) or a bare def id.
 //!
 //! [`resolve_location`] turns them into a [`JumpTarget`]: the instance path to view and what to
-//! mark there.
+//! mark there. [`JumpTarget::crumbs`] describes it with the hierarchy navigation's breadcrumbs
+//! ([`crate::hier::nav`]) and [`mark_bounds`] finds the marked thing on a built canvas
+//! [`Scene`] (for centring and the jump overlay).
 
 use panda_netlist::flat::FlatNetlist;
 use panda_netlist::{ComponentDef, DefId, Design, InstKind};
 
 use crate::app::def_at_path;
+use crate::canvas::Scene;
 use crate::doc::ItemRef;
+use crate::geom::GridRect;
+use crate::hier::nav;
 
 /// What to emphasize in the target view.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -37,9 +42,48 @@ pub struct JumpTarget {
     pub mark: Mark,
 }
 
+impl JumpTarget {
+    /// Breadcrumbs from the top to the target's instance ([`nav::crumbs`]); empty if the path
+    /// no longer exists in `design`.
+    pub fn crumbs(&self, design: &Design) -> Vec<nav::Crumb> {
+        nav::crumbs(design, &self.path)
+    }
+
+    /// One-line description, e.g. `"Panda-8 › cpu › alu: net c"`.
+    pub fn describe(&self, design: &Design) -> String {
+        let crumbs: Vec<String> = self.crumbs(design).into_iter().map(|c| c.label).collect();
+        let at = if crumbs.is_empty() {
+            format!("/{}", self.path)
+        } else {
+            crumbs.join(" › ")
+        };
+        match &self.mark {
+            Mark::Net(n) => format!("{at}: net {n}"),
+            Mark::Item(ItemRef::Instance(i)) => format!("{at}: instance {i}"),
+            Mark::Item(ItemRef::Pin(p)) => format!("{at}: pin {p}"),
+            Mark::None => at,
+        }
+    }
+}
+
+/// Grid bounds of `mark` on `scene` (`None` for [`Mark::None`] or when it is not drawn).
+pub fn mark_bounds(scene: &Scene, mark: &Mark) -> Option<GridRect> {
+    match mark {
+        Mark::Net(id) => scene.net_index.get(id).map(|&i| scene.nets[i].bounds),
+        Mark::Item(r) => scene.item(r).map(|p| p.rect()),
+        Mark::None => None,
+    }
+}
+
 /// The first instance path (depth-first, in instance order) whose def is `def`.
 pub fn first_path_of_def(design: &Design, def: &str) -> Option<String> {
-    fn walk(design: &Design, d: &ComponentDef, path: &str, want: &str, depth: u32) -> Option<String> {
+    fn walk(
+        design: &Design,
+        d: &ComponentDef,
+        path: &str,
+        want: &str,
+        depth: u32,
+    ) -> Option<String> {
         if d.id == want {
             return Some(path.to_string());
         }
@@ -63,6 +107,19 @@ pub fn first_path_of_def(design: &Design, def: &str) -> Option<String> {
         None
     }
     walk(design, design.top_def()?, "", def, 0)
+}
+
+/// The net named by a critical-path entry: STA writes a sequential kernel (latch / flip-flop
+/// cluster) on the path as `"[kernel <net>]"` (its first output net); plain entries are net
+/// names. Returns the net name and whether the entry was a kernel.
+pub fn path_entry_net(entry: &str) -> (&str, bool) {
+    match entry
+        .strip_prefix("[kernel ")
+        .and_then(|r| r.strip_suffix(']'))
+    {
+        Some(n) => (n, true),
+        None => (entry, false),
+    }
 }
 
 /// Strip a trailing `[<bit>]`.
@@ -112,8 +169,12 @@ fn resolve_hier(design: &Design, name: &str) -> Option<JumpTarget> {
 
 /// Resolve `loc` (see the module docs). `flat` lets net aliases resolve when the given name is
 /// not itself a `path/net` of the design.
-pub fn resolve_location(design: &Design, flat: Option<&FlatNetlist>, loc: &str) -> Option<JumpTarget> {
-    let loc = loc.trim();
+pub fn resolve_location(
+    design: &Design,
+    flat: Option<&FlatNetlist>,
+    loc: &str,
+) -> Option<JumpTarget> {
+    let loc = path_entry_net(loc.trim()).0;
     if loc.is_empty() {
         return None;
     }
@@ -173,7 +234,10 @@ pub fn nets_in_view(
     names: &[String],
 ) -> Vec<String> {
     use std::collections::HashSet;
-    let wanted: HashSet<u32> = names.iter().filter_map(|n| flat.net_by_name(n)).collect();
+    let wanted: HashSet<u32> = names
+        .iter()
+        .filter_map(|n| flat.net_by_name(path_entry_net(n).0))
+        .collect();
     if wanted.is_empty() {
         return Vec::new();
     }
@@ -181,9 +245,11 @@ pub fn nets_in_view(
         .nets
         .iter()
         .filter(|(_, bits)| {
-            bits.iter()
-                .flatten()
-                .any(|&w| map.watch.get(w as usize).is_some_and(|n| wanted.contains(n)))
+            bits.iter().flatten().any(|&w| {
+                map.watch
+                    .get(w as usize)
+                    .is_some_and(|n| wanted.contains(n))
+            })
         })
         .map(|(id, _)| id.clone())
         .collect();
@@ -268,7 +334,18 @@ mod tests {
         // nets_in_view maps flat names onto the local nets of a view.
         let top = d.def("top").unwrap();
         let map = crate::doc::values::ViewMap::build(&flat, "", top);
-        assert_eq!(nets_in_view(&flat, &map, &["u0/ny".to_string()]), vec!["res"]);
+        assert_eq!(
+            nets_in_view(&flat, &map, &["u0/ny".to_string()]),
+            vec!["res"]
+        );
+        assert_eq!(
+            nets_in_view(&flat, &map, &["[kernel u0/ny]".to_string()]),
+            vec!["res"]
+        );
+        assert_eq!(path_entry_net("[kernel a/b]"), ("a/b", true));
+        assert_eq!(path_entry_net("a/b[3]"), ("a/b[3]", false));
+        let t = resolve_location(&d, Some(&flat), "[kernel u0/ny]").unwrap();
+        assert_eq!((t.path.as_str(), t.mark), ("u0", Mark::Net("ny".into())));
         assert!(nets_in_view(&flat, &map, &["nope".to_string()]).is_empty());
     }
 }

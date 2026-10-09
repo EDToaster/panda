@@ -1,14 +1,20 @@
-//! Files (owner: the **hierarchy/files** work stream): new / open / save `.panda.json`
-//! documents (geometry preserved in each def's `editor` field), the recent-files list, ROM
-//! import from a hex image and the built-in examples ([`crate::examples::all`]).
+//! Files (owner: the **files** work stream): new / open / save `.panda.json` documents
+//! (geometry preserved in each def's `editor` field), dirty tracking with an unsaved-changes
+//! prompt, the recent-files list (persisted in eframe's storage), ROM import from a hex image and
+//! the built-in examples ([`crate::examples::all`]).
 //!
-//! This module is pure I/O and model code; the *File* menu that drives it lives in
-//! [`crate::hier`] (it shares that module's state: undo history, library, prompts).
-//!
-//! File dialogs: the editor asks for paths with an in-app prompt (no desktop portal needed, so
-//! tests and headless runs work). A native dialog (e.g. the `rfd` crate) can be plugged in
-//! behind a cargo feature without touching this module: it only needs to produce a path for
-//! [`read_document`] / [`write_document`] / [`import_rom`].
+//! * This file: pure I/O and model code (no egui): [`read_document`], [`write_document`],
+//!   [`RecentFiles`], [`build_rom`] (ROM defs from hex images).
+//! * [`session`]: the GPU-free controller of the *File* menu ([`session::FileSession`]): which
+//!   action runs when, the unsaved-changes prompt, Save-as chaining, ROM placement.
+//! * [`dialog`]: where paths come from ([`dialog::PathPicker`]): native dialogs via `rfd`
+//!   (cargo feature `dialogs`, default on; run on a worker thread so the UI keeps drawing), an
+//!   in-app text prompt, or a scripted picker for tests.
+//! * [`menu`]: the egui *File* menu panel, its shortcuts and modals.
+
+pub mod dialog;
+pub mod menu;
+pub mod session;
 
 use std::path::{Path, PathBuf};
 
@@ -16,13 +22,20 @@ use panda_circuits::addr_bits;
 use panda_netlist::{ComponentDef, DefId, Design, DesignBuilder, FORMAT};
 
 use crate::doc::Document;
-use crate::hier::change::DocChange;
 
 /// File name suffix of Panda documents.
 pub const EXTENSION: &str = ".panda.json";
 
 /// Maximum entries in [`RecentFiles`].
 pub const MAX_RECENT: usize = 10;
+
+/// Register the *File* menu ([`menu::FileMenu`]) with native dialogs when the `dialogs` feature
+/// is on (else in-app path prompts) and recent files persisted in eframe's storage.
+pub fn register(reg: &mut crate::app::Registry) {
+    reg.panel(menu::FileMenu::new(session::FileSession::new(
+        dialog::default_picker(),
+    )));
+}
 
 /// An empty design: one top def `main` without pins.
 pub fn new_design() -> Design {
@@ -78,64 +91,43 @@ pub fn with_extension(path: &str) -> PathBuf {
     }
 }
 
-/// Most-recently-used document paths, optionally persisted as JSON.
+/// Most-recently-used document paths (newest first, at most [`MAX_RECENT`]). The *File* menu
+/// persists it in eframe's storage ([`menu::store_recent`]).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RecentFiles {
     /// Newest first.
     pub paths: Vec<PathBuf>,
-    /// Where the list is stored (`None` = in memory only).
-    pub store: Option<PathBuf>,
 }
 
 impl RecentFiles {
-    /// An in-memory list (tests).
+    /// An empty list.
     pub fn in_memory() -> RecentFiles {
         RecentFiles::default()
     }
 
-    /// Load from `store` (missing or unreadable → empty list that will be saved there).
-    pub fn load(store: PathBuf) -> RecentFiles {
-        let paths = std::fs::read_to_string(&store)
-            .ok()
-            .and_then(|s| serde_json::from_str::<Vec<PathBuf>>(&s).ok())
-            .unwrap_or_default();
-        RecentFiles {
-            paths,
-            store: Some(store),
+    /// A list of `paths` (newest first; deduplicated and capped).
+    pub fn with_paths(paths: impl IntoIterator<Item = PathBuf>) -> RecentFiles {
+        let mut v: Vec<PathBuf> = Vec::new();
+        for p in paths {
+            if !v.contains(&p) {
+                v.push(p);
+            }
         }
+        v.truncate(MAX_RECENT);
+        RecentFiles { paths: v }
     }
 
-    /// The default store: `$XDG_CONFIG_HOME/panda/recent.json` (or `~/.config/…`).
-    pub fn default_store() -> Option<PathBuf> {
-        let base = std::env::var_os("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
-        Some(base.join("panda").join("recent.json"))
-    }
-
-    /// Move `path` to the front (dedup, cap at [`MAX_RECENT`]) and persist.
+    /// Move `path` (canonicalized when possible) to the front; dedup, cap at [`MAX_RECENT`].
     pub fn push(&mut self, path: &Path) {
         let p = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         self.paths.retain(|q| q != &p);
         self.paths.insert(0, p);
         self.paths.truncate(MAX_RECENT);
-        self.save();
     }
 
-    /// Drop `path` (e.g. it no longer exists) and persist.
+    /// Drop `path` (e.g. it no longer exists).
     pub fn remove(&mut self, path: &Path) {
         self.paths.retain(|q| q != path);
-        self.save();
-    }
-
-    fn save(&self) {
-        let Some(store) = &self.store else { return };
-        if let Some(dir) = store.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        if let Ok(s) = serde_json::to_string_pretty(&self.paths) {
-            let _ = std::fs::write(store, s);
-        }
     }
 }
 
@@ -158,39 +150,52 @@ pub fn rom_name(file: &Path) -> String {
             }
         })
         .collect();
-    if s.is_empty() { "rom".into() } else { s }
+    if s.is_empty() {
+        "rom".into()
+    } else if s.starts_with(|c: char| c.is_ascii_digit()) {
+        format!("rom_{s}")
+    } else {
+        s
+    }
 }
 
-/// Result of [`import_rom`].
+/// True if `name` is usable as a ROM / def name: non-empty, ASCII letters, digits and `_`, not
+/// starting with a digit.
+pub fn valid_name(name: &str) -> bool {
+    let mut c = name.chars();
+    c.next()
+        .is_some_and(|f| f.is_ascii_alphabetic() || f == '_')
+        && c.all(|x| x.is_ascii_alphanumeric() || x == '_')
+}
+
+/// A ROM def built from a hex image ([`build_rom`]), not yet added to a document.
 #[derive(Clone, Debug, PartialEq)]
-pub struct RomImport {
-    /// The change adding the ROM def (and the mux def it uses, if new).
-    pub change: DocChange,
-    /// Id of the ROM def.
+pub struct BuiltRom {
+    /// Id of the ROM def (content-addressed: `rom_<name>_<a>x<d>_<hash>`).
     pub def: DefId,
+    /// Every def the ROM needs (the ROM and its mux), dependencies first.
+    pub defs: Vec<ComponentDef>,
     /// Address bits.
     pub addr_bits: u32,
     /// Data bits.
     pub data_bits: u32,
-    /// Words read.
+    /// Words read from the image.
     pub words: usize,
 }
 
-/// Build a ROM def from a hex image ([`panda_circuits::rom_from_hex`]) as a change adding it to
-/// `doc`. Address bits fit the image (at least 1); data bits are `data_bits`, or the widest word
-/// (at least 1) if `None`.
-pub fn import_rom(
-    doc: &Document,
-    hex: &str,
-    name: &str,
-    data_bits: Option<u32>,
-) -> Result<RomImport, String> {
+/// Build a ROM def named `name` from a hex image ([`panda_circuits::rom_from_hex`]). Address
+/// bits fit the image (at least 1); data bits are `data_bits`, or the widest word (at least 1)
+/// if `None`. A name that is not [`valid_name`] becomes `rom`.
+pub fn build_rom(hex: &str, name: &str, data_bits: Option<u32>) -> Result<BuiltRom, String> {
     let words = panda_circuits::rom_from_hex(hex)?;
     if words.is_empty() {
         return Err("the hex image contains no words".into());
     }
     if words.len() > 1 << 16 {
-        return Err(format!("{} words exceed the 64Ki-word ROM limit", words.len()));
+        return Err(format!(
+            "{} words exceed the 64Ki-word ROM limit",
+            words.len()
+        ));
     }
     let a = addr_bits(words.len()).max(1);
     let widest = words
@@ -205,24 +210,13 @@ pub fn import_rom(
             "data width {d} does not fit the widest word ({widest} bits)"
         ));
     }
-    let name = if crate::hier::package::valid_ident(name) {
-        name.to_string()
-    } else {
-        "rom".to_string()
-    };
+    let name = if valid_name(name) { name } else { "rom" };
     let mut db = DesignBuilder::new();
-    let r = panda_circuits::rom(&mut db, &name, a, d, &words);
+    let r = panda_circuits::rom(&mut db, name, a, d, &words);
     let built = db.build(&r);
-    let new_defs: Vec<ComponentDef> = built
-        .defs
-        .into_iter()
-        .filter(|x| doc.design.def(&x.id).is_none())
-        .collect();
-    let change = crate::hier::library::add_defs_change(doc, &new_defs, &format!("Import ROM {name}"))
-        .ok_or_else(|| format!("the document already has ROM '{}'", r.id))?;
-    Ok(RomImport {
-        change,
+    Ok(BuiltRom {
         def: r.id,
+        defs: built.defs,
         addr_bits: a,
         data_bits: d,
         words: words.len(),
@@ -262,24 +256,6 @@ mod tests {
     }
 
     #[test]
-    fn recent_files_dedup_cap_persist() {
-        let dir = tmp_dir("recent");
-        let store = dir.join("cfg/recent.json");
-        let mut r = RecentFiles::load(store.clone());
-        assert!(r.paths.is_empty());
-        for i in 0..14 {
-            r.push(&dir.join(format!("f{i}.panda.json")));
-        }
-        r.push(&dir.join("f3.panda.json"));
-        assert_eq!(r.paths.len(), MAX_RECENT);
-        assert!(r.paths[0].ends_with("f3.panda.json"));
-        assert_eq!(r.paths.iter().filter(|p| p.ends_with("f3.panda.json")).count(), 1);
-        let again = RecentFiles::load(store);
-        assert_eq!(again.paths, r.paths);
-        std::fs::remove_dir_all(dir).ok();
-    }
-
-    #[test]
     fn new_design_loads() {
         let mut k = Kernel::default();
         k.load(new_design()).unwrap();
@@ -288,18 +264,24 @@ mod tests {
     }
 
     #[test]
-    fn rom_import_reads_words() {
+    fn rom_build_reads_words() {
         let mut doc = Document::new(new_design());
         let hex = "// test image\n12 34 @4 ab\n0x7f";
-        let imp = import_rom(&doc, hex, &rom_name(Path::new("/x/my-prog.hex")), None).unwrap();
-        assert_eq!((imp.addr_bits, imp.data_bits, imp.words), (3, 8, 6));
-        imp.change.apply_doc(&mut doc).unwrap();
-        assert!(doc.def(&imp.def).is_some());
-        assert!(doc.def(&imp.def).unwrap().name.contains("my_prog"));
-        assert!(doc.editor(&imp.def).is_some());
-        // Read the ROM through a kernel: wrap it as the top.
+        let name = rom_name(Path::new("/x/my-prog.hex"));
+        assert_eq!(name, "my_prog");
+        assert_eq!(rom_name(Path::new("9.hex")), "rom_9");
+        let b = build_rom(hex, &name, None).unwrap();
+        assert_eq!((b.addr_bits, b.data_bits, b.words), (3, 8, 6));
+        let ops: Vec<_> = b
+            .defs
+            .iter()
+            .cloned()
+            .map(panda_kernel::EditOp::AddDef)
+            .collect();
+        doc.apply_ops(&ops).unwrap();
+        assert!(doc.def(&b.def).unwrap().name.contains("my_prog"));
         let mut d = doc.design.clone();
-        d.top = imp.def.clone();
+        d.top = b.def.clone();
         let mut k = Kernel::default();
         k.load(d).unwrap();
         for (a, want) in [(0u64, 0x12u64), (1, 0x34), (2, 0), (4, 0xab), (5, 0x7f)] {
@@ -307,9 +289,9 @@ mod tests {
             k.step(200, panda_kernel::StepUnit::Tick);
             assert_eq!(k.read_u64("D"), Some(want), "A={a}");
         }
-        imp.change.revert_doc(&mut doc).unwrap();
-        assert_eq!(doc.design, new_design());
-        assert!(import_rom(&doc, "zz", "r", None).is_err());
-        assert!(import_rom(&doc, "1ff", "r", Some(8)).is_err());
+        assert!(build_rom("zz", "r", None).is_err());
+        assert!(build_rom("1ff", "r", Some(8)).is_err());
+        assert!(build_rom("", "r", None).is_err());
+        assert!(valid_name("a_1") && !valid_name("1a") && !valid_name("a-b") && !valid_name(""));
     }
 }

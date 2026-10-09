@@ -59,12 +59,16 @@ pub struct EditTool {
     /// Selection last exported to [`super::current_selection`].
     published: Selection,
     toast: Option<(String, Instant)>,
+    /// Handle under which [`super::shared_editor`] finds `ed`.
+    handle: u64,
 }
 
 impl EditTool {
     /// Tool over the shared editor.
     pub fn new(ed: SharedEditor) -> EditTool {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         EditTool {
+            handle: NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             ed,
             gesture: Gesture::None,
             templates: Templates::default(),
@@ -250,6 +254,7 @@ impl CanvasTool for EditTool {
     }
 
     fn canvas(&mut self, ui: &mut Ui, canvas: &CanvasResponse, scene: &Scene, app: &mut AppState) {
+        super::announce_editor(ui.ctx(), self.handle, &self.ed);
         let def = app.view.def.clone();
         self.ed.borrow_mut().sync(&app.doc, &app.view.path, &def);
         if let Some(req) = super::take_place_request(ui.ctx()) {

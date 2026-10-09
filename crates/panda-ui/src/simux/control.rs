@@ -34,6 +34,8 @@ pub enum ToolbarAction {
     SetLimited(bool),
     /// Change the target rate (cycles per second).
     SetRate(f64),
+    /// Turn the limit on at this rate (a preset of the rate menu).
+    LimitTo(f64),
     /// Power-on reset.
     Reset,
 }
@@ -65,6 +67,9 @@ impl Default for SimControl {
 /// Bounds of the target rate.
 pub const RATE_RANGE: (f64, f64) = (0.1, 1e9);
 
+/// Presets of the rate menu (cycles per second).
+pub const RATE_PRESETS: [f64; 7] = [1.0, 10.0, 100.0, 1e3, 1e4, 1e5, 1e6];
+
 impl SimControl {
     /// The speed that follows from `limited` / `rate`.
     pub fn speed(&self) -> Speed {
@@ -86,42 +91,49 @@ impl SimControl {
         }
     }
 
+    /// A step of `step_n` `unit`s. Stepping implies pausing: a step while running would be lost
+    /// in the run.
+    fn step(&self, unit: StepUnit, running: bool) -> Vec<Command> {
+        let step = Command::Step {
+            n: self.step_n.max(1),
+            unit,
+        };
+        if running {
+            vec![Command::Pause, step]
+        } else {
+            vec![step]
+        }
+    }
+
     /// The commands for `action`, given the current snapshot's `mode` and `running` flag.
     /// Updates the control state (step unit, speed) as a side effect.
     pub fn commands(&mut self, action: ToolbarAction, mode: Mode, running: bool) -> Vec<Command> {
         match action {
             ToolbarAction::SetMode(m) if m == mode => Vec::new(),
-            ToolbarAction::SetMode(m) => vec![Command::SetMode(m)],
+            ToolbarAction::SetMode(m) => {
+                let mut v = vec![Command::SetMode(m)];
+                if self.limited {
+                    // Restart the pacing schedule: cycles the slower mode could not reach must
+                    // not be caught up in a burst by the faster one.
+                    v.push(Command::SetSpeed(self.speed()));
+                }
+                v
+            }
             ToolbarAction::Run if running => Vec::new(),
             ToolbarAction::Run => vec![Command::Run],
             ToolbarAction::Pause if !running => Vec::new(),
             ToolbarAction::Pause => vec![Command::Pause],
             ToolbarAction::ToggleRun => {
-                vec![if running { Command::Pause } else { Command::Run }]
+                vec![if running {
+                    Command::Pause
+                } else {
+                    Command::Run
+                }]
             }
-            ToolbarAction::Step => {
-                // Stepping implies pausing: a step while running would be lost in the run.
-                let mut v = Vec::new();
-                if running {
-                    v.push(Command::Pause);
-                }
-                v.push(Command::Step {
-                    n: self.step_n.max(1),
-                    unit: self.step_unit,
-                });
-                v
-            }
+            ToolbarAction::Step => self.step(self.step_unit, running),
             ToolbarAction::StepBy(unit) => {
                 self.step_unit = unit;
-                let mut v = Vec::new();
-                if running {
-                    v.push(Command::Pause);
-                }
-                v.push(Command::Step {
-                    n: self.step_n.max(1),
-                    unit,
-                });
-                v
+                self.step(unit, running)
             }
             ToolbarAction::SetLimited(on) => {
                 self.limited = on;
@@ -134,6 +146,11 @@ impl SimControl {
                 } else {
                     Vec::new()
                 }
+            }
+            ToolbarAction::LimitTo(r) => {
+                self.limited = true;
+                self.rate = r.clamp(RATE_RANGE.0, RATE_RANGE.1);
+                vec![Command::SetSpeed(self.speed())]
             }
             ToolbarAction::Reset => vec![Command::Reset],
         }
@@ -175,6 +192,21 @@ impl InputModel {
         {
             self.sent.remove(pin);
         }
+    }
+
+    /// The value sent to `pin` that the live value does not show yet.
+    pub fn pending(&self, pin: &str, live: Option<&Value>) -> Option<&Value> {
+        self.sent.get(pin).filter(|v| live != Some(*v))
+    }
+
+    /// Sent values awaiting confirmation.
+    pub fn sent(&self) -> impl Iterator<Item = (&str, &Value)> {
+        self.sent.iter().map(|(k, v)| (k.as_str(), v))
+    }
+
+    /// True if no sent value awaits confirmation.
+    pub fn is_empty(&self) -> bool {
+        self.sent.is_empty()
     }
 
     /// Forget everything (new design).
@@ -233,15 +265,24 @@ mod tests {
     fn toolbar_actions_map_to_commands() {
         let mut c = SimControl::default();
         let m = Mode::Timing;
-        assert!(c.commands(ToolbarAction::SetMode(Mode::Timing), m, false).is_empty());
+        assert!(
+            c.commands(ToolbarAction::SetMode(Mode::Timing), m, false)
+                .is_empty()
+        );
         assert_eq!(
             dbg(&c.commands(ToolbarAction::SetMode(Mode::Fast), m, false)),
             ["SetMode(Fast)"]
         );
         assert_eq!(dbg(&c.commands(ToolbarAction::Run, m, false)), ["Run"]);
         assert!(c.commands(ToolbarAction::Run, m, true).is_empty());
-        assert_eq!(dbg(&c.commands(ToolbarAction::ToggleRun, m, true)), ["Pause"]);
-        assert_eq!(dbg(&c.commands(ToolbarAction::ToggleRun, m, false)), ["Run"]);
+        assert_eq!(
+            dbg(&c.commands(ToolbarAction::ToggleRun, m, true)),
+            ["Pause"]
+        );
+        assert_eq!(
+            dbg(&c.commands(ToolbarAction::ToggleRun, m, false)),
+            ["Run"]
+        );
         assert!(c.commands(ToolbarAction::Pause, m, false).is_empty());
         // Stepping while running pauses first.
         c.step_n = 5;
@@ -266,7 +307,10 @@ mod tests {
     fn speed_limit_is_paced_by_the_sim_thread() {
         let mut c = SimControl::default();
         // Changing the rate while unlimited sends nothing.
-        assert!(c.commands(ToolbarAction::SetRate(1000.0), Mode::Fast, true).is_empty());
+        assert!(
+            c.commands(ToolbarAction::SetRate(1000.0), Mode::Fast, true)
+                .is_empty()
+        );
         assert_eq!(
             dbg(&c.commands(ToolbarAction::SetLimited(true), Mode::Fast, true)),
             ["SetSpeed(CyclesPerSec(1000.0))"]
@@ -278,6 +322,24 @@ mod tests {
         assert_eq!(
             dbg(&c.commands(ToolbarAction::SetLimited(false), Mode::Fast, true)),
             ["SetSpeed(Unlimited)"]
+        );
+        assert_eq!(
+            dbg(&c.commands(ToolbarAction::LimitTo(1e5), Mode::Fast, true)),
+            ["SetSpeed(CyclesPerSec(100000.0))"]
+        );
+        assert!(c.limited && c.rate == 1e5);
+        // A mode switch while limited restarts the pacing schedule.
+        assert_eq!(
+            dbg(&c.commands(ToolbarAction::SetMode(Mode::Timing), Mode::Fast, true)),
+            ["SetMode(Timing)", "SetSpeed(CyclesPerSec(100000.0))"]
+        );
+        assert_eq!(
+            dbg(&c.commands(ToolbarAction::SetLimited(false), Mode::Timing, true)),
+            ["SetSpeed(Unlimited)"]
+        );
+        assert_eq!(
+            dbg(&c.commands(ToolbarAction::SetMode(Mode::Fast), Mode::Timing, true)),
+            ["SetMode(Fast)"]
         );
         c.sync_speed(Speed::CyclesPerSec(42.0));
         assert!(c.limited && c.rate == 42.0);
@@ -291,18 +353,27 @@ mod tests {
         let zero = Value::from_bool(false);
         let one = Value::from_bool(true);
         // Unknown → 1.
-        assert_eq!(format!("{:?}", m.toggle("EN", None)), "SetInput(EN, Value(1'0b1))");
+        assert_eq!(
+            format!("{:?}", m.toggle("EN", None)),
+            "SetInput(EN, Value(1'0b1))"
+        );
         // Toggling again before the snapshot shows it uses the sent value.
         assert_eq!(
             format!("{:?}", m.toggle("EN", Some(&zero))),
             "SetInput(EN, Value(1'0b0))"
         );
         assert_eq!(m.current("EN", Some(&one)), Some(zero.clone()));
+        assert_eq!(m.pending("EN", Some(&one)), Some(&zero));
+        assert_eq!(m.pending("EN", Some(&zero)), None);
         m.confirm("EN", Some(&zero));
+        assert!(m.is_empty());
         assert_eq!(m.current("EN", Some(&one)), Some(one.clone()));
         // X → 1.
         let x = Value::xs(1);
-        assert_eq!(format!("{:?}", m.toggle("A", Some(&x))), "SetInput(A, Value(1'0b1))");
+        assert_eq!(
+            format!("{:?}", m.toggle("A", Some(&x))),
+            "SetInput(A, Value(1'0b1))"
+        );
     }
 
     #[test]

@@ -3,7 +3,7 @@
 //!
 //! Keep these constructors stable, tests depend on them. [`all`] lists every example shown in
 //! the menu (SR latch, counter, register file, Panda-8 with each built-in program). The designs
-//! carry no geometry; [`crate::app::AppState::open_design`] lays them out with
+//! carry no geometry; [`crate::app::AppState::open_document`] lays them out with
 //! [`crate::layout`] on a worker thread.
 
 use panda_circuits::{RegFileStyle, nand_sr_latch, register_file, sync_counter, testbench};
@@ -56,6 +56,20 @@ pub struct Example {
     pub description: &'static str,
     /// Constructor.
     pub build: fn() -> Design,
+}
+
+impl Example {
+    /// The example as a new, unsaved document without geometry (the shell lays it out with
+    /// [`crate::layout`] when it is opened; [`crate::doc::Document::layout_missing`] does it
+    /// synchronously).
+    pub fn document(&self) -> crate::doc::Document {
+        crate::doc::Document::new((self.build)())
+    }
+}
+
+/// The example named `name` (see [`all`]).
+pub fn by_name(name: &str) -> Option<Example> {
+    all().into_iter().find(|e| e.name == name)
 }
 
 /// Every built-in example, in menu order.

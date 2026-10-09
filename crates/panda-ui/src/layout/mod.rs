@@ -1,38 +1,57 @@
 //! Automatic layered layout and orthogonal routing for defs without geometry.
 //!
 //! A Sugiyama-style pipeline, sized for generated designs (Panda-8's 256-input ROM OR, decoder
-//! fan-outs, latch feedback):
+//! fan-outs, latch feedback, the 1.8k-instance flat CPU):
 //!
-//! 1. **Graph.** Nodes are the def's pin markers and instances. For every net, driver ends
-//!    (`Out` ports, the def's `In` pins; for undriven nets the `InOut` ends of splitters fed from
+//! 0. **Groups.** In flat designs instance ids carry the hierarchy they were inlined from
+//!    (`cpu.alu.add.g3`, separator `.`). Instances sharing a prefix are laid out on their own,
+//!    recursively, and the result is placed as one rectangular *block* in the enclosing layout;
+//!    nets crossing a block's boundary enter on its left (driven outside) or leave on its right
+//!    (driven inside). Defs without dotted ids are one scope.
+//! 1. **Graph.** Nodes are pin markers, instances and blocks. For every net, driver ends (`Out`
+//!    ports, the def's `In` pins; for undriven nets the `InOut` ends of splitters fed from
 //!    elsewhere) get an edge to every other end.
 //! 2. **Layers.** Cycles (feedback) are broken by DFS back edges; longest-path layering on the
-//!    rest. `In` pins form column 0, `Out`/`InOut` pins the last column, sources without inputs
-//!    (constants, clocks) are pulled right next to their first consumer.
+//!    rest, then nodes with more successors than predecessors are pulled right toward them
+//!    (shorter nets, fewer lanes). `In` pins form column 0, `Out`/`InOut` pins the last column,
+//!    sources without inputs (constants, clocks) sit right next to their first consumer.
 //! 3. **Lanes.** A net whose ends lie in channels `c0..=c1` (the gaps left of/right of the
 //!    columns) gets one *lane* (a horizontal slot) in every column it crosses, so wires never
 //!    pass through symbols, also for feedback going right-to-left.
-//! 4. **Order.** Barycenter sweeps over nodes and lanes, per net centroid.
+//! 4. **Order.** Crossing reduction ([`order`]): barycenter sweeps with port offsets plus
+//!    adjacent-swap transposes, keeping the order with the fewest crossings.
 //! 5. **Y.** Order-preserving 1-D placement that minimizes the squared distance of every item to
 //!    its desired position (aligned with the net it connects to on the left, else on the right),
 //!    solved exactly by pool-adjacent-violators; three alternating passes.
-//! 6. **Channels.** Per channel, every net with ends at different heights gets a vertical track;
-//!    tracks are assigned left-edge first under the constraints that keep stubs of different nets
-//!    at the same height from overlapping. Column x positions follow from channel widths.
+//! 6. **Channels.** Per channel, every net with ends at different heights gets a vertical track
+//!    ([`tracks`]): no overlapping stubs (doglegs break constraint cycles), bundle-friendly track
+//!    order (parallel buses route as crossing-free staircases), left-edge packing. Column x
+//!    positions follow from channel widths.
 //!
 //! The result is an [`EditorData`] with `auto = true`. [`check`] verifies the invariants (no
-//! overlapping symbols, wires outside symbols, every net's ends connected by its wires); the
-//! tests run it over every def of Panda-8.
+//! overlapping symbols, wires outside symbols, every net's ends connected by its wires, no wires
+//! of different nets overlapping or touching); [`metrics`] measures readability (size, wire
+//! length, bends, crossings).
 
-use std::collections::{HashMap, HashSet};
+mod check;
+mod order;
+mod tracks;
+
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use panda_netlist::{ComponentDef, DefId, Design, Dir, Endpoint, InstKind};
 
-use crate::doc::{Document, EditorData, InstGeom, ItemRef, NetGeom, Placed};
+pub use check::{Metrics, check, metrics};
+
+#[cfg(test)]
+use crate::doc::{Document, ItemRef};
+use crate::doc::{EditorData, InstGeom, NetGeom};
 use crate::geom::{
     GridPt, GridRect, Orient, Side, Symbol, SymbolKind, SymbolLayout, atom_symbol, gp,
     package_symbol, pin_symbol,
 };
+use order::{Ctx, Item};
+use tracks::{ChanPt, Piece, route_channel};
 
 /// Vertical gap between two symbols in a column.
 const NODE_GAP: i32 = 2;
@@ -40,8 +59,16 @@ const NODE_GAP: i32 = 2;
 const LANE_GAP: i32 = 1;
 /// Minimum channel width.
 const MIN_CHANNEL: i32 = 3;
-/// Barycenter iterations.
-const ORDER_SWEEPS: usize = 8;
+/// Smallest prefix group laid out as a block.
+const MIN_GROUP: usize = 3;
+/// Scopes with more instances than this lay out their blocks on several threads.
+const PARALLEL_SCOPE: usize = 600;
+/// Height of the name row above a block.
+const LABEL_ROW: i32 = 2;
+/// Approximate width of a label character (grid units, canvas text at size 1).
+const LABEL_CHAR_W: f32 = 0.5;
+/// Separator of hierarchical instance ids in flat designs (`panda_circuits::PATH_SEP`).
+const PATH_SEP: char = '.';
 
 /// Lay out the defs `ids` of `design` (in parallel). Package symbols of instantiated defs come
 /// from `editors` (their `symbol`), else the automatic symbol.
@@ -54,14 +81,21 @@ pub fn layout_defs(
     let threads = std::thread::available_parallelism()
         .map_or(1, |n| n.get())
         .min(ids.len().max(1));
-    let chunks: Vec<&[DefId]> = ids.chunks(ids.len().div_ceil(threads).max(1)).collect();
+    // Big defs first, dealt round-robin, so threads get similar loads.
+    let mut order: Vec<&DefId> = ids.iter().collect();
+    let size = |id: &DefId| design.def(id).map_or(0, |d| d.instances.len());
+    order.sort_by_key(|id| std::cmp::Reverse(size(id)));
+    let mut chunks: Vec<Vec<&DefId>> = vec![Vec::new(); threads];
+    for (i, id) in order.into_iter().enumerate() {
+        chunks[i % threads].push(id);
+    }
     std::thread::scope(|s| {
         let handles: Vec<_> = chunks
             .into_iter()
             .map(|chunk| {
                 s.spawn(move || {
                     chunk
-                        .iter()
+                        .into_iter()
                         .filter_map(|id| {
                             let def = design.def(id)?;
                             let mut e = layout_def(design, def, symbols);
@@ -80,12 +114,27 @@ pub fn layout_defs(
     })
 }
 
+/// What a layout node stands for.
+#[derive(Clone, Debug)]
+enum What {
+    /// The def's own pin (by index).
+    Pin(usize),
+    /// An instance (by index).
+    Inst(usize),
+    /// A block's boundary pin for a def net, `In` (driven outside) or `Out`.
+    VPin(Dir, usize),
+    /// A laid-out group (index into the scope's blocks).
+    Block(usize),
+}
+
 /// One node of the layout graph.
 struct Node {
-    item: ItemRef,
+    what: What,
     sym: Symbol,
     orient: Orient,
     layer: usize,
+    /// Left x (set when the columns are placed).
+    x: i32,
     /// Top y.
     y: i32,
     /// Extra height below the symbol (bottom ports route one unit down).
@@ -93,6 +142,17 @@ struct Node {
 }
 
 impl Node {
+    fn new(what: What, sym: Symbol) -> Node {
+        Node {
+            what,
+            sym,
+            orient: Orient::default(),
+            layer: 0,
+            x: 0,
+            y: 0,
+            extra: 0,
+        }
+    }
     fn size(&self) -> GridPt {
         self.orient.size(self.sym.size)
     }
@@ -107,6 +167,39 @@ impl Node {
             self.orient.side(pg.side),
         )
     }
+    /// A pin marker on the input side (column 0).
+    fn is_in_pin(&self) -> bool {
+        match self.what {
+            What::Pin(_) => self.sym.ports[0].dir == Dir::In,
+            What::VPin(d, _) => d == Dir::In,
+            _ => false,
+        }
+    }
+    /// A pin marker on the output side (last column).
+    fn is_out_pin(&self) -> bool {
+        match self.what {
+            What::Pin(_) => self.sym.ports[0].dir != Dir::In,
+            What::VPin(d, _) => d != Dir::In,
+            _ => false,
+        }
+    }
+    /// A pin marker (either side).
+    fn is_pin_marker(&self) -> bool {
+        matches!(self.what, What::Pin(_) | What::VPin(..))
+    }
+    /// Role of port `p` for the net it is on: `Out` drives it.
+    fn role(&self, p: usize) -> Dir {
+        let d = self.sym.ports[p].dir;
+        match self.what {
+            // The def's own pins drive the inside (In) or are driven (Out); so do block pins.
+            What::Pin(_) | What::VPin(..) => match d {
+                Dir::In => Dir::Out,
+                Dir::Out => Dir::In,
+                Dir::InOut => Dir::InOut,
+            },
+            _ => d,
+        }
+    }
 }
 
 /// End of a net at a node port.
@@ -116,11 +209,108 @@ struct End {
     port: usize,
 }
 
-/// An item of a column: a node or a lane of a net.
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum Item {
-    Node(usize),
-    Lane(usize),
+/// An end of a def net.
+#[derive(Clone, Copy, Debug)]
+enum NetEnd {
+    /// The def's pin (index).
+    Pin(usize),
+    /// Instance (index) and port (index into its symbol's ports).
+    Port(usize, usize),
+}
+
+/// Per-def data shared by all scopes.
+struct DefCtx<'a> {
+    def: &'a ComponentDef,
+    /// Symbol per instance (`None`: a def use whose def is missing; not laid out).
+    syms: Vec<Option<Symbol>>,
+    /// Id path components per instance.
+    path: Vec<Vec<&'a str>>,
+    /// Ends of every def net.
+    net_ends: Vec<Vec<NetEnd>>,
+    /// Nets per instance.
+    inst_nets: Vec<Vec<usize>>,
+}
+
+/// A laid-out scope (local coordinates).
+#[derive(Default)]
+struct ScopeOut {
+    /// Instance placements.
+    insts: Vec<(usize, InstGeom)>,
+    /// Def pin placements (top scope only).
+    pins: Vec<(usize, InstGeom)>,
+    /// Wire segments by def net.
+    wires: HashMap<usize, Vec<(GridPt, GridPt)>>,
+    /// Boundary pins: net, direction, port position.
+    vports: Vec<(usize, Dir, GridPt)>,
+    /// Group name labels (top-left anchor, text).
+    labels: Vec<(GridPt, String)>,
+    /// Bounding box of everything.
+    bounds: Option<GridRect>,
+}
+
+impl ScopeOut {
+    fn grow(&mut self, r: GridRect) {
+        self.bounds = Some(self.bounds.map_or(r, |b| b.union(&r)));
+    }
+
+    /// Move everything by `d`.
+    fn translate(&mut self, d: GridPt) {
+        for (_, g) in self.insts.iter_mut().chain(self.pins.iter_mut()) {
+            g.pos = g.pos + d;
+        }
+        for segs in self.wires.values_mut() {
+            for s in segs {
+                s.0 = s.0 + d;
+                s.1 = s.1 + d;
+            }
+        }
+        for v in &mut self.vports {
+            v.2 = v.2 + d;
+        }
+        for l in &mut self.labels {
+            l.0 = l.0 + d;
+        }
+        if let Some(b) = &mut self.bounds {
+            b.min = b.min + d;
+            b.max = b.max + d;
+        }
+    }
+
+    /// The block symbol of this scope: its box, `In` boundary pins on the left edge, the others
+    /// on the right. Port order is `vports` order.
+    fn block_symbol(&self) -> Symbol {
+        let b = self.bounds.unwrap_or(GridRect {
+            min: gp(0, 0),
+            max: gp(0, 0),
+        });
+        let ports = self
+            .vports
+            .iter()
+            .map(|&(net, dir, p)| {
+                let side = if dir == Dir::In {
+                    Side::Left
+                } else {
+                    Side::Right
+                };
+                debug_assert_eq!(p.x, if side == Side::Left { b.min.x } else { b.max.x });
+                crate::geom::PortGeom {
+                    name: net.to_string(),
+                    pos: p - b.min,
+                    side,
+                    dir,
+                    width: 1,
+                }
+            })
+            .collect();
+        Symbol {
+            kind: SymbolKind::Package {
+                def: String::new(),
+                title: String::new(),
+            },
+            size: b.max - b.min,
+            ports,
+        }
+    }
 }
 
 /// Lay out one def. `symbols` gives package symbol layouts by def id.
@@ -129,82 +319,431 @@ pub fn layout_def<'a>(
     def: &'a ComponentDef,
     symbols: impl Fn(&str) -> Option<&'a SymbolLayout>,
 ) -> EditorData {
-    // ---- nodes ----
-    let mut nodes: Vec<Node> = Vec::new();
-    let mut pin_node: HashMap<&str, usize> = HashMap::new();
-    let mut inst_node: HashMap<&str, usize> = HashMap::new();
-    for p in &def.pins {
-        pin_node.insert(&p.name, nodes.len());
-        nodes.push(Node {
-            item: ItemRef::Pin(p.name.clone()),
-            sym: pin_symbol(p),
-            orient: Orient::default(),
-            layer: 0,
-            y: 0,
-            extra: 0,
-        });
-    }
-    for inst in &def.instances {
-        let sym = match &inst.kind {
-            InstKind::Atom(a) => atom_symbol(a),
-            InstKind::Def(id) => match design.def(id) {
-                Some(d) => package_symbol(d, symbols(id)),
-                None => continue,
-            },
-        };
-        inst_node.insert(&inst.id, nodes.len());
-        nodes.push(Node {
-            item: ItemRef::Instance(inst.id.clone()),
-            sym,
-            orient: Orient::default(),
-            layer: 0,
-            y: 0,
-            extra: 0,
-        });
-    }
-    let n_nodes = nodes.len();
-
-    // ---- net ends ----
-    let nets: Vec<Vec<End>> = def
+    let syms: Vec<Option<Symbol>> = def
+        .instances
+        .iter()
+        .map(|inst| match &inst.kind {
+            InstKind::Atom(a) => Some(atom_symbol(a)),
+            InstKind::Def(id) => design.def(id).map(|d| package_symbol(d, symbols(id))),
+        })
+        .collect();
+    let inst_ix: HashMap<&str, usize> = def
+        .instances
+        .iter()
+        .enumerate()
+        .map(|(i, x)| (x.id.as_str(), i))
+        .collect();
+    let pin_ix: HashMap<&str, usize> = def
+        .pins
+        .iter()
+        .enumerate()
+        .map(|(i, p)| (p.name.as_str(), i))
+        .collect();
+    let mut inst_nets: Vec<Vec<usize>> = vec![Vec::new(); def.instances.len()];
+    let net_ends: Vec<Vec<NetEnd>> = def
         .nets
         .iter()
-        .map(|net| {
+        .enumerate()
+        .map(|(ni, net)| {
             net.ends
                 .iter()
-                .filter_map(|e| {
-                    let (node, port) = match e {
-                        Endpoint::Pin(name) => (*pin_node.get(name.as_str())?, name.as_str()),
-                        Endpoint::Port { inst, port } => {
-                            (*inst_node.get(inst.as_str())?, port.as_str())
+                .filter_map(|e| match e {
+                    Endpoint::Pin(name) => pin_ix.get(name.as_str()).map(|&p| NetEnd::Pin(p)),
+                    Endpoint::Port { inst, port } => {
+                        let i = *inst_ix.get(inst.as_str())?;
+                        let p = syms[i].as_ref()?.ports.iter().position(|p| p.name == *port)?;
+                        if inst_nets[i].last() != Some(&ni) {
+                            inst_nets[i].push(ni);
                         }
-                    };
-                    let port = nodes[node].sym.ports.iter().position(|p| p.name == port)?;
-                    Some(End { node, port })
+                        Some(NetEnd::Port(i, p))
+                    }
                 })
                 .collect()
         })
         .collect();
-
-    // ---- roles: drivers of each net ----
-    let role = |e: &End| -> Dir {
-        let p = &nodes[e.node].sym.ports[e.port];
-        match (&nodes[e.node].item, p.dir) {
-            // The def's own pins drive the inside (In) or are driven (Out).
-            (ItemRef::Pin(_), Dir::In) => Dir::Out,
-            (ItemRef::Pin(_), Dir::Out) => Dir::In,
-            (_, d) => d,
-        }
+    let cx = DefCtx {
+        def,
+        path: def
+            .instances
+            .iter()
+            .map(|i| i.id.split(PATH_SEP).collect())
+            .collect(),
+        syms,
+        net_ends,
+        inst_nets,
     };
+    let all: Vec<usize> = (0..def.instances.len())
+        .filter(|&i| cx.syms[i].is_some())
+        .collect();
+    let mut scope = layout_scope(&cx, &all, 0, None, "");
+    // Normalize: content starts at (0, 0) like a hand-drawn schematic would.
+    if let Some(b) = scope.bounds {
+        scope.translate(gp(-b.min.x, -b.min.y));
+    }
+    let mut out = EditorData {
+        version: crate::doc::EDITOR_VERSION,
+        auto: true,
+        ..EditorData::default()
+    };
+    for (i, g) in scope.insts {
+        out.instances.insert(def.instances[i].id.clone(), g);
+    }
+    for (p, g) in scope.pins {
+        out.pins.insert(def.pins[p].name.clone(), g);
+    }
+    for (ni, segs) in scope.wires {
+        if !segs.is_empty() {
+            out.wires.insert(def.nets[ni].id.clone(), net_geom(segs));
+        }
+    }
+    out.labels = scope
+        .labels
+        .into_iter()
+        .map(|(pos, text)| crate::doc::Label { pos, text })
+        .collect();
+    out
+}
+
+/// Split `insts` (sharing their first `depth` id components) into prefix groups and leaves.
+/// Descends while everything is in one group. Returns `(depth, groups, leaves)`.
+fn split_groups(
+    cx: &DefCtx,
+    insts: &[usize],
+    mut depth: usize,
+) -> (usize, Vec<Vec<usize>>, Vec<usize>) {
+    loop {
+        let mut groups: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+        let mut leaves = Vec::new();
+        for &i in insts {
+            let p = &cx.path[i];
+            if p.len() > depth + 1 {
+                groups.entry(p[depth]).or_default().push(i);
+            } else {
+                leaves.push(i);
+            }
+        }
+        if leaves.is_empty() && groups.len() == 1 {
+            depth += 1;
+            continue;
+        }
+        let mut out = Vec::new();
+        for (_, g) in groups {
+            if g.len() >= MIN_GROUP && g.len() < insts.len() {
+                out.push(g);
+            } else {
+                leaves.extend(g);
+            }
+        }
+        leaves.sort_unstable();
+        return (depth, out, leaves);
+    }
+}
+
+/// Lay out the instances `insts` (sharing their first `depth` id components). `boundary` lists
+/// the nets crossing the scope's edge with their direction (`None`: the def's top scope, whose
+/// boundary is the def's pins). A block (`boundary` given) gets a label row with `name` on top.
+fn layout_scope(
+    cx: &DefCtx,
+    insts: &[usize],
+    depth: usize,
+    boundary: Option<&[(usize, Dir)]>,
+    name: &str,
+) -> ScopeOut {
+    let (depth, groups, leaves) = split_groups(cx, insts, depth);
+    // ---- blocks (recursively, in parallel for big scopes) ----
+    let mut scope_of = HashMap::with_capacity(insts.len());
+    for (g, members) in groups.iter().enumerate() {
+        for &i in members {
+            scope_of.insert(i, g);
+        }
+    }
+    let bounds: Vec<Vec<(usize, Dir)>> = groups
+        .iter()
+        .enumerate()
+        .map(|(g, members)| group_boundary(cx, members, |i| scope_of.get(&i) == Some(&g)))
+        .collect();
+    let names: Vec<String> = groups
+        .iter()
+        .map(|m| cx.path[m[0]][..=depth].join(&PATH_SEP.to_string()))
+        .collect();
+    let blocks: Vec<ScopeOut> = if insts.len() > PARALLEL_SCOPE && groups.len() > 1 {
+        std::thread::scope(|s| {
+            let hs: Vec<_> = groups
+                .iter()
+                .zip(&bounds)
+                .zip(&names)
+                .map(|((m, b), n)| s.spawn(move || layout_scope(cx, m, depth + 1, Some(b), n)))
+                .collect();
+            hs.into_iter()
+                .map(|h| h.join().expect("layout thread"))
+                .collect()
+        })
+    } else {
+        groups
+            .iter()
+            .zip(&bounds)
+            .zip(&names)
+            .map(|((m, b), n)| layout_scope(cx, m, depth + 1, Some(b), n))
+            .collect()
+    };
+
+    // ---- nodes ----
+    let mut nodes: Vec<Node> = Vec::new();
+    // Node of each def pin / boundary net, leaf instance and block.
+    let mut pin_node: HashMap<usize, usize> = HashMap::new();
+    let mut vpin_node: HashMap<usize, usize> = HashMap::new();
+    let mut inst_node: HashMap<usize, usize> = HashMap::new();
+    match boundary {
+        None => {
+            for (pi, p) in cx.def.pins.iter().enumerate() {
+                pin_node.insert(pi, nodes.len());
+                nodes.push(Node::new(What::Pin(pi), pin_symbol(p)));
+            }
+        }
+        Some(b) => {
+            for &(ni, dir) in b {
+                vpin_node.insert(ni, nodes.len());
+                nodes.push(Node::new(What::VPin(dir, ni), vpin_symbol(dir)));
+            }
+        }
+    }
+    for &i in &leaves {
+        inst_node.insert(i, nodes.len());
+        let sym = cx.syms[i].clone().expect("laid-out instances have symbols");
+        nodes.push(Node::new(What::Inst(i), sym));
+    }
+    // Block port index by (block, net).
+    let mut block_port: HashMap<(usize, usize), usize> = HashMap::new();
+    let mut block_node = Vec::with_capacity(blocks.len());
+    for (bi, b) in blocks.iter().enumerate() {
+        for (pi, &(ni, _, _)) in b.vports.iter().enumerate() {
+            block_port.insert((bi, ni), pi);
+        }
+        block_node.push(nodes.len());
+        nodes.push(Node::new(What::Block(bi), b.block_symbol()));
+    }
+
+    // ---- nets of this scope ----
+    let mut scope_nets: Vec<usize> = insts
+        .iter()
+        .flat_map(|&i| cx.inst_nets[i].iter().copied())
+        .collect();
+    if boundary.is_none() {
+        for (ni, ends) in cx.net_ends.iter().enumerate() {
+            if ends.iter().any(|e| matches!(e, NetEnd::Pin(_))) {
+                scope_nets.push(ni);
+            }
+        }
+    }
+    scope_nets.sort_unstable();
+    scope_nets.dedup();
+    let mut nets: Vec<Vec<End>> = Vec::with_capacity(scope_nets.len());
+    for &ni in &scope_nets {
+        let mut ends = Vec::new();
+        let mut seen_blocks: HashSet<usize> = HashSet::new();
+        for e in &cx.net_ends[ni] {
+            match *e {
+                NetEnd::Pin(p) => {
+                    if let Some(&n) = pin_node.get(&p) {
+                        ends.push(End { node: n, port: 0 });
+                    }
+                }
+                NetEnd::Port(i, p) => {
+                    if let Some(&n) = inst_node.get(&i) {
+                        ends.push(End { node: n, port: p });
+                    } else if let Some(&g) = scope_of.get(&i)
+                        && seen_blocks.insert(g)
+                        && let Some(&bp) = block_port.get(&(g, ni))
+                    {
+                        ends.push(End {
+                            node: block_node[g],
+                            port: bp,
+                        });
+                    }
+                }
+            }
+        }
+        if let Some(&n) = vpin_node.get(&ni) {
+            ends.push(End { node: n, port: 0 });
+        }
+        nets.push(ends);
+    }
+
+    // ---- solve ----
+    let segs = solve(&mut nodes, &nets);
+
+    // ---- emit ----
+    let mut out = ScopeOut::default();
+    for (k, s) in segs.into_iter().enumerate() {
+        for &(a, b) in &s {
+            out.grow(GridRect {
+                min: gp(a.x.min(b.x), a.y.min(b.y)),
+                max: gp(a.x.max(b.x), a.y.max(b.y)),
+            });
+        }
+        if !s.is_empty() {
+            out.wires.entry(scope_nets[k]).or_default().extend(s);
+        }
+    }
+    let mut blocks: Vec<Option<ScopeOut>> = blocks.into_iter().map(Some).collect();
+    for n in &nodes {
+        let pos = gp(n.x, n.y);
+        let rect = GridRect::from_pos_size(pos, n.size());
+        match n.what {
+            What::Pin(p) => {
+                out.grow(rect);
+                out.pins.push((
+                    p,
+                    InstGeom {
+                        pos,
+                        orient: n.orient,
+                    },
+                ));
+            }
+            What::Inst(i) => {
+                out.grow(rect);
+                out.insts.push((
+                    i,
+                    InstGeom {
+                        pos,
+                        orient: n.orient,
+                    },
+                ));
+            }
+            What::VPin(dir, net) => {
+                out.grow(rect);
+                out.vports.push((net, dir, pos + n.port(0).0));
+            }
+            What::Block(bi) => {
+                let mut b = blocks[bi].take().expect("block placed once");
+                let min = b.bounds.map_or(gp(0, 0), |r| r.min);
+                b.translate(pos - min);
+                out.grow(rect);
+                out.insts.extend(b.insts);
+                out.labels.extend(b.labels);
+                for (ni, s) in b.wires {
+                    out.wires.entry(ni).or_default().extend(s);
+                }
+            }
+        }
+    }
+    // Boundary pins in the order given (block port order).
+    if let Some(b) = boundary {
+        let rank: HashMap<usize, usize> = b.iter().enumerate().map(|(i, &(n, _))| (n, i)).collect();
+        out.vports.sort_by_key(|v| rank[&v.0]);
+        // The name row above the block's content.
+        if let Some(r) = out.bounds {
+            let at = gp(r.min.x, r.min.y - LABEL_ROW);
+            out.grow(GridRect { min: at, max: at });
+            out.labels.push((at, fit_label(name, r.max.x - r.min.x)));
+        }
+    }
+    out
+}
+
+/// `name`, shortened from the left (whole components, `…` prefix) to fit `width` grid units.
+fn fit_label(name: &str, width: i32) -> String {
+    let room = (width.max(0) as f32 / LABEL_CHAR_W) as usize;
+    if name.chars().count() <= room {
+        return name.to_string();
+    }
+    let mut parts: Vec<&str> = name.split(PATH_SEP).collect();
+    while parts.len() > 1 {
+        parts.remove(0);
+        let s = format!("…{}", parts.join(&PATH_SEP.to_string()));
+        if s.chars().count() <= room {
+            return s;
+        }
+    }
+    parts[0].chars().take(room).collect()
+}
+
+/// Nets of the group `members` that also have ends outside it (or on a def pin), with their
+/// direction: `Out` if driven inside the group.
+fn group_boundary(
+    cx: &DefCtx,
+    members: &[usize],
+    inside: impl Fn(usize) -> bool,
+) -> Vec<(usize, Dir)> {
+    let mut nets: Vec<usize> = members
+        .iter()
+        .flat_map(|&i| cx.inst_nets[i].iter().copied())
+        .collect();
+    nets.sort_unstable();
+    nets.dedup();
+    let dir_of = |e: &NetEnd| match *e {
+        NetEnd::Pin(_) => None,
+        NetEnd::Port(i, p) => cx.syms[i].as_ref().map(|s| s.ports[p].dir),
+    };
+    nets.into_iter()
+        .filter_map(|ni| {
+            let ends = &cx.net_ends[ni];
+            let crosses = ends.iter().any(|e| match *e {
+                NetEnd::Pin(_) => true,
+                NetEnd::Port(i, _) => !inside(i),
+            });
+            if !crosses {
+                return None;
+            }
+            let is_in = |e: &NetEnd| matches!(*e, NetEnd::Port(i, _) if inside(i));
+            // Def `In` pins drive the net from outside; `Out` ports drive it where they are.
+            let driven_inside = ends.iter().any(|e| is_in(e) && dir_of(e) == Some(Dir::Out));
+            let driven = ends.iter().any(|e| match *e {
+                NetEnd::Pin(p) => cx.def.pins[p].dir == Dir::In,
+                _ => dir_of(e) == Some(Dir::Out),
+            });
+            // Undriven (splitter-only) nets: the group holding the first end drives it.
+            let first_inside = ends.first().is_some_and(is_in);
+            let dir = if driven_inside || (!driven && first_inside) {
+                Dir::Out
+            } else {
+                Dir::In
+            };
+            Some((ni, dir))
+        })
+        .collect()
+}
+
+/// Symbol of a block boundary pin: a zero-width marker with its port at mid height.
+fn vpin_symbol(dir: Dir) -> Symbol {
+    let side = if dir == Dir::In {
+        Side::Right
+    } else {
+        Side::Left
+    };
+    Symbol {
+        kind: SymbolKind::Pin {
+            dir,
+            name: String::new(),
+        },
+        size: gp(0, 2),
+        ports: vec![crate::geom::PortGeom {
+            name: String::new(),
+            pos: gp(0, 1),
+            side,
+            dir,
+            width: 1,
+        }],
+    }
+}
+
+
+/// Place `nodes` (sets `layer`, `x`, `y`, `orient`) and route `nets`; returns the wire segments
+/// of every net (same indices as `nets`).
+fn solve(nodes: &mut Vec<Node>, nets: &[Vec<End>]) -> Vec<Vec<(GridPt, GridPt)>> {
+    let n_nodes = nodes.len();
+    // ---- roles: drivers of each net ----
+    let role = |nodes: &[Node], e: &End| nodes[e.node].role(e.port);
     let has_real_driver: Vec<bool> = nets
         .iter()
-        .map(|ends| ends.iter().any(|e| role(e) == Dir::Out))
+        .map(|ends| ends.iter().any(|e| role(nodes, e) == Dir::Out))
         .collect();
     // Splitters fed through some port from a really driven net.
     let mut fed = vec![false; n_nodes];
     for (ni, ends) in nets.iter().enumerate() {
         if has_real_driver[ni] {
             for e in ends {
-                if role(e) == Dir::InOut {
+                if role(nodes, e) == Dir::InOut {
                     fed[e.node] = true;
                 }
             }
@@ -215,19 +754,19 @@ pub fn layout_def<'a>(
         .enumerate()
         .map(|(ni, ends)| {
             let real: Vec<usize> = (0..ends.len())
-                .filter(|&i| role(&ends[i]) == Dir::Out)
+                .filter(|&i| role(nodes, &ends[i]) == Dir::Out)
                 .collect();
             if !real.is_empty() || has_real_driver[ni] {
                 return real;
             }
             let fed_io: Vec<usize> = (0..ends.len())
-                .filter(|&i| role(&ends[i]) == Dir::InOut && fed[ends[i].node])
+                .filter(|&i| role(nodes, &ends[i]) == Dir::InOut && fed[ends[i].node])
                 .collect();
             if !fed_io.is_empty() {
                 return fed_io;
             }
             (0..ends.len())
-                .filter(|&i| role(&ends[i]) == Dir::InOut)
+                .filter(|&i| role(nodes, &ends[i]) == Dir::InOut)
                 .take(1)
                 .collect()
         })
@@ -237,10 +776,10 @@ pub fn layout_def<'a>(
     for (ni, ends) in nets.iter().enumerate() {
         for &d in &drivers[ni] {
             let e = ends[d];
-            if matches!(nodes[e.node].sym.kind, SymbolKind::Splitter { .. })
-                && nodes[e.node].sym.ports[e.port].name == "whole"
+            let n = &mut nodes[e.node];
+            if matches!(n.sym.kind, SymbolKind::Splitter { .. }) && n.sym.ports[e.port].name == "whole"
             {
-                nodes[e.node].orient.flip = true;
+                n.orient.flip = true;
             }
         }
     }
@@ -271,24 +810,20 @@ pub fn layout_def<'a>(
 
     // ---- layers ----
     let topo = topo_order(&dag, &pred);
-    let is_in_pin = |i: usize| {
-        matches!(&nodes[i].item, ItemRef::Pin(_)) && nodes[i].sym.ports[0].dir == Dir::In
-    };
-    let is_out_pin = |i: usize| {
-        matches!(&nodes[i].item, ItemRef::Pin(_)) && nodes[i].sym.ports[0].dir != Dir::In
-    };
+    let is_in_pin: Vec<bool> = nodes.iter().map(Node::is_in_pin).collect();
+    let is_out_pin: Vec<bool> = nodes.iter().map(Node::is_out_pin).collect();
     let mut layer = vec![1usize; n_nodes];
     for &v in &topo {
-        if is_in_pin(v) {
+        if is_in_pin[v] {
             layer[v] = 0;
             continue;
         }
-        if is_out_pin(v) {
+        if is_out_pin[v] {
             continue;
         }
         layer[v] = pred[v]
             .iter()
-            .filter(|&&u| !is_out_pin(u))
+            .filter(|&&u| !is_out_pin[u])
             .map(|&u| layer[u] + 1)
             .max()
             .unwrap_or(1)
@@ -296,10 +831,10 @@ pub fn layout_def<'a>(
     }
     // Pull sources (no predecessors) right next to their first consumer.
     for &v in topo.iter().rev() {
-        if pred[v].is_empty() && !is_in_pin(v) && !is_out_pin(v) {
+        if pred[v].is_empty() && !is_in_pin[v] && !is_out_pin[v] {
             let m = dag[v]
                 .iter()
-                .filter(|&&s| !is_out_pin(s))
+                .filter(|&&s| !is_out_pin[s])
                 .map(|&s| layer[s])
                 .min();
             if let Some(m) = m {
@@ -308,12 +843,31 @@ pub fn layout_def<'a>(
         }
     }
     let last_inner = (0..n_nodes)
-        .filter(|&i| !is_out_pin(i))
+        .filter(|&i| !is_out_pin[i])
         .map(|i| layer[i])
         .max()
         .unwrap_or(0);
+    // Balance: a node with more successors than predecessors moves right toward them (as far
+    // as its successors allow), which shortens its nets.
+    for &v in topo.iter().rev() {
+        if is_in_pin[v] || is_out_pin[v] || pred[v].is_empty() {
+            continue;
+        }
+        let ns = dag[v].len();
+        if ns <= pred[v].len() {
+            continue;
+        }
+        let hi = dag[v]
+            .iter()
+            .map(|&s| if is_out_pin[s] { last_inner } else { layer[s] - 1 })
+            .min()
+            .unwrap_or(layer[v]);
+        if hi > layer[v] {
+            layer[v] = hi;
+        }
+    }
     for (i, l) in layer.iter_mut().enumerate() {
-        if is_out_pin(i) {
+        if is_out_pin[i] {
             *l = last_inner + 1;
         }
     }
@@ -338,20 +892,18 @@ pub fn layout_def<'a>(
         }
     };
     let mut lanes: Vec<(usize, usize)> = Vec::new(); // (net, column)
-    let mut lane_of: HashMap<(usize, usize), usize> = HashMap::new();
     for (ni, ends) in nets.iter().enumerate() {
         if ends.len() < 2 {
             continue;
         }
-        let cs = ends.iter().map(|e| end_channel(e, &nodes));
+        let cs = ends.iter().map(|e| end_channel(e, nodes));
         let (c0, c1) = cs.fold((usize::MAX, 0), |(a, b), c| (a.min(c), b.max(c)));
         for col in c0..c1 {
-            lane_of.insert((ni, col), lanes.len());
             lanes.push((ni, col));
         }
     }
 
-    // ---- columns and initial order ----
+    // ---- columns, order, y ----
     let mut cols: Vec<Vec<Item>> = vec![Vec::new(); n_cols];
     for (i, n) in nodes.iter().enumerate() {
         cols[n.layer].push(Item::Node(i));
@@ -359,7 +911,6 @@ pub fn layout_def<'a>(
     for (li, &(_, col)) in lanes.iter().enumerate() {
         cols[col].push(Item::Lane(li));
     }
-    // Nets of each node (for barycenters / anchors), with the port.
     let mut node_nets: Vec<Vec<(usize, usize)>> = vec![Vec::new(); n_nodes];
     for (ni, ends) in nets.iter().enumerate() {
         if ends.len() < 2 {
@@ -369,73 +920,28 @@ pub fn layout_def<'a>(
             node_nets[e.node].push((ni, e.port));
         }
     }
-
     let mut ctx = Ctx {
-        nodes,
+        nodes: std::mem::take(nodes),
         lanes,
-        nets: &nets,
         node_nets,
         cols,
         ys: Vec::new(),
     };
-    ctx.pack_initial();
-    for it in 0..ORDER_SWEEPS {
-        if it % 2 == 0 {
-            for c in 1..n_cols {
-                ctx.reorder(c, c - 1);
-            }
-        } else {
-            for c in (0..n_cols.saturating_sub(1)).rev() {
-                ctx.reorder(c, c + 1);
-            }
-        }
-    }
-    // ---- y placement ----
-    for pass in 0..3 {
-        if pass % 2 == 0 {
-            for c in 0..n_cols {
-                ctx.place_column(c, true);
-            }
-        } else {
-            for c in (0..n_cols).rev() {
-                ctx.place_column(c, false);
-            }
-        }
-    }
+    ctx.order();
+    ctx.place(3);
     let Ctx {
-        nodes,
+        nodes: placed,
         lanes,
-        cols: _,
         ys: lane_y,
         ..
     } = ctx;
-    // Normalize so the topmost item is at y = 0.
-    let min_y = nodes
-        .iter()
-        .map(|n| n.y)
-        .chain(lane_y.iter().copied())
-        .min()
-        .unwrap_or(0);
-    let nodes: Vec<Node> = nodes
-        .into_iter()
-        .map(|mut n| {
-            n.y -= min_y;
-            n
-        })
-        .collect();
-    let lane_y: Vec<i32> = lane_y.iter().map(|y| y - min_y).collect();
+    *nodes = placed;
 
     // ---- channel points ----
     // Left points of channel c: right ports of column c-1 and lane ends of column c-1 (at
     // x = col_right(c-1)). Right points: left/bottom ports of column c and lane starts.
-    #[derive(Clone, Copy)]
-    struct Pt {
-        net: usize,
-        y: i32,
-        left: bool,
-    }
     let n_chan = n_cols + 1;
-    let mut chan_pts: Vec<Vec<Pt>> = vec![Vec::new(); n_chan];
+    let mut chan_pts: Vec<Vec<ChanPt>> = vec![Vec::new(); n_chan];
     for (ni, ends) in nets.iter().enumerate() {
         if ends.len() < 2 {
             continue;
@@ -443,64 +949,38 @@ pub fn layout_def<'a>(
         for e in ends {
             let n = &nodes[e.node];
             let (p, side) = n.port(e.port);
-            match side {
-                Side::Right => chan_pts[n.layer + 1].push(Pt {
-                    net: ni,
-                    y: n.y + p.y,
-                    left: true,
-                }),
-                Side::Bottom | Side::Top => {
-                    let y = if side == Side::Bottom {
-                        n.y + p.y + 1
-                    } else {
-                        n.y + p.y - 1
-                    };
-                    chan_pts[n.layer].push(Pt {
-                        net: ni,
-                        y,
-                        left: false,
-                    });
-                }
-                Side::Left => chan_pts[n.layer].push(Pt {
-                    net: ni,
-                    y: n.y + p.y,
-                    left: false,
-                }),
-            }
+            let (chan, y, left) = match side {
+                Side::Right => (n.layer + 1, n.y + p.y, true),
+                Side::Bottom => (n.layer, n.y + p.y + 1, false),
+                Side::Top => (n.layer, n.y + p.y - 1, false),
+                Side::Left => (n.layer, n.y + p.y, false),
+            };
+            chan_pts[chan].push(ChanPt { net: ni, y, left });
         }
     }
     for (li, &(ni, col)) in lanes.iter().enumerate() {
-        chan_pts[col].push(Pt {
+        chan_pts[col].push(ChanPt {
             net: ni,
             y: lane_y[li],
             left: false,
         });
-        chan_pts[col + 1].push(Pt {
+        chan_pts[col + 1].push(ChanPt {
             net: ni,
             y: lane_y[li],
             left: true,
         });
     }
 
-    // ---- tracks ----
-    let mut tracks: Vec<HashMap<usize, i32>> = Vec::with_capacity(n_chan);
-    let mut chan_w = vec![MIN_CHANNEL; n_chan];
-    for (c, pts) in chan_pts.iter().enumerate() {
-        let t = assign_tracks(pts.iter().map(|p| (p.net, p.y, p.left)));
-        let n_tracks = t.values().copied().max().map_or(0, |m| m + 1);
-        chan_w[c] = (n_tracks + 2).max(MIN_CHANNEL);
-        tracks.push(t);
-    }
-    let col_w: Vec<i32> = (0..n_cols)
-        .map(|c| {
-            nodes
-                .iter()
-                .filter(|n| n.layer == c)
-                .map(|n| n.size().x)
-                .max()
-                .unwrap_or(0)
-        })
+    // ---- tracks and x ----
+    let routes: Vec<tracks::ChannelRoute> = chan_pts.iter().map(|p| route_channel(p)).collect();
+    let chan_w: Vec<i32> = routes
+        .iter()
+        .map(|r| (r.tracks + 2).max(MIN_CHANNEL))
         .collect();
+    let mut col_w = vec![0i32; n_cols];
+    for n in nodes.iter() {
+        col_w[n.layer] = col_w[n.layer].max(n.size().x);
+    }
     let mut chan_x = vec![0i32; n_chan];
     let mut col_x = vec![0i32; n_cols];
     let mut x = 0;
@@ -512,25 +992,11 @@ pub fn layout_def<'a>(
     }
     chan_x[n_cols] = x;
     let col_right = |c: usize| col_x[c] + col_w[c];
-
-    // ---- emit placements ----
-    let mut out = EditorData {
-        version: crate::doc::EDITOR_VERSION,
-        auto: true,
-        ..EditorData::default()
-    };
-    for n in &nodes {
-        let g = InstGeom {
-            pos: gp(col_x[n.layer], n.y),
-            orient: n.orient,
-        };
-        match &n.item {
-            ItemRef::Pin(p) => out.pins.insert(p.clone(), g),
-            ItemRef::Instance(i) => out.instances.insert(i.clone(), g),
-        };
+    for n in nodes.iter_mut() {
+        n.x = col_x[n.layer];
     }
 
-    // ---- emit wires ----
+    // ---- wires ----
     let mut segs: Vec<Vec<(GridPt, GridPt)>> = vec![Vec::new(); nets.len()];
     // Stubs inside columns.
     for (ni, ends) in nets.iter().enumerate() {
@@ -540,7 +1006,7 @@ pub fn layout_def<'a>(
         for e in ends {
             let n = &nodes[e.node];
             let (p, side) = n.port(e.port);
-            let at = gp(col_x[n.layer] + p.x, n.y + p.y);
+            let at = gp(n.x + p.x, n.y + p.y);
             match side {
                 Side::Right => {
                     let r = col_right(n.layer);
@@ -555,7 +1021,7 @@ pub fn layout_def<'a>(
                         at.y - 1
                     };
                     segs[ni].push((at, gp(at.x, y)));
-                    segs[ni].push((gp(at.x, y), gp(col_x[n.layer], y)));
+                    segs[ni].push((gp(at.x, y), gp(n.x, y)));
                 }
                 Side::Left => {}
             }
@@ -566,51 +1032,26 @@ pub fn layout_def<'a>(
         segs[ni].push((gp(col_x[col], y), gp(col_right(col), y)));
     }
     // Channels.
-    for (c, pts) in chan_pts.iter().enumerate() {
+    for (c, r) in routes.iter().enumerate() {
         let left_x = chan_x[c];
         let right_x = if c < n_cols {
             col_x[c]
         } else {
             chan_x[c] + chan_w[c]
         };
-        let mut by_net: HashMap<usize, Vec<Pt>> = HashMap::new();
-        for p in pts {
-            by_net.entry(p.net).or_default().push(*p);
-        }
-        for (ni, ps) in by_net {
-            match tracks[c].get(&ni) {
-                None => {
-                    // All at one height: one straight segment across.
-                    let y = ps[0].y;
-                    let has_l = ps.iter().any(|p| p.left);
-                    let has_r = ps.iter().any(|p| !p.left);
-                    if has_l && has_r {
-                        segs[ni].push((gp(left_x, y), gp(right_x, y)));
-                    }
-                }
-                Some(&t) => {
-                    let tx = left_x + 1 + t;
-                    let y0 = ps.iter().map(|p| p.y).min().expect("points");
-                    let y1 = ps.iter().map(|p| p.y).max().expect("points");
-                    segs[ni].push((gp(tx, y0), gp(tx, y1)));
-                    for p in ps {
-                        if p.left {
-                            segs[ni].push((gp(left_x, p.y), gp(tx, p.y)));
-                        } else {
-                            segs[ni].push((gp(tx, p.y), gp(right_x, p.y)));
-                        }
-                    }
-                }
-            }
+        let tx = |t: i32| left_x + 1 + t;
+        for p in &r.pieces {
+            let (net, a, b) = match *p {
+                Piece::Across { net, y } => (net, gp(left_x, y), gp(right_x, y)),
+                Piece::Vertical { net, t, y0, y1 } => (net, gp(tx(t), y0), gp(tx(t), y1)),
+                Piece::LeftStub { net, t, y } => (net, gp(left_x, y), gp(tx(t), y)),
+                Piece::RightStub { net, t, y } => (net, gp(tx(t), y), gp(right_x, y)),
+                Piece::Jog { net, t0, t1, y } => (net, gp(tx(t0), y), gp(tx(t1), y)),
+            };
+            segs[net].push((a, b));
         }
     }
-    for (ni, s) in segs.into_iter().enumerate() {
-        if s.is_empty() {
-            continue;
-        }
-        out.wires.insert(def.nets[ni].id.clone(), net_geom(s));
-    }
-    out
+    segs
 }
 
 /// Build a [`NetGeom`] from segments: drop degenerate ones, merge collinear overlapping or
@@ -709,7 +1150,7 @@ pub fn junctions(g: &NetGeom) -> Vec<GridPt> {
     out
 }
 
-fn on_interior(p: GridPt, a: GridPt, b: GridPt) -> bool {
+pub(crate) fn on_interior(p: GridPt, a: GridPt, b: GridPt) -> bool {
     if a.y == b.y && p.y == a.y {
         p.x > a.x.min(b.x) && p.x < a.x.max(b.x)
     } else if a.x == b.x && p.x == a.x {
@@ -719,206 +1160,8 @@ fn on_interior(p: GridPt, a: GridPt, b: GridPt) -> bool {
     }
 }
 
-fn on_segment(p: GridPt, a: GridPt, b: GridPt) -> bool {
+pub(crate) fn on_segment(p: GridPt, a: GridPt, b: GridPt) -> bool {
     p == a || p == b || on_interior(p, a, b)
-}
-
-/// Layout state for ordering and y placement.
-struct Ctx<'a> {
-    nodes: Vec<Node>,
-    lanes: Vec<(usize, usize)>,
-    nets: &'a [Vec<End>],
-    node_nets: Vec<Vec<(usize, usize)>>,
-    cols: Vec<Vec<Item>>,
-    /// Lane y by lane index.
-    ys: Vec<i32>,
-}
-
-impl Ctx<'_> {
-    fn height(&self, it: Item) -> i32 {
-        match it {
-            Item::Node(n) => self.nodes[n].height(),
-            Item::Lane(_) => 0,
-        }
-    }
-
-    fn gap(&self, a: Item, b: Item) -> i32 {
-        match (a, b) {
-            (Item::Node(_), Item::Node(_)) => NODE_GAP,
-            _ => LANE_GAP,
-        }
-    }
-
-    fn top(&self, it: Item) -> i32 {
-        match it {
-            Item::Node(n) => self.nodes[n].y,
-            Item::Lane(l) => self.ys[l],
-        }
-    }
-
-    fn set_top(&mut self, it: Item, y: i32) {
-        match it {
-            Item::Node(n) => self.nodes[n].y = y,
-            Item::Lane(l) => self.ys[l] = y,
-        }
-    }
-
-    /// Stack every column top-down in its current order.
-    fn pack_initial(&mut self) {
-        self.ys = vec![0; self.lanes.len()];
-        for c in 0..self.cols.len() {
-            self.pack(c);
-        }
-    }
-
-    fn pack(&mut self, c: usize) {
-        let mut y = 0;
-        let mut prev: Option<Item> = None;
-        for i in 0..self.cols[c].len() {
-            let it = self.cols[c][i];
-            if let Some(p) = prev {
-                y += self.height(p) + self.gap(p, it);
-            }
-            self.set_top(it, y);
-            prev = Some(it);
-        }
-    }
-
-    /// Mean y of the points of each net in channel `chan` contributed by column `col` (its
-    /// right side if `col < chan`... i.e. the side facing the channel).
-    fn net_anchors(&self, col: usize, facing_right: bool) -> HashMap<usize, (f64, u32)> {
-        let mut acc: HashMap<usize, (f64, u32)> = HashMap::new();
-        for &it in &self.cols[col] {
-            match it {
-                Item::Node(n) => {
-                    let node = &self.nodes[n];
-                    for &(ni, p) in &self.node_nets[n] {
-                        let (pos, side) = node.port(p);
-                        let faces_right = side == Side::Right;
-                        if faces_right == facing_right {
-                            let e = acc.entry(ni).or_default();
-                            e.0 += f64::from(node.y + pos.y);
-                            e.1 += 1;
-                        }
-                    }
-                }
-                Item::Lane(l) => {
-                    let e = acc.entry(self.lanes[l].0).or_default();
-                    e.0 += f64::from(self.ys[l]);
-                    e.1 += 1;
-                }
-            }
-        }
-        acc
-    }
-
-    /// Desired top of item `it` from the anchors of a neighbouring column (`from_left`: the
-    /// anchors are on the item's left).
-    fn desired(
-        &self,
-        it: Item,
-        anchors: &HashMap<usize, (f64, u32)>,
-        from_left: bool,
-    ) -> Option<f64> {
-        match it {
-            Item::Lane(l) => anchors
-                .get(&self.lanes[l].0)
-                .map(|&(s, n)| s / f64::from(n)),
-            Item::Node(n) => {
-                let node = &self.nodes[n];
-                let (mut s, mut k) = (0.0, 0u32);
-                for &(ni, p) in &self.node_nets[n] {
-                    let (pos, side) = node.port(p);
-                    let faces_left = side != Side::Right;
-                    if faces_left == from_left
-                        && let Some(&(sum, cnt)) = anchors.get(&ni)
-                    {
-                        s += sum / f64::from(cnt) - f64::from(pos.y);
-                        k += 1;
-                    }
-                }
-                (k > 0).then(|| s / f64::from(k))
-            }
-        }
-    }
-
-    /// Barycenter reorder of column `c` against column `other`.
-    fn reorder(&mut self, c: usize, other: usize) {
-        let from_left = other < c;
-        let anchors = self.net_anchors(other, from_left);
-        let items = self.cols[c].clone();
-        let mut keyed: Vec<(f64, usize, Item)> = items
-            .iter()
-            .enumerate()
-            .map(|(i, &it)| {
-                let center = f64::from(self.top(it)) + f64::from(self.height(it)) / 2.0;
-                let k = self
-                    .desired(it, &anchors, from_left)
-                    .map_or(center, |d| d + f64::from(self.height(it)) / 2.0);
-                (k, i, it)
-            })
-            .collect();
-        keyed.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
-        self.cols[c] = keyed.into_iter().map(|k| k.2).collect();
-        self.pack(c);
-        // Unpacked spacing would bias the next column; keep the packed positions centered on
-        // the previous ones.
-        let _ = self.nets;
-    }
-
-    /// Place column `c` by order-preserving least squares toward the desired positions
-    /// (anchors on the left if `left_pass`, falling back to the other side).
-    fn place_column(&mut self, c: usize, left_pass: bool) {
-        let n_cols = self.cols.len();
-        let empty = HashMap::new();
-        let left = if c > 0 {
-            self.net_anchors(c - 1, true)
-        } else {
-            empty.clone()
-        };
-        let right = if c + 1 < n_cols {
-            self.net_anchors(c + 1, false)
-        } else {
-            empty
-        };
-        let items = self.cols[c].clone();
-        let desired: Vec<Option<f64>> = items
-            .iter()
-            .map(|&it| {
-                let (a, b) = if left_pass {
-                    (&left, &right)
-                } else {
-                    (&right, &left)
-                };
-                let (fa, fb) = if left_pass {
-                    (true, false)
-                } else {
-                    (false, true)
-                };
-                self.desired(it, a, fa).or_else(|| self.desired(it, b, fb))
-            })
-            .collect();
-        // Offsets of each item if packed tightly.
-        let mut gaps = Vec::with_capacity(items.len());
-        for i in 0..items.len() {
-            gaps.push(if i == 0 {
-                0
-            } else {
-                self.height(items[i - 1]) + self.gap(items[i - 1], items[i])
-            });
-        }
-        let tops = pav_place(
-            &desired,
-            &gaps,
-            &items
-                .iter()
-                .map(|&it| f64::from(self.top(it)))
-                .collect::<Vec<_>>(),
-        );
-        for (it, y) in items.into_iter().zip(tops) {
-            self.set_top(it, y);
-        }
-    }
 }
 
 /// Order-preserving placement: minimize Σ (y_i − d_i)² over items with a desired position `d_i`
@@ -1032,199 +1275,6 @@ fn topo_order(dag: &[Vec<usize>], pred: &[Vec<usize>]) -> Vec<usize> {
     out
 }
 
-/// Assign tracks in one channel. Input: `(net, y, left)` points (`left`: the point is on the
-/// channel's left side). Nets whose points all share one height need no track. Returns the
-/// track index per net.
-fn assign_tracks(pts: impl Iterator<Item = (usize, i32, bool)>) -> HashMap<usize, i32> {
-    let mut span: HashMap<usize, (i32, i32)> = HashMap::new();
-    let mut left_at: HashMap<i32, Vec<usize>> = HashMap::new();
-    let mut right_at: HashMap<i32, Vec<usize>> = HashMap::new();
-    for (net, y, left) in pts {
-        let e = span.entry(net).or_insert((y, y));
-        e.0 = e.0.min(y);
-        e.1 = e.1.max(y);
-        if left {
-            left_at.entry(y).or_default().push(net)
-        } else {
-            right_at.entry(y).or_default().push(net)
-        }
-    }
-    let mut need: Vec<usize> = span
-        .iter()
-        .filter(|(_, s)| s.0 != s.1)
-        .map(|(&n, _)| n)
-        .collect();
-    need.sort_by_key(|n| (span[n].0, span[n].1, *n));
-    let needs: HashSet<usize> = need.iter().copied().collect();
-    // Constraint a → b: a's track left of b's (a has a left point and b a right point at the
-    // same height). Straight nets (no track) do not constrain.
-    let mut after: HashMap<usize, Vec<usize>> = HashMap::new();
-    let mut indeg: HashMap<usize, usize> = need.iter().map(|&n| (n, 0)).collect();
-    for (y, ls) in &left_at {
-        if let Some(rs) = right_at.get(y) {
-            for &a in ls {
-                for &b in rs {
-                    if a != b && needs.contains(&a) && needs.contains(&b) {
-                        after.entry(a).or_default().push(b);
-                        *indeg.get_mut(&b).expect("needs") += 1;
-                    }
-                }
-            }
-        }
-    }
-    let mut track: HashMap<usize, i32> = HashMap::new();
-    let mut used: Vec<Vec<(i32, i32)>> = Vec::new();
-    let mut done: HashSet<usize> = HashSet::new();
-    let mut min_track: HashMap<usize, i32> = HashMap::new();
-    while done.len() < need.len() {
-        // Next ready net in span order (or, on a cycle, the first pending one).
-        let pick = need
-            .iter()
-            .copied()
-            .find(|n| !done.contains(n) && indeg[n] == 0)
-            .or_else(|| need.iter().copied().find(|n| !done.contains(n)))
-            .expect("pending");
-        let (a, b) = span[&pick];
-        let mut t = *min_track.get(&pick).unwrap_or(&0);
-        loop {
-            if used.len() <= t as usize {
-                used.push(Vec::new());
-            }
-            if used[t as usize].iter().all(|&(c, d)| b < c || a > d) {
-                break;
-            }
-            t += 1;
-        }
-        used[t as usize].push((a, b));
-        track.insert(pick, t);
-        done.insert(pick);
-        for &s in after.get(&pick).map_or(&[][..], Vec::as_slice) {
-            if let Some(d) = indeg.get_mut(&s) {
-                *d = d.saturating_sub(1);
-            }
-            let m = min_track.entry(s).or_insert(0);
-            *m = (*m).max(t + 1);
-        }
-    }
-    track
-}
-
-/// Invariant violations of a def's geometry (empty = fine): overlapping symbols, wires passing
-/// through a symbol's interior, a net end not on its wires, a net whose wires are disconnected.
-pub fn check(doc: &Document, def_id: &str) -> Vec<String> {
-    let mut errs = Vec::new();
-    let Some(def) = doc.def(def_id) else {
-        return vec![format!("no def {def_id}")];
-    };
-    let Some(ed) = doc.editor(def_id) else {
-        return vec![format!("no geometry for {def_id}")];
-    };
-    let placed = doc.placed(def_id);
-    if placed.len() != def.instances.len() + def.pins.len() {
-        errs.push(format!(
-            "{def_id}: {} of {} items placed",
-            placed.len(),
-            def.instances.len() + def.pins.len()
-        ));
-    }
-    // Overlaps (sweep by x).
-    let mut rects: Vec<(GridRect, &Placed)> = placed.iter().map(|p| (p.rect(), p)).collect();
-    rects.sort_by_key(|r| r.0.min.x);
-    for i in 0..rects.len() {
-        for j in i + 1..rects.len() {
-            if rects[j].0.min.x >= rects[i].0.max.x {
-                break;
-            }
-            if rects[i].0.overlaps(&rects[j].0) {
-                errs.push(format!(
-                    "{def_id}: {:?} overlaps {:?}",
-                    rects[i].1.item, rects[j].1.item
-                ));
-            }
-        }
-    }
-    let by_item: HashMap<&ItemRef, &Placed> = placed.iter().map(|p| (&p.item, p)).collect();
-    for net in &def.nets {
-        let ends: Vec<GridPt> = net
-            .ends
-            .iter()
-            .filter_map(|e| {
-                let (item, port) = match e {
-                    Endpoint::Pin(n) => (ItemRef::Pin(n.clone()), n.as_str()),
-                    Endpoint::Port { inst, port } => {
-                        (ItemRef::Instance(inst.clone()), port.as_str())
-                    }
-                };
-                by_item.get(&item)?.port_pos(port)
-            })
-            .collect();
-        if ends.len() < 2 {
-            continue;
-        }
-        let Some(g) = ed.wires.get(&net.id) else {
-            errs.push(format!("{def_id}: net {} has no wires", net.id));
-            continue;
-        };
-        let segs: Vec<(GridPt, GridPt)> = g.segments().collect();
-        for &p in &ends {
-            if !segs.iter().any(|&(a, b)| on_segment(p, a, b)) {
-                errs.push(format!("{def_id}: net {}: end {p:?} not on a wire", net.id));
-            }
-        }
-        // Connectivity: union-find over segments that touch.
-        let mut parent: Vec<usize> = (0..segs.len()).collect();
-        fn find(p: &mut [usize], i: usize) -> usize {
-            let mut i = i;
-            while p[i] != i {
-                p[i] = p[p[i]];
-                i = p[i];
-            }
-            i
-        }
-        for i in 0..segs.len() {
-            for j in i + 1..segs.len() {
-                let (a, b) = segs[i];
-                let (c, d) = segs[j];
-                if on_segment(c, a, b)
-                    || on_segment(d, a, b)
-                    || on_segment(a, c, d)
-                    || on_segment(b, c, d)
-                {
-                    let (ri, rj) = (find(&mut parent, i), find(&mut parent, j));
-                    parent[ri] = rj;
-                }
-            }
-        }
-        let roots: HashSet<usize> = (0..segs.len()).map(|i| find(&mut parent, i)).collect();
-        if roots.len() > 1 {
-            errs.push(format!(
-                "{def_id}: net {} wires form {} pieces",
-                net.id,
-                roots.len()
-            ));
-        }
-        // Wires outside symbol interiors.
-        for &(a, b) in &segs {
-            for (r, p) in &rects {
-                let lo = gp(a.x.min(b.x), a.y.min(b.y));
-                let hi = gp(a.x.max(b.x), a.y.max(b.y));
-                let inside = if a.y == b.y {
-                    a.y > r.min.y && a.y < r.max.y && lo.x < r.max.x && hi.x > r.min.x
-                } else {
-                    a.x > r.min.x && a.x < r.max.x && lo.y < r.max.y && hi.y > r.min.y
-                };
-                if inside {
-                    errs.push(format!(
-                        "{def_id}: net {} wire {a:?}-{b:?} crosses {:?}",
-                        net.id, p.item
-                    ));
-                }
-            }
-        }
-    }
-    errs
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1232,7 +1282,7 @@ mod tests {
     use std::time::Instant;
 
     fn check_all(doc: &Document) {
-        let mut errs = Vec::new();
+        let mut errs: Vec<String> = Vec::new();
         for id in crate::doc::reachable_defs(&doc.design) {
             errs.extend(check(doc, &id));
         }
@@ -1274,6 +1324,49 @@ mod tests {
         doc.layout_missing();
         eprintln!("flat Panda-8 laid out in {:?}", t0.elapsed());
         check_all(&doc);
+        // Prefix groups become disjoint blocks, nested ones inside their parents, each with a
+        // name label.
+        let top = doc.design.top.clone();
+        let ed = &doc.editors[&top];
+        let placed = doc.placed(&top);
+        let group_box = |prefix: &str| {
+            placed
+                .iter()
+                .filter(|p| matches!(&p.item, ItemRef::Instance(id) if id.starts_with(prefix)))
+                .map(|p| p.rect())
+                .reduce(|a, b| a.union(&b))
+                .expect("group members")
+        };
+        let level1 = ["cpu.alu.", "cpu.ctl.", "cpu.rf.", "cpu.pc.", "cpu.ir."];
+        for (i, a) in level1.iter().enumerate() {
+            assert!(group_box("cpu.").contains(group_box(a).min), "{a}");
+            for b in &level1[i + 1..] {
+                assert!(!group_box(a).overlaps(&group_box(b)), "{a} overlaps {b}");
+            }
+        }
+        assert!(!group_box("cpu.").overlaps(&group_box("rom.")));
+        for name in ["cpu", "rom", "cpu.alu", "cpu.rf"] {
+            assert!(ed.labels.iter().any(|l| l.text == name), "label {name}");
+        }
+    }
+
+    #[test]
+    fn layout_is_deterministic() {
+        let design = panda_cpu8::panda8(
+            &panda_cpu8::programs::BENCH_LOOP.image(),
+            panda_cpu8::Variant::Flat,
+        );
+        let a = layout_defs(&design, &HashMap::new(), std::slice::from_ref(&design.top));
+        let b = layout_defs(&design, &HashMap::new(), std::slice::from_ref(&design.top));
+        assert!(a == b);
+    }
+
+    #[test]
+    fn labels_shorten_from_the_left() {
+        assert_eq!(fit_label("cpu.alu", 20), "cpu.alu");
+        assert_eq!(fit_label("cpu.rf.w0.ff1.master", 4), "…master");
+        assert_eq!(fit_label("cpu.rf.w0", 3), "…rf.w0");
+        assert_eq!(fit_label("cpu.rf.w0", 1), "w0");
     }
 
     #[test]
@@ -1287,14 +1380,5 @@ mod tests {
         // The first two conflict and meet in the middle; the last one is free.
         assert_eq!(y[3], 30);
         assert_eq!(y[0], 3);
-    }
-
-    #[test]
-    fn tracks_avoid_stub_overlaps() {
-        // Net 0: left at y=0, right at y=4. Net 1: left at y=4, right at y=8.
-        // Net 0's right stub at y=4 must start right of net 1's track.
-        let t =
-            assign_tracks([(0, 0, true), (0, 4, false), (1, 4, true), (1, 8, false)].into_iter());
-        assert!(t[&1] < t[&0], "{t:?}");
     }
 }

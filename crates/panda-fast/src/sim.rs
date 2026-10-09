@@ -930,6 +930,26 @@ impl FastSim {
         self.values_ref()[net as usize]
     }
 
+    /// True if reading any of `nets` needs the lazy nets brought up to date first (the
+    /// `lazy` argument of [`FastSim::sample_into`]).
+    pub fn needs_materialize(&self, nets: &[NetIdx]) -> bool {
+        nets.iter()
+            .any(|&n| self.prog.lazy_owner[n as usize] != NONE)
+    }
+
+    /// Append the values of `nets` to `out`: the per-event waveform-sampling path, with the
+    /// lazy-net check hoisted out (`lazy` = [`FastSim::needs_materialize`] of the same list,
+    /// computed once per run). Same values as [`FastSim::get`].
+    #[inline]
+    pub fn sample_into(&self, nets: &[NetIdx], lazy: bool, out: &mut Vec<Logic>) {
+        debug_assert_eq!(lazy, self.needs_materialize(nets));
+        if lazy {
+            self.materialize();
+        }
+        let v = self.values_ref();
+        out.extend(nets.iter().map(|&n| v[n as usize]));
+    }
+
     /// Values of all nets at the settled point (index = [`NetIdx`]); exactly FastRef's.
     pub fn values(&self) -> &[Logic] {
         self.materialize();

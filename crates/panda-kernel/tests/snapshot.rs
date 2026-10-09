@@ -212,3 +212,39 @@ fn pending_inputs_survive_snapshots() {
         );
     }
 }
+
+/// `snapshot_into` (buffer-reusing) produces exactly what `snapshot` produces, including after
+/// input changes (applied and pending) and in both modes.
+#[test]
+fn snapshot_into_matches_snapshot() {
+    for mode in [Mode::Timing, Mode::Fast] {
+        let (mut k, _, _, _) = cpu_kernel(mode);
+        let mut reused = k.snapshot();
+        for i in 0..6u64 {
+            k.step(7, StepUnit::Cycle);
+            if i == 2 {
+                // An unknown pin is fine to ignore; any top-level input works.
+                let pin = k
+                    .netlist()
+                    .unwrap()
+                    .top_inputs
+                    .first()
+                    .map(|p| p.name.clone());
+                if let Some(pin) = pin {
+                    let w = k.netlist().unwrap().top_inputs[0].nets.len();
+                    let v = panda_netlist::Value::from_bits(&vec![Logic::One; w]);
+                    k.set_input(&pin, &v).unwrap();
+                }
+            }
+            let want = k.snapshot();
+            let ptr = reused.values().as_ptr();
+            k.snapshot_into(&mut reused);
+            assert_eq!(reused.tick(), want.tick(), "{mode:?} {i}");
+            assert_eq!(reused.mode(), want.mode());
+            assert_eq!(reused.values(), want.values());
+            assert_eq!(reused.inputs(), want.inputs());
+            assert_eq!(reused.pending_inputs(), want.pending_inputs());
+            assert_eq!(reused.values().as_ptr(), ptr, "values buffer reused");
+        }
+    }
+}

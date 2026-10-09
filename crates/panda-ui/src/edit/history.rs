@@ -4,6 +4,12 @@
 //! The forward action applies fine-grained [`EditOp`]s (`AddNet`, `Connect`, …) through an
 //! [`EditTarget`]; undo and redo restore the recorded states with one `ReplaceDef` per changed
 //! def plus the recorded geometry, which is exact whatever the forward ops were.
+//!
+//! Undo / redo first check that the touched defs are still in the recorded state
+//! ([`Txn::diverged`]); if something outside this history changed them (another module with its
+//! own history, a newly opened document), the history is cleared instead of overwriting that
+//! change. Other modules should record their document changes in the editor's history
+//! ([`crate::edit::shared_editor`], [`crate::edit::commit_change`]) so Ctrl+Z covers them too.
 
 use panda_kernel::EditOp;
 use panda_netlist::{ComponentDef, DefId, Diagnostic};
@@ -81,6 +87,16 @@ impl Txn {
     pub fn structural(&self) -> bool {
         self.defs.iter().any(|(_, b, a)| b.def != a.def)
     }
+
+    /// The first touched def whose current state in `doc` is not the recorded one (the
+    /// `after` state when `applied`, else `before`): something outside this history changed
+    /// it, and restoring the recorded state would silently discard that change.
+    pub fn diverged(&self, doc: &Document, applied: bool) -> Option<DefId> {
+        self.defs.iter().find_map(|(id, b, a)| {
+            let want = if applied { a } else { b };
+            (DefState::capture(doc, id) != *want).then(|| id.clone())
+        })
+    }
 }
 
 /// Undo and redo stacks.
@@ -89,6 +105,7 @@ pub struct History {
     undo: Vec<Txn>,
     redo: Vec<Txn>,
     last_id: Option<u64>,
+    recorded: u64,
     /// Maximum number of undo steps kept.
     pub limit: usize,
 }
@@ -99,6 +116,7 @@ impl Default for History {
             undo: Vec::new(),
             redo: Vec::new(),
             last_id: None,
+            recorded: 0,
             limit: 500,
         }
     }
@@ -125,6 +143,17 @@ impl History {
         self.redo.last().map(|t| t.label.as_str())
     }
 
+    /// Number of actions recorded by [`History::commit`] so far (tells whether a commit
+    /// recorded anything).
+    pub fn recorded(&self) -> u64 {
+        self.recorded
+    }
+
+    /// The action [`History::undo`] would revert.
+    pub fn last_txn(&self) -> Option<&Txn> {
+        self.undo.last()
+    }
+
     /// Kernel command id of the most recent structural submission (action, undo or redo).
     pub fn last_kernel_id(&self) -> Option<u64> {
         self.last_id
@@ -134,6 +163,16 @@ impl History {
     pub fn clear(&mut self) {
         self.undo.clear();
         self.redo.clear();
+    }
+
+    /// `label`'s def `def` was changed outside this history: forget everything (the recorded
+    /// states no longer chain) and describe why.
+    fn diverged(&mut self, label: &str, def: &str) -> String {
+        self.clear();
+        format!(
+            "cannot undo/redo '{label}': def '{def}' was changed outside the edit history; \
+             history cleared"
+        )
     }
 
     /// Run one action: snapshot `defs`, submit `ops` (structure), then apply `geom` to the
@@ -173,6 +212,7 @@ impl History {
                 .collect(),
             kernel_id,
         });
+        self.recorded += 1;
         if self.undo.len() > self.limit {
             self.undo.remove(0);
         }
@@ -185,6 +225,9 @@ impl History {
         let Some(mut txn) = self.undo.pop() else {
             return Ok(None);
         };
+        if let Some(def) = txn.diverged(t.doc(), true) {
+            return Err(self.diverged(&txn.label, &def));
+        }
         let states: Vec<(DefId, DefState)> = txn
             .defs
             .iter()
@@ -212,6 +255,9 @@ impl History {
         let Some(mut txn) = self.redo.pop() else {
             return Ok(None);
         };
+        if let Some(def) = txn.diverged(t.doc(), false) {
+            return Err(self.diverged(&txn.label, &def));
+        }
         let states: Vec<(DefId, DefState)> = txn
             .defs
             .iter()

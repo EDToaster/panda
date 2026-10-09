@@ -91,8 +91,8 @@ impl Registry {
 
 /// Register every feature module. **One line per module**; each module owns its `register`.
 pub fn register_all(reg: &mut Registry) {
+    crate::files::register(reg);
     crate::edit::register(reg);
     crate::hier::register(reg);
-    crate::simui::register(reg);
     crate::simux::register(reg);
 }

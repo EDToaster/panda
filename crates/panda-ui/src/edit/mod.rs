@@ -20,20 +20,36 @@
 //! canvas) with a [`PlaceRequest`]; the canvas then shows a ghost under the pointer and places
 //! the item on the next click / drop. [`current_selection`] gives the current selection (e.g.
 //! for "create package from selection").
+//!
+//! Placing directly at a known grid point (no gesture), undoable like any edit:
+//! [`Editor::place`] on the editor from [`shared_editor`] (or on your own [`Editor`] with any
+//! [`EditTarget`]).
+//!
+//! # Shared undo history (for other modules' document changes)
+//!
+//! Changes made outside this module (packaging, adding library defs, …) should be recorded in
+//! the editor's [`History`] so that Ctrl+Z / Ctrl+Shift+Z cover them in order with the editing
+//! actions: [`commit_change`] (or [`shared_editor`] and [`History::commit`] directly). A change
+//! recorded in a separate history still never gets clobbered — undo detects a def changed
+//! outside its history and clears the history instead ([`Txn::diverged`]) — but it then cannot
+//! be undone with the editing actions.
 
 pub mod actions;
 pub mod history;
 pub mod inspector;
-mod menus;
+pub mod menus;
 pub mod route;
 mod tool;
 
 use std::cell::RefCell;
-use std::rc::Rc;
+use std::collections::HashMap;
+use std::rc::{Rc, Weak};
 
-use panda_netlist::{Atom, Dir, GateOp, Value};
+use panda_kernel::EditOp;
+use panda_netlist::{Atom, DefId, Dir, GateOp, Value};
 
-use crate::app::Registry;
+use crate::app::{AppState, Registry};
+use crate::doc::Document;
 
 pub use actions::{Anchor, Clipboard, Editor, PlaceRequest, Selection, Tool, WireSeg};
 pub use history::{EditTarget, History, Txn};
@@ -47,7 +63,78 @@ pub fn register(reg: &mut Registry) {
     reg.panel(menus::EditMenu::new(ed.clone()));
     reg.panel(menus::PlaceMenu::new(ed.clone()));
     reg.panel(inspector::Inspector::new(ed.clone()));
-    reg.tool(tool::EditTool::new(ed));
+    reg.tool(tool::EditTool::new(ed.clone()));
+    reg.tool(menus::ContextMenu::new(ed));
+}
+
+thread_local! {
+    /// Editors by handle (the UI thread owns them; an egui context names its handle).
+    static EDITORS: RefCell<HashMap<u64, Weak<RefCell<Editor>>>> = RefCell::new(HashMap::new());
+}
+
+fn editor_handle_id() -> egui::Id {
+    egui::Id::new("panda.edit.editor_handle")
+}
+
+/// Make `ed` reachable through [`shared_editor`] for `ctx` (called by the canvas tool every
+/// frame; cheap).
+fn announce_editor(ctx: &egui::Context, handle: u64, ed: &SharedEditor) {
+    if ctx.data(|d| d.get_temp::<u64>(editor_handle_id())) != Some(handle) {
+        ctx.data_mut(|d| d.insert_temp(editor_handle_id(), handle));
+    }
+    EDITORS.with(|m| {
+        let mut m = m.borrow_mut();
+        if !m.contains_key(&handle) {
+            m.retain(|_, w| w.strong_count() > 0);
+            m.insert(handle, Rc::downgrade(ed));
+        }
+    });
+}
+
+/// The editor of the app running in `ctx` (selection, tool, clipboard, undo history), once its
+/// canvas has been shown. UI thread only. Do not hold the borrow across a call back into the
+/// edit module.
+pub fn shared_editor(ctx: &egui::Context) -> Option<SharedEditor> {
+    let h = ctx.data(|d| d.get_temp::<u64>(editor_handle_id()))?;
+    EDITORS.with(|m| m.borrow().get(&h).and_then(Weak::upgrade))
+}
+
+/// Apply a document change made by another module as one undoable action of the editor's
+/// history: `ops` go to the document and the kernel (non-blocking, see
+/// [`AppState::submit_edit`]), then `geom` edits the geometry; `defs` lists every def the
+/// change touches (structure or geometry), so undo / redo restore them exactly.
+///
+/// Returns the kernel command id of the submission (`None` if nothing structural was sent or
+/// nothing changed). Without an editor (canvas not shown yet) the change is applied without
+/// being recorded.
+pub fn commit_change(
+    ctx: &egui::Context,
+    app: &mut AppState,
+    label: &str,
+    defs: &[DefId],
+    ops: Vec<EditOp>,
+    geom: impl FnOnce(&mut Document),
+) -> Result<Option<u64>, String> {
+    match shared_editor(ctx) {
+        Some(ed) => {
+            let mut ed = ed.borrow_mut();
+            let before = ed.history.recorded();
+            ed.history.commit(app, label, defs, ops, geom)?;
+            Ok((ed.history.recorded() > before)
+                .then(|| ed.history.last_txn().and_then(|t| t.kernel_id))
+                .flatten())
+        }
+        None => {
+            let id = if ops.is_empty() {
+                None
+            } else {
+                Some(app.submit_edit(ops).map_err(|d| d.message)?)
+            };
+            geom(&mut app.doc);
+            app.doc.touch();
+            Ok(id)
+        }
+    }
 }
 
 fn place_id() -> egui::Id {

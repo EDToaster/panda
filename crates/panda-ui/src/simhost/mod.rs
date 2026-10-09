@@ -14,7 +14,23 @@
 //!
 //! The UI never waits on the sim thread and vice versa: commands are queued locally when the
 //! channel is full, publication is a lock-free buffer swap, and events that do not fit are kept
-//! in a sim-side outbox (waveform chunks there are dropped first, marked as gaps).
+//! in a sim-side outbox (waveform chunks there are dropped first, marked as gaps; only the newest
+//! diagnostics list is kept). No lock is shared between the UI and the sim thread.
+//!
+//! Isolation guarantees of the sim thread:
+//! * **Publication budget**: a publication (snapshot + shadow checkpoint) may take at most 1 % of
+//!   the sim thread's time; when it is expensive (huge watch sets or designs) the publication
+//!   rate drops below [`SimOptions::publish_hz`] instead of the simulation slowing down.
+//! * **No allocation per publication** once buffers have grown (snapshot slots are reused;
+//!   checkpoint states come from a pool), see `tests/simhost_alloc.rs`.
+//! * **Interruptible steps**: [`Command::Step`] runs in chunks like [`Command::Run`] (snapshots
+//!   keep flowing, [`Command::Pause`] aborts it, drop never waits for it); commands that depend
+//!   on the order (inputs, edits, loads, mode, waves, custom) wait until it finished.
+//! * **Crashes are surfaced**: a panic on the sim thread is reported by [`SimHost::crashed`] and
+//!   as a [`SimEvent::Error`]; a panicking [`Command::Custom`] closure is reported and the
+//!   simulation continues.
+//! * **Pacing**: with [`Speed::CyclesPerSec`] bursts are sized to about one chunk and debt older
+//!   than 100 ms is forgiven (no flat-out catch-up after a slow phase).
 //!
 //! Net indices in [`WatchSet`] / [`WaveConfig`] refer to the netlist of a *design generation*
 //! ([`Snapshot::design_gen`], bumped on every successful load/edit/reset and announced by
@@ -24,12 +40,13 @@
 //!
 //! [`Command::SetWave`] selects signals; changes reach the UI as [`SimEvent::Wave`] chunks
 //! ([`WaveStore`] keeps the history). With the default [`WaveCapture::Shadow`] the sim thread
-//! does **not** sample: it hands a checkpoint (kernel snapshot + input changes) to a shadow
-//! thread at each publication, and the shadow replays the interval on its own kernel with the
-//! observer attached (module `shadow`). Measured on Panda-8 (Fast/JIT), sampling on the sim
+//! does **not** sample: it hands a checkpoint (pooled kernel state + input changes) to a shadow
+//! coordinator at each publication, and up to [`SimOptions::shadow_workers`] replay threads
+//! re-simulate the intervals **in parallel** with the observer attached (module `shadow`), so
+//! capture keeps up with a flat-out run. Measured on Panda-8 (Fast/JIT), sampling on the sim
 //! thread ([`WaveCapture::Inline`]) costs ≈ 0.45 % throughput per sampled net (≈ 17 % for
-//! 8 bus signals); shadow capture costs one snapshot per publication (≈ 15 µs at 120 Hz). Clock
-//! nets are never sampled: [`WaveStore`] synthesizes them.
+//! 8 bus signals); shadow capture costs one state copy per publication (≈ 15 µs at 120 Hz).
+//! Clock nets are never sampled: [`WaveStore`] synthesizes them.
 //!
 //! Extension point: [`Command::Custom`] runs a closure on the sim thread with the kernel (e.g.
 //! timing reports, classification) and can answer with a [`SimEvent::Custom`] payload.
@@ -41,9 +58,9 @@ pub mod wave;
 
 use std::any::Any;
 use std::collections::VecDeque;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
+use std::sync::{Arc, OnceLock};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -126,6 +143,9 @@ pub enum Command {
     Custom(CustomFn),
     /// Stop the thread.
     Quit,
+    /// Panic on the sim thread (tests of crash reporting).
+    #[cfg(test)]
+    Crash,
 }
 
 impl std::fmt::Debug for Command {
@@ -146,6 +166,8 @@ impl std::fmt::Debug for Command {
             Command::SetChunk(d) => write!(f, "SetChunk({d:?})"),
             Command::Custom(_) => write!(f, "Custom"),
             Command::Quit => write!(f, "Quit"),
+            #[cfg(test)]
+            Command::Crash => write!(f, "Crash"),
         }
     }
 }
@@ -290,6 +312,10 @@ pub struct SimOptions {
     pub event_capacity: usize,
     /// Waveform capture strategy.
     pub wave_capture: WaveCapture,
+    /// Max shadow replay threads ([`WaveCapture::Shadow`]; started on demand). Replaying with
+    /// sampling is slower than the main run, so keeping up with a flat-out simulation takes
+    /// about `1 + 0.0045 × sampled nets` workers on Panda-8.
+    pub shadow_workers: usize,
 }
 
 impl Default for SimOptions {
@@ -301,7 +327,28 @@ impl Default for SimOptions {
             command_capacity: 1024,
             event_capacity: 256,
             wave_capture: WaveCapture::default(),
+            shadow_workers: default_shadow_workers(),
         }
+    }
+}
+
+/// A quarter of the cores, between 1 and 4.
+fn default_shadow_workers() -> usize {
+    std::thread::available_parallelism().map_or(2, |n| (n.get() / 4).clamp(1, 4))
+}
+
+/// How long [`SimHost::shutdown`] waits for the sim thread before detaching it (it only takes
+/// long when the thread is inside one long kernel call, e.g. loading a huge design).
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The message of a caught panic payload.
+pub(crate) fn panic_message(p: &(dyn Any + Send)) -> String {
+    if let Some(s) = p.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = p.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic".to_string()
     }
 }
 
@@ -313,6 +360,9 @@ pub struct SimHost {
     events: Receiver<SimEvent>,
     backlog: VecDeque<Command>,
     thread: Option<JoinHandle<()>>,
+    /// Set (once) if the sim thread panicked.
+    crash: Arc<OnceLock<String>>,
+    crash_reported: bool,
 }
 
 impl SimHost {
@@ -323,9 +373,21 @@ impl SimHost {
         let pending = Arc::new(AtomicBool::new(false));
         let (w, r) = triple::triple_buffer(Snapshot::default());
         let p = pending.clone();
+        let crash = Arc::new(OnceLock::new());
+        let c = crash.clone();
         let thread = std::thread::Builder::new()
             .name("panda-sim".into())
-            .spawn(move || thread::SimThread::new(opts, rx, p, w, etx).run())
+            .spawn(move || {
+                let etx2 = etx.clone();
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                    thread::SimThread::new(opts, rx, p, w, etx).run();
+                }));
+                if let Err(payload) = r {
+                    let msg = panic_message(payload.as_ref());
+                    let _ = c.set(msg.clone());
+                    let _ = etx2.try_send(SimEvent::Error(crash_text(&msg)));
+                }
+            })
             .expect("spawn sim thread");
         SimHost {
             tx,
@@ -334,7 +396,21 @@ impl SimHost {
             events: erx,
             backlog: VecDeque::new(),
             thread: Some(thread),
+            crash,
+            crash_reported: false,
         }
+    }
+
+    /// The panic message if the sim thread crashed (the simulation is then stopped; commands
+    /// are discarded). Also reported once as a [`SimEvent::Error`] by
+    /// [`SimHost::poll_events`].
+    pub fn crashed(&self) -> Option<&str> {
+        self.crash.get().map(String::as_str)
+    }
+
+    /// True while the sim thread is alive.
+    pub fn is_alive(&self) -> bool {
+        self.thread.as_ref().is_some_and(|t| !t.is_finished())
     }
 
     /// Send a command. Never blocks: if the channel is full the command is queued locally and
@@ -379,7 +455,25 @@ impl SimHost {
     /// Drain the events that arrived (never blocks).
     pub fn poll_events(&mut self) -> Vec<SimEvent> {
         self.flush();
-        self.events.try_iter().collect()
+        let mut v: Vec<SimEvent> = self.events.try_iter().collect();
+        self.report_crash(&mut v);
+        v
+    }
+
+    /// Make sure a crash reaches the UI even if its event did not fit into the channel.
+    fn report_crash(&mut self, events: &mut Vec<SimEvent>) {
+        if self.crash_reported {
+            return;
+        }
+        let Some(msg) = self.crash.get() else { return };
+        self.crash_reported = true;
+        let text = crash_text(msg);
+        if !events
+            .iter()
+            .any(|e| matches!(e, SimEvent::Error(m) if *m == text))
+        {
+            events.push(SimEvent::Error(text));
+        }
     }
 
     /// Wait up to `timeout` for the next event (for tests and headless tools; the UI uses
@@ -409,13 +503,24 @@ impl SimHost {
             }
             self.pending.store(true, Ordering::Release);
             // Unblock a sim thread waiting to hand over events.
+            let t0 = std::time::Instant::now();
             while !t.is_finished() {
+                if t0.elapsed() > SHUTDOWN_TIMEOUT {
+                    // Stuck in one long kernel call: detach (it exits when the call returns,
+                    // as the channel is closed).
+                    return;
+                }
                 while self.events.try_recv().is_ok() {}
                 std::thread::sleep(Duration::from_millis(1));
             }
             let _ = t.join();
         }
     }
+}
+
+/// The user-facing text of a sim-thread crash.
+fn crash_text(msg: &str) -> String {
+    format!("simulation thread panicked: {msg}")
 }
 
 impl Drop for SimHost {

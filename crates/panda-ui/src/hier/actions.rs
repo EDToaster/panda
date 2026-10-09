@@ -1,118 +1,77 @@
-//! The hierarchy/files actions on [`AppState`] (GPU-free; the panels in [`super::ui`] only call
-//! these). Shared state between the panels and tools is [`HierState`].
-
-use std::path::Path;
+//! The hierarchy actions on [`AppState`] (GPU-free; the panels in [`super::ui`] only call
+//! these). Shared state between the panels and the canvas tool is [`HierState`].
 
 use panda_netlist::DefId;
 
-use super::change::History;
+use super::change::DocChange;
 use super::classify::Classifier;
-use super::library::{EntryKind, LibEntry, Placeable, add_defs_change, builtin_entries};
-use super::nav::{child_path, parent_path};
+use super::library::{LibEntry, Placeable, add_defs_change, builtin_entries};
+use super::nav::{child_path, parent_path, valid_view};
 use super::package::{fresh_def_id, plan_package};
 use crate::app::AppState;
-use crate::doc::{Document, ItemRef};
-use crate::edit::PlaceRequest;
-use crate::examples::Example;
-use crate::files::{self, RecentFiles};
+use crate::doc::ItemRef;
+use crate::edit::{EditTarget, History, PlaceRequest, SharedEditor};
 
-/// What an open path prompt will do with the text.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PromptKind {
-    /// Open a document.
-    Open,
-    /// Save under a new path.
-    SaveAs,
-    /// Import a ROM from a hex file.
-    ImportRom,
-    /// Name of a package created from the selection.
-    PackageName,
-}
-
-impl PromptKind {
-    /// Dialog title.
-    pub fn title(self) -> &'static str {
-        match self {
-            PromptKind::Open => "Open design",
-            PromptKind::SaveAs => "Save design as",
-            PromptKind::ImportRom => "Import ROM from hex file",
-            PromptKind::PackageName => "Create package from selection",
-        }
-    }
-
-    /// Label of the text field.
-    pub fn field(self) -> &'static str {
-        match self {
-            PromptKind::PackageName => "Package (def) name",
-            PromptKind::ImportRom => "Hex file",
-            _ => "Path",
-        }
-    }
-}
-
-/// A modal text prompt (paths, package names).
+/// The open "create package" prompt.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Prompt {
-    /// Purpose.
-    pub kind: PromptKind,
-    /// Current text.
-    pub text: String,
+pub struct PackagePrompt {
+    /// Package (def) name being typed.
+    pub name: String,
+    /// Instances to package (captured when the prompt opened).
+    pub selection: Vec<String>,
     /// Error of the last attempt.
     pub error: Option<String>,
 }
 
-/// State shared by the hierarchy/files panels and tools.
+/// State shared by the hierarchy panels and tools.
+///
+/// Changes are recorded in the editor-wide undo history ([`crate::edit::shared_editor`]) when
+/// one is given (the app: Ctrl+Z covers them in order with the editing actions), else in
+/// [`HierState::history`] (headless use).
 pub struct HierState {
-    /// Undo/redo of hierarchy changes.
+    /// Fallback undo/redo when there is no shared editor (same type as the editor's).
     pub history: History,
+    /// Kernel command ids of fallback-history changes not yet answered by the sim thread.
+    pub in_flight: Vec<u64>,
     /// Classification badges.
     pub classifier: Classifier,
-    /// Recent documents.
-    pub recent: RecentFiles,
     /// Built-in library entries (parameters edited in the palette).
     pub builtin: Vec<LibEntry>,
-    /// Placement to hand to the edit module's place tool ([`crate::edit::request_place`]) on
-    /// the next frame (set by GPU-free actions such as ROM import).
-    pub pending_place: Option<PlaceRequest>,
-    /// Selection captured when the package-name prompt opened.
-    pub package_selection: Vec<String>,
-    /// Open prompt.
-    pub prompt: Option<Prompt>,
+    /// Open package prompt.
+    pub prompt: Option<PackagePrompt>,
     /// Library search text.
     pub filter: String,
     /// Selected library entry (name), whose parameters are shown.
     pub selected_entry: Option<String>,
     /// Last view seen (to fit the canvas when it changes).
     pub last_view: Option<(String, DefId)>,
+    /// `(top def, revision)` of the document last seen (a new document clears the history).
+    pub last_doc: Option<(DefId, u64)>,
     /// Last message for the user.
     pub status: Option<String>,
 }
 
+impl Default for HierState {
+    fn default() -> Self {
+        HierState::new()
+    }
+}
+
 impl HierState {
-    /// State with the recent-files list stored in `recent`.
-    pub fn new(recent: RecentFiles) -> HierState {
+    /// Fresh state (starts the classification worker).
+    pub fn new() -> HierState {
         HierState {
             history: History::default(),
+            in_flight: Vec::new(),
             classifier: Classifier::new(),
-            recent,
             builtin: builtin_entries(),
-            pending_place: None,
-            package_selection: Vec::new(),
             prompt: None,
             filter: String::new(),
             selected_entry: None,
             last_view: None,
+            last_doc: None,
             status: None,
         }
-    }
-
-    /// State using the user's recent-files list ([`RecentFiles::default_store`]).
-    pub fn with_default_store() -> HierState {
-        HierState::new(
-            RecentFiles::default_store()
-                .map(RecentFiles::load)
-                .unwrap_or_default(),
-        )
     }
 
     fn report(&mut self, app: &mut AppState, msg: String) {
@@ -120,13 +79,81 @@ impl HierState {
         self.status = Some(msg);
     }
 
-    /// Open a prompt.
-    pub fn ask(&mut self, kind: PromptKind, text: String) {
-        self.prompt = Some(Prompt {
-            kind,
-            text,
+    /// Record `c` (apply it to the document and kernel) as one undoable action of `ed`'s
+    /// history, or of the fallback history without an editor.
+    pub fn commit(
+        &mut self,
+        ed: Option<&SharedEditor>,
+        app: &mut AppState,
+        c: &DocChange,
+    ) -> Result<(), String> {
+        match ed {
+            // The edit module rolls back kernel rejections of its own history's actions.
+            Some(ed) => c.commit(&mut ed.borrow_mut().history, app).map(|_| ()),
+            None => {
+                if let Some(id) = c.commit(&mut self.history, app)? {
+                    self.in_flight.push(id);
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Per-frame bookkeeping: forget the history when another document was opened, keep the
+    /// view on an existing def after structural changes (e.g. undoing the package the view
+    /// was in).
+    pub fn sync(&mut self, app: &mut AppState) {
+        let top = app.doc.design.top.clone();
+        let rev = app.doc.revision;
+        let replaced = self
+            .last_doc
+            .as_ref()
+            .is_some_and(|(t, r)| *t != top || rev < *r);
+        if replaced {
+            self.history.clear();
+            self.in_flight.clear();
+            self.prompt = None;
+        }
+        self.last_doc = Some((top, rev));
+        if let Some(path) = valid_view(&app.doc.design, &app.view.path, &app.view.def) {
+            app.enter(&path);
+        }
+    }
+
+    /// The kernel answered command `id`. A rejected change of the fallback history is rolled
+    /// back (document and kernel). Returns the label of a rolled-back change.
+    pub fn edited(&mut self, app: &mut AppState, id: u64, ok: bool) -> Option<String> {
+        let pos = self.in_flight.iter().position(|&x| x == id)?;
+        self.in_flight.remove(pos);
+        if ok {
+            return None;
+        }
+        let label = self.history.rejected(app, id)?;
+        self.report(
+            app,
+            format!("'{label}' was rejected by the kernel and rolled back"),
+        );
+        Some(label)
+    }
+
+    /// Open the package prompt for `selection` with a free default name.
+    pub fn ask_package(&mut self, app: &AppState, selection: Vec<String>) {
+        self.prompt = Some(PackagePrompt {
+            name: default_package_name(app),
+            selection,
             error: None,
         });
+    }
+
+    /// Create the package of the open prompt. On error the prompt stays open with the message.
+    pub fn submit_prompt(&mut self, ed: Option<&SharedEditor>, app: &mut AppState) {
+        let Some(mut p) = self.prompt.take() else {
+            return;
+        };
+        if let Err(e) = create_package(self, ed, app, &p.selection, &p.name) {
+            p.error = Some(e);
+            self.prompt = Some(p);
+        }
     }
 }
 
@@ -160,7 +187,7 @@ pub fn enter_instance(app: &mut AppState, inst: &str) -> bool {
     ok
 }
 
-/// Go to the enclosing instance; the instance just left is selected there. False at the top.
+/// Go to the enclosing instance; the instance just left is highlighted there. False at the top.
 pub fn exit(app: &mut AppState) -> bool {
     let Some(parent) = parent_path(&app.view.path) else {
         return false;
@@ -180,20 +207,19 @@ pub fn exit(app: &mut AppState) -> bool {
     ok
 }
 
-/// Create a package named `name` from the instances `sel` of the viewed def and select the
-/// new instance. Returns the instance id.
+/// Create a package named `name` from the instances `sel` of the viewed def (one undoable
+/// action) and highlight the new instance. Returns the instance id.
 pub fn create_package(
     hs: &mut HierState,
+    ed: Option<&SharedEditor>,
     app: &mut AppState,
     sel: &[String],
     name: &str,
 ) -> Result<String, String> {
     let def = app.view.def.clone();
-    let plan = plan_package(&app.doc, &def, sel, name.trim())?;
+    let plan = plan_package(EditTarget::doc(app), &def, sel, name.trim())?;
     let inst = plan.instance.clone();
-    hs.history
-        .apply(app, (&plan).into())
-        .map_err(|d| d.to_string())?;
+    hs.commit(ed, app, &DocChange::from(&plan))?;
     app.highlights.items.clear();
     app.highlights.items.insert(ItemRef::Instance(inst.clone()));
     let msg = format!(
@@ -211,137 +237,60 @@ pub fn default_package_name(app: &AppState) -> String {
     fresh_def_id(&app.doc.design, "pkg")
 }
 
-/// Prepare placing library entry `e` into the viewed def: blocks first get their defs added
-/// (an undoable change), then the edit module's place tool takes over. Returns the request
-/// for [`crate::edit::request_place`].
-pub fn arm_entry(hs: &mut HierState, app: &mut AppState, e: &LibEntry) -> Result<PlaceRequest, String> {
+/// Prepare placing library entry `e` into the viewed def: blocks first get their missing defs
+/// added (an undoable action), then the edit module's place tool takes over. Returns the
+/// request for [`crate::edit::request_place`].
+pub fn arm_entry(
+    hs: &mut HierState,
+    ed: Option<&SharedEditor>,
+    app: &mut AppState,
+    e: &LibEntry,
+) -> Result<PlaceRequest, String> {
     if !e.allowed_in(&app.doc.design, &app.view.def) {
-        return Err(format!("'{}' cannot be placed into '{}'", e.name, app.view.def));
+        return Err(format!(
+            "'{}' cannot be placed into '{}'",
+            e.name, app.view.def
+        ));
     }
     match e.resolve(&app.doc.design)? {
         Placeable::Atom(a) => Ok(PlaceRequest::Atom(a)),
         Placeable::Def { id, new_defs } => {
-            if let Some(c) = add_defs_change(&app.doc, &new_defs, &format!("Add {}", e.name)) {
-                hs.history.apply(app, c).map_err(|d| d.to_string())?;
+            if let Some(c) = add_defs_change(&app.doc, &new_defs, &format!("Add {id}")) {
+                hs.commit(ed, app, &c)?;
             }
-            if matches!(e.kind, EntryKind::Block(_)) {
-                hs.status = Some(format!("placing {id}"));
-            }
+            hs.status = Some(format!("placing {id}: click the canvas"));
             Ok(PlaceRequest::Def(id))
         }
     }
 }
 
-/// Undo the last hierarchy change.
+/// Undo the last change of the fallback history (in the app, the Edit menu / Ctrl+Z undo
+/// hierarchy changes together with the editing actions).
 pub fn undo(hs: &mut HierState, app: &mut AppState) {
-    if let Some(r) = hs.history.undo(app) {
-        let msg = match r {
-            Ok(l) => format!("undid: {l}"),
-            Err(e) => format!("cannot undo: {e}"),
-        };
-        hs.report(app, msg);
-    }
-}
-
-/// Redo the last undone hierarchy change.
-pub fn redo(hs: &mut HierState, app: &mut AppState) {
-    if let Some(r) = hs.history.redo(app) {
-        let msg = match r {
-            Ok(l) => format!("redid: {l}"),
-            Err(e) => format!("cannot redo: {e}"),
-        };
-        hs.report(app, msg);
-    }
-}
-
-fn open_doc(hs: &mut HierState, app: &mut AppState, doc: Document) {
-    hs.history.clear();
-    hs.pending_place = None;
-    hs.last_view = None;
-    app.open_document(doc);
-}
-
-/// New empty document.
-pub fn new_document(hs: &mut HierState, app: &mut AppState) {
-    let mut doc = Document::new(files::new_design());
-    doc.layout_missing();
-    open_doc(hs, app, doc);
-    hs.report(app, "new design".into());
-}
-
-/// Open a built-in example (laid out on a worker thread by the shell).
-pub fn open_example(hs: &mut HierState, app: &mut AppState, e: &Example) {
-    open_doc(hs, app, Document::new((e.build)()));
-    hs.report(app, format!("opened example '{}'", e.name));
-}
-
-/// Open the document at `path` and remember it in the recent files.
-pub fn open_file(hs: &mut HierState, app: &mut AppState, path: &Path) -> Result<(), String> {
-    match files::read_document(path) {
-        Ok(doc) => {
-            open_doc(hs, app, doc);
-            hs.recent.push(path);
-            hs.report(app, format!("opened {}", path.display()));
-            Ok(())
-        }
-        Err(e) => {
-            if !path.exists() {
-                hs.recent.remove(path);
-            }
-            Err(e)
-        }
-    }
-}
-
-/// Save to `path` (or the document's own path). Errors if there is neither.
-pub fn save(hs: &mut HierState, app: &mut AppState, path: Option<&Path>) -> Result<(), String> {
-    let path = path
-        .map(Path::to_path_buf)
-        .or_else(|| app.doc.path.clone())
-        .ok_or_else(|| "no file name yet: use Save As".to_string())?;
-    files::write_document(&mut app.doc, &path)?;
-    hs.recent.push(&path);
-    hs.report(app, format!("saved {}", path.display()));
-    Ok(())
-}
-
-/// Import a ROM from a hex file as a new def and request its placement.
-pub fn import_rom_file(hs: &mut HierState, app: &mut AppState, path: &Path) -> Result<DefId, String> {
-    let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let imp = files::import_rom(&app.doc, &text, &files::rom_name(path), None)?;
-    hs.history
-        .apply(app, imp.change.clone())
-        .map_err(|d| d.to_string())?;
-    hs.pending_place = Some(PlaceRequest::Def(imp.def.clone()));
-    let msg = format!(
-        "imported ROM '{}' ({} words, {}x{} bits): click the canvas to place it",
-        imp.def, imp.words, imp.addr_bits, imp.data_bits
-    );
-    hs.report(app, msg);
-    Ok(imp.def)
-}
-
-/// Carry out the open prompt with its text. On error the prompt stays open with the message.
-pub fn submit_prompt(hs: &mut HierState, app: &mut AppState) {
-    let Some(p) = hs.prompt.take() else { return };
-    let text = p.text.trim().to_string();
-    let r = match p.kind {
-        PromptKind::Open => open_file(hs, app, Path::new(&text)),
-        PromptKind::SaveAs => save(hs, app, Some(&files::with_extension(&text))),
-        PromptKind::ImportRom => import_rom_file(hs, app, Path::new(&text)).map(|_| ()),
-        PromptKind::PackageName => {
-            let sel = std::mem::take(&mut hs.package_selection);
-            let r = create_package(hs, app, &sel, &text).map(|_| ());
-            if r.is_err() {
-                hs.package_selection = sel;
-            }
-            r
-        }
+    let msg = match hs.history.undo(app) {
+        Ok(Some(l)) => format!("undid: {l}"),
+        Ok(None) => return,
+        Err(e) => format!("cannot undo: {e}"),
     };
-    if let Err(e) = r {
-        hs.prompt = Some(Prompt {
-            error: Some(e),
-            ..p
-        });
+    track(hs);
+    hs.report(app, msg);
+}
+
+/// Redo the last undone change of the fallback history.
+pub fn redo(hs: &mut HierState, app: &mut AppState) {
+    let msg = match hs.history.redo(app) {
+        Ok(Some(l)) => format!("redid: {l}"),
+        Ok(None) => return,
+        Err(e) => format!("cannot redo: {e}"),
+    };
+    track(hs);
+    hs.report(app, msg);
+}
+
+fn track(hs: &mut HierState) {
+    if let Some(id) = hs.history.last_kernel_id()
+        && !hs.in_flight.contains(&id)
+    {
+        hs.in_flight.push(id);
     }
 }

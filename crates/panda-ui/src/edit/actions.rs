@@ -494,8 +494,16 @@ impl Editor {
     }
 
     /// Keep the selection consistent with the view (`path`, `def`) and the document: clears it
-    /// when the view changes, drops items that no longer exist after other changes.
+    /// when the view changes, drops items that no longer exist after other changes. Clears the
+    /// history too when a different document was opened.
     pub fn sync(&mut self, doc: &Document, path: &str, def: &str) {
+        // Revisions only grow within one document: a smaller one means another document was
+        // opened, whose history this is not.
+        if doc.revision < self.revision {
+            self.history.clear();
+            self.selection.clear();
+            self.view = None;
+        }
         let view = (path.to_string(), def.to_string());
         if self.view.as_ref() != Some(&view) {
             self.view = Some(view);
@@ -1342,7 +1350,10 @@ impl Editor {
             .iter()
             .map(|(id, _)| ItemRef::Instance(id.clone()))
             .collect();
-        let label = format!("paste {} items", geoms.len());
+        let label = match geoms.len() {
+            1 => "paste 1 item".to_string(),
+            n => format!("paste {n} items"),
+        };
         let def_owned = def_id.to_string();
         self.history
             .commit(t, label, &[def_id.to_string()], ops, move |doc| {

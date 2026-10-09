@@ -3,7 +3,7 @@
 //! | piece | where | slot |
 //! |---|---|---|
 //! | run controls: Timing/Fast, run/pause, step tick/phase/cycle, speed, reset | [`toolbar`] | top bar |
-//! | click inputs, hover values, "add to waveform" context menu, jump focus | [`canvas_tool`] | canvas tool |
+//! | click / edit inputs, pending-input badges, hover values, "Set input value…" context entry, jump focus | [`canvas_tool`] | canvas tool |
 //! | waveform viewer (radix, zoom/scroll/follow, cursor) | [`waveform`] | bottom tab |
 //! | diagnostics (grouped, severity filter, jump-to-location) | [`diag`] | bottom tab |
 //! | STA (min period per clock, apply suggested period, critical path, violations) | [`sta`] | bottom tab |
@@ -133,5 +133,6 @@ pub fn register(reg: &mut Registry) {
     reg.panel(diag::DiagPanel::new(shared.clone()));
     reg.panel(sta::StaPanel::new(shared.clone()));
     reg.panel(hud::Hud::default());
+    reg.tool(diag::JumpOverlay::new(shared.clone()));
     reg.tool(canvas_tool::SimTool::new(shared));
 }

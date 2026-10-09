@@ -1,10 +1,10 @@
-//! egui panels and the canvas tool of the hierarchy/files feature. All behaviour lives in
+//! egui panels and the canvas tool of the hierarchy feature. All behaviour lives in
 //! [`super::actions`]; this file only draws and maps input to those actions.
 //!
 //! * [`Breadcrumbs`] (top bar): `top › cpu › alu` buttons, an *Up* button, the viewed def's
-//!   classification badge; it also hosts the modal prompt and the keyboard shortcuts
-//!   (`Alt+↑` up, `Ctrl+G` package the selection).
-//! * [`FileMenu`] / [`HierMenu`] (menus).
+//!   classification badge; it also hosts the package-name prompt and the keyboard shortcuts
+//!   (`Alt+↑` up, `Ctrl+G` package the selection), and rolls back kernel-rejected changes.
+//! * [`HierMenu`] (the *Hierarchy* menu).
 //! * [`LibraryTab`] / [`TreeTab`] (left panel tabs *Library* and *Instances*).
 //! * [`HierTool`] (canvas): double-click a package instance to enter it.
 //!
@@ -18,7 +18,7 @@ use std::rc::Rc;
 use egui::{Color32, Key, KeyboardShortcut, Modifiers, RichText, Ui};
 use panda_kernel::ClassKind;
 
-use super::actions::{self, HierState, PromptKind};
+use super::actions::{self, HierState};
 use super::classify::{Badge, BadgeState};
 use super::library::{Category, LibEntry, user_entries};
 use super::nav::{child_path, crumbs, package_instances};
@@ -26,6 +26,7 @@ use crate::app::{AppState, CanvasTool, Panel, Slot};
 use crate::canvas::{CanvasResponse, Scene};
 use crate::doc::ItemRef;
 use crate::geom::SymbolKind;
+use crate::simhost::SimEvent;
 
 /// Shared state handle (single UI thread).
 pub type Shared = Rc<RefCell<HierState>>;
@@ -86,9 +87,12 @@ fn selection(ctx: &egui::Context, app: &AppState) -> Vec<String> {
 }
 
 fn ask_package_name(ctx: &egui::Context, hs: &mut HierState, app: &AppState) {
-    hs.package_selection = selection(ctx, app);
-    let name = actions::default_package_name(app);
-    hs.ask(PromptKind::PackageName, name);
+    let sel = selection(ctx, app);
+    if sel.is_empty() {
+        hs.status = Some("select the instances to package first".into());
+        return;
+    }
+    hs.ask_package(app, sel);
 }
 
 // ---------------------------------------------------------------- breadcrumbs
@@ -106,6 +110,7 @@ impl Panel for Breadcrumbs {
 
     fn on_frame(&mut self, ctx: &egui::Context, app: &mut AppState) {
         let hs = &mut *self.0.borrow_mut();
+        hs.sync(app);
         hs.classifier.sync(&app.doc);
         hs.classifier.poll();
         // Fit when the view changed by any means.
@@ -115,9 +120,6 @@ impl Panel for Breadcrumbs {
                 app.canvas.request_fit();
             }
             hs.last_view = Some(view);
-        }
-        if let Some(req) = hs.pending_place.take() {
-            crate::edit::request_place(ctx, req);
         }
         if hs.prompt.is_none() {
             let (up, pkg) =
@@ -130,6 +132,12 @@ impl Panel for Breadcrumbs {
             }
         }
         prompt_modal(ctx, hs, app);
+    }
+
+    fn on_event(&mut self, ev: &SimEvent, app: &mut AppState) {
+        if let SimEvent::Edited { id, result } = ev {
+            self.0.borrow_mut().edited(app, *id, result.is_ok());
+        }
     }
 
     fn ui(&mut self, ui: &mut Ui, app: &mut AppState) {
@@ -157,7 +165,11 @@ impl Panel for Breadcrumbs {
             };
             if ui
                 .add(egui::Button::new(text).frame(false))
-                .on_hover_text(format!("{} ({})", if c.path.is_empty() { "/" } else { &c.path }, c.def))
+                .on_hover_text(format!(
+                    "{} ({})",
+                    if c.path.is_empty() { "/" } else { &c.path },
+                    c.def
+                ))
                 .clicked()
                 && !last
             {
@@ -180,9 +192,14 @@ fn prompt_modal(ctx: &egui::Context, hs: &mut HierState, app: &mut AppState) {
     let mut cancel = false;
     let r = egui::Modal::new(egui::Id::new("hier.prompt")).show(ctx, |ui| {
         ui.set_width(420.0);
-        ui.heading(p.kind.title());
-        ui.label(p.kind.field());
-        let te = ui.add(egui::TextEdit::singleline(&mut p.text).desired_width(400.0));
+        ui.heading("Create package from selection");
+        ui.label(format!(
+            "{} instance(s): {}",
+            p.selection.len(),
+            p.selection.join(", ")
+        ));
+        ui.label("Package (def) name");
+        let te = ui.add(egui::TextEdit::singleline(&mut p.name).desired_width(400.0));
         te.request_focus();
         if te.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
             submit = true;
@@ -191,7 +208,7 @@ fn prompt_modal(ctx: &egui::Context, hs: &mut HierState, app: &mut AppState) {
             ui.colored_label(ui.visuals().error_fg_color, e);
         }
         ui.horizontal(|ui| {
-            if ui.button("OK").clicked() {
+            if ui.button("Create").clicked() {
                 submit = true;
             }
             if ui.button("Cancel").clicked() {
@@ -205,85 +222,11 @@ fn prompt_modal(ctx: &egui::Context, hs: &mut HierState, app: &mut AppState) {
     if cancel {
         hs.prompt = None;
     } else if submit {
-        actions::submit_prompt(hs, app);
+        hs.submit_prompt(crate::edit::shared_editor(ctx).as_ref(), app);
     }
 }
 
 // ---------------------------------------------------------------- menus
-
-/// The *File* menu.
-pub struct FileMenu(pub Shared);
-
-impl Panel for FileMenu {
-    fn id(&self) -> &'static str {
-        "hier.file"
-    }
-    fn title(&self) -> String {
-        "File".into()
-    }
-    fn slot(&self) -> Slot {
-        Slot::Menu
-    }
-    fn ui(&mut self, ui: &mut Ui, app: &mut AppState) {
-        let hs = &mut *self.0.borrow_mut();
-        if ui.button("New").clicked() {
-            actions::new_document(hs, app);
-            ui.close();
-        }
-        if ui.button("Open…").clicked() {
-            hs.ask(PromptKind::Open, String::new());
-            ui.close();
-        }
-        ui.menu_button("Open recent", |ui| {
-            if hs.recent.paths.is_empty() {
-                ui.label(RichText::new("(none)").weak());
-            }
-            for p in hs.recent.paths.clone() {
-                if ui.button(p.display().to_string()).clicked() {
-                    if let Err(e) = actions::open_file(hs, app, &p) {
-                        app.log.push(e.clone());
-                        hs.status = Some(e);
-                    }
-                    ui.close();
-                }
-            }
-        });
-        ui.separator();
-        let has_path = app.doc.path.is_some();
-        if ui
-            .add_enabled(has_path, egui::Button::new("Save"))
-            .clicked()
-        {
-            if let Err(e) = actions::save(hs, app, None) {
-                hs.status = Some(e);
-            }
-            ui.close();
-        }
-        if ui.button("Save as…").clicked() {
-            let cur = app
-                .doc
-                .path
-                .as_ref()
-                .map(|p| p.display().to_string())
-                .unwrap_or_default();
-            hs.ask(PromptKind::SaveAs, cur);
-            ui.close();
-        }
-        ui.separator();
-        if ui.button("Import ROM from hex…").clicked() {
-            hs.ask(PromptKind::ImportRom, String::new());
-            ui.close();
-        }
-        ui.menu_button("Examples", |ui| {
-            for e in crate::examples::all() {
-                if ui.button(e.name).on_hover_text(e.description).clicked() {
-                    actions::open_example(hs, app, &e);
-                    ui.close();
-                }
-            }
-        });
-    }
-}
 
 /// The *Hierarchy* menu.
 pub struct HierMenu(pub Shared);
@@ -311,7 +254,10 @@ impl Panel for HierMenu {
             _ => None,
         };
         if ui
-            .add_enabled(pkg_sel.is_some(), egui::Button::new("Enter selected package"))
+            .add_enabled(
+                pkg_sel.is_some(),
+                egui::Button::new("Enter selected package"),
+            )
             .clicked()
         {
             if let Some(i) = &pkg_sel {
@@ -346,29 +292,6 @@ impl Panel for HierMenu {
             .clicked()
         {
             ask_package_name(ui.ctx(), hs, app);
-            ui.close();
-        }
-        ui.separator();
-        let ul = hs.history.undo_label().map(str::to_string);
-        if ui
-            .add_enabled(
-                ul.is_some(),
-                egui::Button::new(format!("Undo {}", ul.unwrap_or_default())),
-            )
-            .clicked()
-        {
-            actions::undo(hs, app);
-            ui.close();
-        }
-        let rl = hs.history.redo_label().map(str::to_string);
-        if ui
-            .add_enabled(
-                rl.is_some(),
-                egui::Button::new(format!("Redo {}", rl.unwrap_or_default())),
-            )
-            .clicked()
-        {
-            actions::redo(hs, app);
             ui.close();
         }
     }
@@ -429,7 +352,11 @@ impl Panel for LibraryTab {
                     let shown: Vec<usize> = list
                         .into_iter()
                         .filter(|&i| {
-                            let e = if cat == Category::User { &user[i] } else { &hs.builtin[i] };
+                            let e = if cat == Category::User {
+                                &user[i]
+                            } else {
+                                &hs.builtin[i]
+                            };
                             entry_matches(e, &hs.filter)
                         })
                         .collect();
@@ -482,7 +409,8 @@ impl Panel for LibraryTab {
                 }
             });
         if let Some(e) = arm {
-            match actions::arm_entry(hs, app, &e) {
+            let ed = crate::edit::shared_editor(ui.ctx());
+            match actions::arm_entry(hs, ed.as_ref(), app, &e) {
                 Ok(req) => crate::edit::request_place(ui.ctx(), req),
                 Err(err) => hs.status = Some(err),
             }
@@ -542,7 +470,7 @@ fn tree_node(
         }
         let st = hs.classifier.peek(def).cloned();
         badge_ui(ui, st.as_ref(), false);
-        if path.is_empty() || label != def {
+        if label != def {
             ui.label(RichText::new(def).small().weak());
         }
     };

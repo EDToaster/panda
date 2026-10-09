@@ -1,15 +1,23 @@
-//! Symbol glyphs: outlines in local grid coordinates, tessellated once per zoom into pixel-space
-//! template meshes that are copied (rotated / mirrored in 90° steps, which keeps anti-aliasing
-//! exact) for every visible instance.
+//! Symbol glyphs and symbol text.
+//!
+//! * Glyphs: outlines in local grid coordinates, tessellated once per zoom into pixel-space
+//!   template meshes that are copied (rotated / mirrored in 90° steps, which keeps anti-aliasing
+//!   exact) for every visible instance. Package boxes show a tick at every pin.
+//! * Text ([`symbol_texts`], [`place_text`]): labels are laid out in the symbol's local frame
+//!   (pin names inside the box next to their pin, sized to the room they have) and follow the
+//!   symbol's orientation like the glyph does, except that they are never drawn upside down or
+//!   mirrored: text that would read right-to-left reads left-to-right, text that would read
+//!   downward reads upward, with the alignment mirrored so a label stays attached to its pin.
 
 use std::collections::HashMap;
 
-use egui::epaint::{PathShape, PathStroke, TessellationOptions, Tessellator};
-use egui::{Color32, Mesh, Pos2, Shape, Stroke, pos2};
+use egui::epaint::{PathShape, PathStroke, TessellationOptions, Tessellator, TextShape};
+use egui::{Align2, Color32, FontId, Mesh, Painter, Pos2, Shape, Stroke, pos2};
 use panda_netlist::{Dir, GateOp};
 
-use crate::geom::{GridPt, Orient, Symbol, SymbolKind};
+use crate::geom::{GridPt, Orient, Side, Symbol, SymbolKind};
 
+use super::scene::SymText;
 use super::style::Palette;
 
 type P = [f32; 2];
@@ -46,8 +54,9 @@ pub enum TemplateKey {
     Por,
     /// Pin marker (direction, width).
     Pin(Dir, i32),
-    /// Package box (size).
-    Package(i32, i32),
+    /// Package box: size, and per pin its side, position along the side and whether it is a
+    /// bus.
+    Package(i32, i32, Vec<(Side, i32, bool)>),
 }
 
 /// Template key of a symbol.
@@ -64,7 +73,20 @@ pub fn template_key(s: &Symbol) -> TemplateKey {
         SymbolKind::Clock => TemplateKey::Clock,
         SymbolKind::PowerOnReset => TemplateKey::Por,
         SymbolKind::Pin { dir, .. } => TemplateKey::Pin(*dir, s.size.x),
-        SymbolKind::Package { .. } => TemplateKey::Package(s.size.x, s.size.y),
+        SymbolKind::Package { .. } => TemplateKey::Package(
+            s.size.x,
+            s.size.y,
+            s.ports
+                .iter()
+                .map(|p| {
+                    let along = match p.side {
+                        Side::Left | Side::Right => p.pos.y,
+                        Side::Top | Side::Bottom => p.pos.x,
+                    };
+                    (p.side, along, p.width > 1)
+                })
+                .collect(),
+        ),
     }
 }
 
@@ -233,13 +255,254 @@ pub fn glyph(s: &Symbol) -> Glyph {
         SymbolKind::Package { .. } => {
             let body = rect(0.0, 0.0, w, h);
             g.fills.push((body.clone(), [w / 2.0, h / 2.0], false));
-            let header = rect(0.0, 0.0, w, 2.0);
-            g.fills.push((header, [w / 2.0, 1.0], true));
-            g.strokes.push((vec![[0.0, 2.0], [w, 2.0]], false, 0.6));
+            // The title band; with pins on the top edge the title moves into the body.
+            if has_header(s) {
+                let header = rect(0.0, 0.0, w, 2.0);
+                g.fills.push((header, [w / 2.0, 1.0], true));
+                g.strokes.push((vec![[0.0, 2.0], [w, 2.0]], false, 0.6));
+            }
+            // A short tick inside the box at every pin (thicker for buses).
+            for p in &s.ports {
+                let (x, y) = (p.pos.x as f32, p.pos.y as f32);
+                let (dx, dy) = match p.side {
+                    Side::Left => (PIN_TICK, 0.0),
+                    Side::Right => (-PIN_TICK, 0.0),
+                    Side::Top => (0.0, PIN_TICK),
+                    Side::Bottom => (0.0, -PIN_TICK),
+                };
+                let wm = if p.width > 1 { 2.2 } else { 1.2 };
+                g.strokes.push((vec![[x, y], [x + dx, y + dy]], false, wm));
+            }
             g.strokes.push((body, true, 1.2));
         }
     }
     g
+}
+
+/// Length of the pin ticks inside package boxes (grid units).
+const PIN_TICK: f32 = 0.45;
+/// Inset of pin labels from the box edge (grid units).
+const LABEL_INSET: f32 = 0.7;
+/// Width of one character per unit of [`SymText::size`] (grid units; the canvas draws text at
+/// 0.8 × size with a proportional font averaging ~0.55 em per character).
+const CHAR_W: f32 = 0.47;
+/// Smallest text size labels shrink to before they are allowed to overflow.
+const MIN_TEXT: f32 = 0.55;
+
+/// True if a package symbol draws its title band (no pins on its top edge).
+fn has_header(s: &Symbol) -> bool {
+    !s.ports.iter().any(|p| p.side == Side::Top)
+}
+
+/// Text size ≤ `max` at which `text` fits into `room` grid units.
+fn fit(text: &str, room: f32, max: f32) -> f32 {
+    let n = text.chars().count().max(1) as f32;
+    (room / (CHAR_W * n)).clamp(MIN_TEXT, max)
+}
+
+/// The texts of a symbol, in its local (unoriented) frame.
+///
+/// Package pin names sit inside the box next to their pin: left/right pins horizontally, top /
+/// bottom pins vertically (reading away from the edge), each shrunk to fit the room it has
+/// (half the box when a label faces another one on the opposite side). The title fills the
+/// title band, or the body when pins occupy the top edge.
+pub fn symbol_texts(s: &Symbol) -> Vec<SymText> {
+    let (w, h) = (s.size.x as f32, s.size.y as f32);
+    let t = |pos: [f32; 2], text: &str, size: f32, align: Align2, dim: bool| SymText {
+        pos,
+        text: text.to_string(),
+        size,
+        align,
+        dim,
+        vertical: false,
+    };
+    match &s.kind {
+        SymbolKind::Constant { text } => {
+            vec![t([w / 2.0, 1.0], text, fit(text, w - 0.4, 1.1), Align2::CENTER_CENTER, false)]
+        }
+        SymbolKind::PowerOnReset => {
+            vec![t([w / 2.0, 1.0], "POR", 1.1, Align2::CENTER_CENTER, false)]
+        }
+        SymbolKind::Pin { name, dir } => {
+            let x = if *dir == Dir::In {
+                (w - 1.0) / 2.0
+            } else {
+                (w + 1.0) / 2.0
+            };
+            vec![t([x, 1.0], name, fit(name, w - 1.2, 1.1), Align2::CENTER_CENTER, false)]
+        }
+        SymbolKind::Package { title, .. } => {
+            let mut v = Vec::with_capacity(s.ports.len() + 1);
+            let header = has_header(s);
+            // Rows / columns used by pins on each side (for the room left to each label).
+            let rows = |side: Side| -> Vec<i32> {
+                s.ports
+                    .iter()
+                    .filter(|p| p.side == side)
+                    .map(|p| p.pos.y)
+                    .collect()
+            };
+            let cols = |side: Side| -> Vec<i32> {
+                s.ports
+                    .iter()
+                    .filter(|p| p.side == side)
+                    .map(|p| p.pos.x)
+                    .collect()
+            };
+            let (left_rows, right_rows) = (rows(Side::Left), rows(Side::Right));
+            let (top_cols, bottom_cols) = (cols(Side::Top), cols(Side::Bottom));
+            let faces = |others: &[i32], at: i32| others.iter().any(|&o| (o - at).abs() < 2);
+            for port in &s.ports {
+                let name = port.name.as_str();
+                let (x, y) = (port.pos.x as f32, port.pos.y as f32);
+                let mut label = match port.side {
+                    Side::Left | Side::Right => {
+                        let shared = if faces(
+                            if port.side == Side::Left {
+                                &right_rows
+                            } else {
+                                &left_rows
+                            },
+                            port.pos.y,
+                        ) {
+                            0.5
+                        } else {
+                            1.0
+                        };
+                        let room = (w - 2.0 * LABEL_INSET) * shared - 0.3;
+                        let size = fit(name, room, 1.0);
+                        if port.side == Side::Left {
+                            t([LABEL_INSET, y], name, size, Align2::LEFT_CENTER, true)
+                        } else {
+                            t([w - LABEL_INSET, y], name, size, Align2::RIGHT_CENTER, true)
+                        }
+                    }
+                    Side::Top | Side::Bottom => {
+                        let shared = if faces(
+                            if port.side == Side::Top {
+                                &bottom_cols
+                            } else {
+                                &top_cols
+                            },
+                            port.pos.x,
+                        ) {
+                            0.5
+                        } else {
+                            1.0
+                        };
+                        let room = (h - 2.0 * LABEL_INSET) * shared - 0.3;
+                        let size = fit(name, room, 1.0);
+                        // Vertical text reads upward: a top label ends at the top edge, a bottom
+                        // label starts at the bottom edge.
+                        if port.side == Side::Top {
+                            t([x, LABEL_INSET], name, size, Align2::RIGHT_CENTER, true)
+                        } else {
+                            t([x, h - LABEL_INSET], name, size, Align2::LEFT_CENTER, true)
+                        }
+                    }
+                };
+                label.vertical = matches!(port.side, Side::Top | Side::Bottom);
+                v.push(label);
+            }
+            if header {
+                v.push(t([w / 2.0, 1.0], title, fit(title, w - 0.8, 1.15), Align2::CENTER_CENTER, false));
+            } else {
+                // Between the left and right label columns, below the top labels.
+                let room = w - 2.0 * LABEL_INSET - 2.0;
+                v.push(t([w / 2.0, h / 2.0], title, fit(title, room, 1.15), Align2::CENTER_CENTER, false));
+            }
+            v
+        }
+        SymbolKind::Splitter { parts } => parts
+            .iter()
+            .enumerate()
+            .map(|(i, (lo, hi))| {
+                let label = if lo == hi {
+                    format!("{lo}")
+                } else {
+                    format!("{hi}:{lo}")
+                };
+                t(
+                    [1.25, 1.0 + 2.0 * i as f32 - 0.15],
+                    &label,
+                    0.75,
+                    Align2::LEFT_BOTTOM,
+                    true,
+                )
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// A symbol text placed for an orientation: anchor in the oriented symbol's frame (grid units
+/// from its top-left corner), alignment at the anchor and rotation (radians clockwise; 0 or
+/// −90°, i.e. reading upward).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TextPlacement {
+    /// Anchor (oriented local grid coordinates).
+    pub pos: [f32; 2],
+    /// Alignment of the (unrotated) text box at the anchor.
+    pub align: Align2,
+    /// Clockwise rotation in radians.
+    pub angle: f32,
+}
+
+/// Place text `t` of a symbol of local size `size` drawn with orientation `o`: the text follows
+/// the orientation but always reads left-to-right or bottom-to-top.
+pub fn place_text(t: &SymText, o: Orient, size: GridPt) -> TextPlacement {
+    let origin = o.apply_f([0.0, 0.0], size);
+    let map = |v: [f32; 2]| {
+        let p = o.apply_f(v, size);
+        [(p[0] - origin[0]).round() as i32, (p[1] - origin[1]).round() as i32]
+    };
+    // Local reading direction and the local "down" of the text.
+    let (b_local, n_local) = if t.vertical {
+        ([0.0, -1.0], [1.0, 0.0])
+    } else {
+        ([1.0, 0.0], [0.0, 1.0])
+    };
+    let d = map(b_local);
+    let u = map(n_local);
+    // Readable direction: rightward, or upward for vertical text.
+    let b = if d == [1, 0] || d == [0, -1] { d } else { [-d[0], -d[1]] };
+    let n = if b == [1, 0] { [0, 1] } else { [1, 0] };
+    let mut align = t.align;
+    if b != d {
+        align = Align2([align.x().flip(), align.y()]);
+    }
+    if n != u {
+        align = Align2([align.x(), align.y().flip()]);
+    }
+    TextPlacement {
+        pos: o.apply_f(t.pos, size),
+        align,
+        angle: if b == [1, 0] {
+            0.0
+        } else {
+            -std::f32::consts::FRAC_PI_2
+        },
+    }
+}
+
+/// Paint `text` anchored at `pos` with `align` (of the unrotated text box), rotated by `angle`
+/// radians clockwise about the anchor.
+pub fn paint_text(
+    painter: &Painter,
+    pos: Pos2,
+    align: Align2,
+    angle: f32,
+    text: String,
+    font: FontId,
+    color: Color32,
+) {
+    let galley = painter.layout_no_wrap(text, font, color);
+    let rect = align.anchor_size(pos, galley.size());
+    if angle == 0.0 {
+        painter.galley(rect.min, galley, color);
+    } else {
+        painter.add(TextShape::new(rect.min, galley, color).with_angle_and_anchor(angle, align));
+    }
 }
 
 /// Tessellated template meshes for the current zoom and palette.
@@ -459,6 +722,81 @@ mod tests {
         assert_eq!(out.vertices.len(), m.vertices.len());
         for v in &out.vertices {
             assert!(v.pos.x > 96.0 && v.pos.x < 100.0 + 40.0 + 4.0);
+        }
+    }
+
+    /// World-frame (oriented local) bounding box of a placed text of `chars` characters.
+    fn text_box(t: &SymText, tp: &TextPlacement) -> egui::Rect {
+        let len = CHAR_W * t.size * t.text.chars().count() as f32;
+        let r = tp.align.anchor_size(pos2(tp.pos[0], tp.pos[1]), egui::vec2(len, 0.8 * t.size));
+        if tp.angle == 0.0 {
+            return r;
+        }
+        // −90° about the anchor: (vx, vy) → (vy, −vx).
+        let a = pos2(tp.pos[0], tp.pos[1]);
+        let rot = |p: Pos2| pos2(a.x + (p.y - a.y), a.y - (p.x - a.x));
+        egui::Rect::from_two_pos(rot(r.min), rot(r.max))
+    }
+
+    #[test]
+    fn package_labels_stay_with_their_pins_in_every_orientation() {
+        use crate::geom::{SymbolLayout, SymbolPin, gp, package_symbol};
+        use panda_netlist::DefBuilder;
+        let mut b = DefBuilder::new("pkg");
+        let ins: Vec<_> = ["A", "BUS", "SEL", "EN"].iter().map(|n| b.input(n, 1)).collect();
+        let y = b.and(&ins);
+        b.output("Y", y);
+        b.output("OVF", ins[0]);
+        let def = b.finish();
+        let pin = |side, offset| SymbolPin { side, offset };
+        let layout = SymbolLayout {
+            size: gp(12, 10),
+            pins: [
+                ("A".to_string(), pin(Side::Left, 3)),
+                ("BUS".to_string(), pin(Side::Left, 5)),
+                ("SEL".to_string(), pin(Side::Top, 4)),
+                ("EN".to_string(), pin(Side::Bottom, 6)),
+                ("Y".to_string(), pin(Side::Right, 3)),
+                ("OVF".to_string(), pin(Side::Right, 7)),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let s = package_symbol(&def, Some(&layout));
+        let texts = symbol_texts(&s);
+        assert_eq!(texts.len(), s.ports.len() + 1);
+        for rot in 0..4u8 {
+            for flip in [false, true] {
+                let o = Orient { rot, flip };
+                let size = o.size(s.size);
+                for (t, port) in texts.iter().zip(&s.ports) {
+                    let tp = place_text(t, o, s.size);
+                    // Readable: horizontal or reading upward.
+                    assert!(tp.angle == 0.0 || tp.angle == -std::f32::consts::FRAC_PI_2);
+                    let r = text_box(t, &tp);
+                    let tol = 0.05;
+                    assert!(
+                        r.min.x >= -tol
+                            && r.min.y >= -tol
+                            && r.max.x <= size.x as f32 + tol
+                            && r.max.y <= size.y as f32 + tol,
+                        "{o:?} {}: {r:?} outside {size:?}",
+                        t.text
+                    );
+                    // Attached to its pin: the box starts within an inset of the pin.
+                    let pp = o.apply_f([port.pos.x as f32, port.pos.y as f32], s.size);
+                    let dx = (pp[0] - r.center().x).abs() - r.width() / 2.0;
+                    let dy = (pp[1] - r.center().y).abs() - r.height() / 2.0;
+                    assert!(
+                        dx.max(0.0) + dy.max(0.0) <= LABEL_INSET + tol,
+                        "{o:?} {}: {r:?} far from pin {pp:?}",
+                        t.text
+                    );
+                    // Labels run perpendicular to the edge their pin is on.
+                    let edge_vertical = pp[0] < 0.01 || pp[0] > size.x as f32 - 0.01;
+                    assert_eq!(tp.angle == 0.0, edge_vertical, "{o:?} {}", t.text);
+                }
+            }
         }
     }
 }

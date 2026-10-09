@@ -1,5 +1,6 @@
-//! Offscreen renders (egui_kittest + wgpu) of the hierarchy/files UI: breadcrumbs and badges,
-//! the library palette, the instance tree, packaging and its prompt, the File menu.
+//! Offscreen renders (egui_kittest + wgpu) of the hierarchy UI: breadcrumbs and badges, the
+//! library palette, the instance tree, packaging (Ctrl+G, its prompt, undo from the Hierarchy
+//! menu) and library placement through the edit module's place tool.
 //!
 //! Writes `docs/screenshots/hier-*.png` (inspect them after visual changes).
 
@@ -12,7 +13,6 @@ use panda_kernel::{Mode, StepUnit};
 use panda_netlist::Value;
 use panda_ui::app::{AppState, PandaApp, Registry};
 use panda_ui::examples;
-use panda_ui::files::RecentFiles;
 use panda_ui::hier::classify::BadgeState;
 use panda_ui::hier::ui::Shared;
 use panda_ui::hier::{HierState, actions};
@@ -24,18 +24,13 @@ fn shot(name: &str) -> PathBuf {
         .join(format!("hier-{name}.png"))
 }
 
-/// The full app with an in-memory recent-files list.
+/// The full app (as [`panda_ui::app::panel::register_all`]) with a handle on the hierarchy
+/// state.
 fn app(state: AppState) -> (PandaApp, Shared) {
     let mut reg = Registry::default();
+    panda_ui::files::register(&mut reg);
     panda_ui::edit::register(&mut reg);
-    let hs = panda_ui::hier::register_with(
-        &mut reg,
-        HierState::new(RecentFiles {
-            paths: vec!["/home/user/designs/alu.panda.json".into()],
-            store: None,
-        }),
-    );
-    panda_ui::simui::register(&mut reg);
+    let hs = panda_ui::hier::register_with(&mut reg, HierState::new());
     panda_ui::simux::register(&mut reg);
     (PandaApp::with_registry(state, reg), hs)
 }
@@ -89,7 +84,10 @@ fn panda8_breadcrumbs_badge_and_library() {
     assert!(h.state_mut().state.enter("cpu/alu"));
     let def = h.state().state.view.def.clone();
     step_until(&mut h, 20.0, |a| {
-        a.state.live.values().is_some_and(|l| l.map.path == "cpu/alu")
+        a.state
+            .live
+            .values()
+            .is_some_and(|l| l.map.path == "cpu/alu")
             && !a.state.live.snapshot.running
             && badge_ready(&hs, &def)
     });
@@ -138,7 +136,8 @@ fn package_counter_and_enter_it() {
     }
     assert!(h.state_mut().state.enter("dut"));
     step_until(&mut h, 20.0, |a| {
-        a.state.live.values().is_some_and(|l| l.map.path == "dut") && a.state.live.snapshot.tick > 50
+        a.state.live.values().is_some_and(|l| l.map.path == "dut")
+            && a.state.live.snapshot.tick > 50
     });
     // Select everything except the register, then open the package prompt.
     let sel: Vec<String> = {
@@ -162,60 +161,125 @@ fn package_counter_and_enter_it() {
     }
     h.step();
     save(&mut h, "counter-selection");
+    // Ctrl+G opens the prompt for the selection with a free default name.
+    h.event(egui::Event::Key {
+        key: egui::Key::G,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers::COMMAND,
+    });
+    h.step();
+    h.step();
     {
-        let mut b = hs.borrow_mut();
-        b.package_selection = sel.clone();
-        b.ask(actions::PromptKind::PackageName, "incr".into());
+        let b = hs.borrow();
+        let p = b.prompt.as_ref().expect("Ctrl+G opens the prompt");
+        assert_eq!(p.selection, sel);
+        assert_eq!(p.name, "pkg");
     }
+    hs.borrow_mut().prompt.as_mut().unwrap().name = "incr".into();
     h.step();
     h.step();
     save(&mut h, "package-prompt");
-    h.get_by_label("OK").click();
+    h.get_by_label("Create").click();
     step_until(&mut h, 20.0, |a| a.state.doc.def("incr").is_some());
     step_until(&mut h, 20.0, |a| {
         a.state.live.values().is_some_and(|l| {
-            l.map.path == "dut" && l.map.nets.len() == a.state.doc.def(&a.state.view.def).unwrap().nets.len()
+            l.map.path == "dut"
+                && l.map.nets.len() == a.state.doc.def(&a.state.view.def).unwrap().nets.len()
         })
     });
     save(&mut h, "counter-packaged");
     assert!(actions::enter_instance(&mut h.state_mut().state, "incr"));
     step_until(&mut h, 20.0, |a| {
-        a.state.live.values().is_some_and(|l| l.map.path == "dut/incr") && badge_ready(&hs, "incr")
+        a.state
+            .live
+            .values()
+            .is_some_and(|l| l.map.path == "dut/incr")
+            && badge_ready(&hs, "incr")
     });
     save(&mut h, "inside-new-package");
 }
 
 #[test]
-fn file_menu_and_examples() {
-    let mut state = AppState::new(examples::sr_latch(), SimOptions::default());
+fn undo_package_with_ctrl_z_while_inside_it() {
+    let mut state = AppState::new(examples::counter(), SimOptions::default());
     state.wait_layout();
+    let original = state.doc.design.clone();
     let (app, hs) = app(state);
     let mut h = harness(app, 1000.0, 600.0);
     step_until(&mut h, 20.0, |a| a.state.live.values().is_some());
-    h.get_by_label("File").click();
-    h.step();
-    h.step();
-    h.get_by_label_contains("Examples").click();
-    h.step();
-    h.step();
-    save(&mut h, "file-menu");
-    h.get_by_label("Register file").click();
+    let ed = panda_ui::edit::shared_editor(&h.ctx).expect("editor announced");
+    {
+        let s = &mut h.state_mut().state;
+        assert!(s.enter("dut"));
+        let sel: Vec<String> = s
+            .doc
+            .def(&s.view.def)
+            .unwrap()
+            .instances
+            .iter()
+            .filter(|i| i.id != "reg")
+            .map(|i| i.id.clone())
+            .collect();
+        actions::create_package(&mut hs.borrow_mut(), Some(&ed), s, &sel, "incr").unwrap();
+        assert_eq!(
+            ed.borrow().history.undo_label(),
+            Some("Create package incr")
+        );
+        assert!(actions::enter_instance(s, "incr"));
+    }
     step_until(&mut h, 20.0, |a| {
-        a.state.doc.design.top.starts_with("tb_regfile") && a.state.live.values().is_some()
+        a.state
+            .live
+            .values()
+            .is_some_and(|l| l.map.path == "dut/incr")
     });
-    // Badges are computed for the new document (not stale ones of the previous document).
+    h.get_by_label("Hierarchy").click();
+    h.step();
+    h.step();
+    save(&mut h, "hierarchy-menu");
+    h.key_press(egui::Key::Escape);
+    h.step();
+    // Ctrl+Z (the edit module's shortcut) undoes the packaging: one editor-wide history.
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
+    // The viewed instance is gone: the view falls back to its parent.
+    step_until(&mut h, 20.0, |a| {
+        a.state.view.path == "dut" && a.state.live.values().is_some_and(|l| l.map.path == "dut")
+    });
+    assert_eq!(h.state().state.doc.design, original);
+    assert_eq!(
+        ed.borrow().history.redo_label(),
+        Some("Create package incr")
+    );
+    // Opening another document forgets the history and classifies the new defs.
+    let rf = examples::by_name("Register file").unwrap();
+    h.state_mut().state.open_document(rf.document());
     step_until(&mut h, 30.0, |a| {
-        a.state.doc.design.defs.iter().all(|d| badge_ready(&hs, &d.id))
+        a.state.live.values().is_some()
+            && a.state
+                .doc
+                .design
+                .defs
+                .iter()
+                .all(|d| badge_ready(&hs, &d.id))
     });
+    assert_eq!(ed.borrow().history.redo_len(), 0);
     for d in &h.state().state.doc.design.defs {
         assert!(
-            matches!(hs.borrow().classifier.peek(&d.id), Some(BadgeState::Ready(_))),
+            matches!(
+                hs.borrow().classifier.peek(&d.id),
+                Some(BadgeState::Ready(_))
+            ),
             "{}: {:?}",
             d.id,
             hs.borrow().classifier.peek(&d.id)
         );
     }
-    save(&mut h, "example-register-file");
+    h.get_by_label("Instances").click();
+    h.step();
+    h.step();
+    save(&mut h, "register-file-instances");
 }
 
 #[test]
@@ -252,9 +316,10 @@ fn library_block_click_then_canvas_click_places_it() {
     h.step();
     let def = h.state().state.doc.def(&top).unwrap().clone();
     assert_eq!(def.instances.len(), before + 1, "nothing placed");
-    assert!(def
-        .instances
-        .iter()
-        .any(|i| matches!(&i.kind, panda_netlist::InstKind::Def(d) if d == "ripple_adder_8")));
+    assert!(
+        def.instances
+            .iter()
+            .any(|i| matches!(&i.kind, panda_netlist::InstKind::Def(d) if d == "ripple_adder_8"))
+    );
     save(&mut h, "library-placed");
 }

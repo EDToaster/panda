@@ -169,7 +169,9 @@ impl Classifier {
             .keys()
             .filter(|id| {
                 doc.design.def(id).is_none()
-                    || closure(&doc.design, id).iter().any(|c| changed.contains(c.as_str()))
+                    || closure(&doc.design, id)
+                        .iter()
+                        .any(|c| changed.contains(c.as_str()))
             })
             .cloned()
             .collect();

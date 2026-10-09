@@ -91,7 +91,11 @@ impl PackagePlan {
     /// Restore the geometry after [`PackagePlan::undo_ops`] were applied to `doc`.
     pub fn restore_geometry(&self, doc: &mut Document) {
         doc.editors.remove(&self.package.id);
-        set_editor(doc, &self.parent_before.id, self.parent_editor_before.clone());
+        set_editor(
+            doc,
+            &self.parent_before.id,
+            self.parent_editor_before.clone(),
+        );
         doc.touch();
     }
 }
@@ -147,7 +151,11 @@ fn is_auto_net_id(id: &str) -> bool {
 /// Direction of the port `port` of instance `inst` (`None` if unknown).
 fn port_dir(design: &Design, inst: &Instance, port: &str) -> Option<Dir> {
     match &inst.kind {
-        InstKind::Atom(a) => a.ports().into_iter().find(|p| p.name == port).map(|p| p.dir),
+        InstKind::Atom(a) => a
+            .ports()
+            .into_iter()
+            .find(|p| p.name == port)
+            .map(|p| p.dir),
         InstKind::Def(d) => design
             .def(d)?
             .pins
@@ -266,7 +274,8 @@ pub fn plan_package(
             ));
         }
     }
-    let inside = |e: &Endpoint| matches!(e, Endpoint::Port { inst, .. } if sel.contains(inst.as_str()));
+    let inside =
+        |e: &Endpoint| matches!(e, Endpoint::Port { inst, .. } if sel.contains(inst.as_str()));
 
     // ---- drivers per bit class ----
     let mut classes = BitClasses::new(def);
@@ -286,8 +295,7 @@ pub fn plan_package(
                         continue;
                     };
                     let splitter = matches!(i.kind, InstKind::Atom(Atom::Splitter { .. }));
-                    !splitter
-                        && matches!(port_dir(design, i, port), Some(Dir::Out | Dir::InOut))
+                    !splitter && matches!(port_dir(design, i, port), Some(Dir::Out | Dir::InOut))
                 }
             };
             if !drives {
@@ -654,7 +662,11 @@ fn parent_geometry(
         .map(Placed::rect)
         .collect();
     let centre = gp((bbox.min.x + bbox.max.x) / 2, (bbox.min.y + bbox.max.y) / 2);
-    let pos = free_spot(centre - gp(sym.size.x / 2, sym.size.y / 2), sym.size, &obstacles);
+    let pos = free_spot(
+        centre - gp(sym.size.x / 2, sym.size.y / 2),
+        sym.size,
+        &obstacles,
+    );
     let geom = InstGeom {
         pos,
         orient: Default::default(),
@@ -667,9 +679,8 @@ fn parent_geometry(
     };
     // Wires inside the selection's box are dropped (clipped at its boundary).
     let cut = bbox;
-    let strictly_inside = |p: GridPt| {
-        p.x > cut.min.x && p.x < cut.max.x && p.y > cut.min.y && p.y < cut.max.y
-    };
+    let strictly_inside =
+        |p: GridPt| p.x > cut.min.x && p.x < cut.max.x && p.y > cut.min.y && p.y < cut.max.y;
     e.wires
         .retain(|k, _| parent_after.nets.iter().any(|n| &n.id == k));
     for p in pins {
@@ -865,6 +876,9 @@ fn closest_on_seg(p: GridPt, a: GridPt, b: GridPt) -> GridPt {
 
 /// Package geometry is consistent: every instance and pin placed, every net wired.
 pub fn geometry_complete(def: &ComponentDef, e: &EditorData) -> bool {
-    e.covers(def) && def.nets.iter().all(|n| e.wires.contains_key(&n.id) || n.ends.len() < 2)
+    e.covers(def)
+        && def
+            .nets
+            .iter()
+            .all(|n| e.wires.contains_key(&n.id) || n.ends.len() < 2)
 }
-

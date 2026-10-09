@@ -19,7 +19,6 @@
 //! | [`edit`] | **editing** | selection, move, wires, palette, inspector, undo/redo |
 //! | [`hier`] | **hierarchy/files** | enter/exit, packaging, library, file menu, examples menu |
 //! | [`files`] | **hierarchy/files** | open/save `.panda.json`, recent files, ROM import |
-//! | [`simui`] | **sim UX** | placeholder (superseded by [`simux`]) |
 //! | [`simux`] | **sim UX** | run controls, inputs, waveforms, diagnostics, STA, perf HUD |
 //!
 //! # Extension points
@@ -45,5 +44,11 @@ pub mod geom;
 pub mod hier;
 pub mod layout;
 pub mod simhost;
-pub mod simui;
+/// Former placeholder of the sim UX stream, superseded by [`simux`]. Empty; kept only so that
+/// existing callers of `simui::register` still compile (remove once none are left).
+#[doc(hidden)]
+pub mod simui {
+    /// Does nothing (see [`crate::simux::register`]).
+    pub fn register(_reg: &mut crate::app::Registry) {}
+}
 pub mod simux;

@@ -7,7 +7,7 @@ use panda_kernel::{Mode, StepUnit};
 
 use crate::app::{AppState, Panel, Slot};
 
-use super::control::{RATE_RANGE, SimControl, ToolbarAction};
+use super::control::{RATE_PRESETS, RATE_RANGE, SimControl, ToolbarAction, si};
 
 /// The toolbar panel.
 #[derive(Debug, Default)]
@@ -62,6 +62,7 @@ impl Panel for Toolbar {
         let s = &app.live.snapshot;
         let (mode, running) = (s.mode, s.running);
         let mut actions = Vec::new();
+        ui.spacing_mut().item_spacing.x = 4.0;
         ui.separator();
         // Mode.
         for (m, label) in [(Mode::Timing, "Timing"), (Mode::Fast, "Fast")] {
@@ -91,7 +92,6 @@ impl Panel for Toolbar {
             actions.push(ToolbarAction::ToggleRun);
         }
         // Step.
-        ui.label("Step");
         for (unit, label) in [
             (StepUnit::Tick, "tick"),
             (StepUnit::Phase, "phase"),
@@ -100,7 +100,10 @@ impl Panel for Toolbar {
             let b = egui::Button::new(label).selected(self.ctl.step_unit == unit);
             if ui
                 .add(b)
-                .on_hover_text(format!("Advance {} {label}(s) (F10 repeats)", self.ctl.step_n))
+                .on_hover_text(format!(
+                    "Step: advance {} {label}(s); pauses first if running (F10 repeats)",
+                    self.ctl.step_n
+                ))
                 .clicked()
             {
                 actions.push(ToolbarAction::StepBy(unit));
@@ -136,6 +139,16 @@ impl Panel for Toolbar {
         if r.changed() {
             actions.push(ToolbarAction::SetRate(rate));
         }
+        ui.menu_button("⏷", |ui| {
+            for p in RATE_PRESETS {
+                if ui.button(format!("{} cyc/s", si(p))).clicked() {
+                    actions.push(ToolbarAction::LimitTo(p));
+                    ui.close();
+                }
+            }
+        })
+        .response
+        .on_hover_text("Speed presets");
         ui.separator();
         if ui
             .button("⟲ Reset")

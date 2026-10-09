@@ -10,7 +10,7 @@ use std::collections::VecDeque;
 
 use panda_netlist::Logic;
 
-use crate::simhost::Packed;
+use crate::simhost::{ClockSpec, Packed, WaveChunk};
 
 /// Smallest ticks-per-pixel (most zoomed in: 64 px per tick).
 pub const MIN_TPP: f64 = 1.0 / 64.0;
@@ -110,6 +110,221 @@ pub fn nice_step(tpp: f64, min_px: f64) -> u64 {
         }
         p = p.saturating_mul(10);
     }
+}
+
+/// Unit of the time axis and of time readouts.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum TimeUnit {
+    /// Simulation ticks (natural in Timing mode).
+    #[default]
+    Ticks,
+    /// Clock cycles of a reference clock (natural in Fast mode, which advances event by event
+    /// at clock-phase granularity). Falls back to ticks when no clock is known.
+    Cycles,
+}
+
+impl TimeUnit {
+    /// Menu label.
+    pub fn label(self) -> &'static str {
+        match self {
+            TimeUnit::Ticks => "Ticks",
+            TimeUnit::Cycles => "Cycles",
+        }
+    }
+}
+
+/// Tick of rising edge number `k` of `clk` (edge 0 is the first rising edge at or after tick 0).
+pub fn rising_edge(clk: &ClockSpec, k: u64) -> u64 {
+    let p = u64::from(clk.period.max(1));
+    (u64::from(clk.phase) % p).saturating_add(k.saturating_mul(p))
+}
+
+/// Position of `tick` in cycles of `clk` (0.0 at the first rising edge; negative before it).
+pub fn cycle_of(clk: &ClockSpec, tick: f64) -> f64 {
+    let p = f64::from(clk.period.max(1));
+    (tick - (f64::from(clk.phase) % p)) / p
+}
+
+/// Human-readable time of `tick`: `"1234"` in ticks, `"c12+3"` (cycle 12, 3 ticks after its
+/// rising edge) in cycles.
+pub fn format_time(tick: u64, unit: TimeUnit, clk: Option<&ClockSpec>) -> String {
+    match (unit, clk) {
+        (TimeUnit::Cycles, Some(c)) => {
+            let p = u64::from(c.period.max(1));
+            let first = u64::from(c.phase) % p;
+            if tick < first {
+                return format!("c-1+{}", tick + p - first);
+            }
+            let k = (tick - first) / p;
+            let off = (tick - first) % p;
+            if off == 0 {
+                format!("c{k}")
+            } else {
+                format!("c{k}+{off}")
+            }
+        }
+        _ => tick.to_string(),
+    }
+}
+
+/// One labelled grid line of the time axis.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AxisMark {
+    /// Tick of the line.
+    pub tick: u64,
+    /// Label.
+    pub label: String,
+}
+
+/// Grid lines of the time axis for the visible range of `view` over `width` pixels, spaced at
+/// least `min_px` apart: "nice" tick multiples, or "nice" multiples of whole cycles of `clk`
+/// (placed on its rising edges) in [`TimeUnit::Cycles`]. At most `width / min_px + 2` marks.
+pub fn axis_marks(
+    view: &WaveView,
+    width: f64,
+    min_px: f64,
+    unit: TimeUnit,
+    clk: Option<&ClockSpec>,
+) -> Vec<AxisMark> {
+    let (t0, t1) = view.range(width);
+    let t0 = t0.max(0.0);
+    let mut out = Vec::new();
+    if t1 < t0 {
+        return out;
+    }
+    let max_marks = (width / min_px.max(1.0)) as usize + 2;
+    match (unit, clk) {
+        (TimeUnit::Cycles, Some(c)) => {
+            let p = f64::from(c.period.max(1));
+            let step = nice_step(view.tpp / p, min_px);
+            let k0 = cycle_of(c, t0).max(0.0);
+            let mut k = (k0 / step as f64).ceil() as u64 * step;
+            while out.len() < max_marks {
+                let t = rising_edge(c, k);
+                if t as f64 > t1 {
+                    break;
+                }
+                out.push(AxisMark {
+                    tick: t,
+                    label: format!("c{k}"),
+                });
+                k = match k.checked_add(step) {
+                    Some(n) => n,
+                    None => break,
+                };
+            }
+        }
+        _ => {
+            let step = nice_step(view.tpp, min_px);
+            let mut t = (t0 / step as f64).ceil() as u64 * step;
+            while (t as f64) <= t1 && out.len() < max_marks {
+                out.push(AxisMark {
+                    tick: t,
+                    label: t.to_string(),
+                });
+                t = match t.checked_add(step) {
+                    Some(n) => n,
+                    None => break,
+                };
+            }
+        }
+    }
+    out
+}
+
+/// Where capture lost data, derived from the [`WaveChunk`] stream of one waveform config.
+///
+/// The shadow capture reports a lost interval by setting [`WaveChunk::gap`] on the next chunk it
+/// delivers (whose first change is where recording resumed). The tracker turns that into tick
+/// ranges `(last tick recorded before, first tick recorded after)` for drawing.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GapTracker {
+    /// Config the gaps belong to.
+    pub config: u64,
+    /// Newest tick recorded so far.
+    pub last: Option<u64>,
+    /// Lost intervals `(from, to)` in tick order (`from < to`).
+    pub gaps: Vec<(u64, u64)>,
+    /// A gap was reported but no change after it has arrived yet (its start).
+    pub open: Option<u64>,
+}
+
+impl GapTracker {
+    /// Max gaps remembered (the oldest are dropped).
+    pub const MAX_GAPS: usize = 4096;
+
+    /// Account for `chunk` (a chunk of another config resets the tracker to that config).
+    pub fn on_chunk(&mut self, chunk: &WaveChunk) {
+        if chunk.config != self.config {
+            *self = GapTracker {
+                config: chunk.config,
+                ..GapTracker::default()
+            };
+        }
+        if chunk.gap && self.open.is_none() {
+            self.open = Some(self.last.unwrap_or(0));
+        }
+        let (Some(first), Some(newest)) = (
+            chunk.changes.iter().map(|c| c.tick).min(),
+            chunk.changes.iter().map(|c| c.tick).max(),
+        ) else {
+            return;
+        };
+        if let Some(from) = self.open.take()
+            && first > from
+        {
+            if self.gaps.len() >= Self::MAX_GAPS {
+                self.gaps.remove(0);
+            }
+            self.gaps.push((from, first));
+        }
+        self.last = Some(self.last.map_or(newest, |l| l.max(newest)));
+    }
+
+    /// Gaps overlapping `[t0, t1]`.
+    pub fn visible(&self, t0: f64, t1: f64) -> impl Iterator<Item = (u64, u64)> + '_ {
+        let i = self.gaps.partition_point(|&(_, b)| (b as f64) < t0);
+        self.gaps[i..]
+            .iter()
+            .copied()
+            .take_while(move |&(a, _)| (a as f64) <= t1)
+    }
+}
+
+/// Signal names offered by the picker for the flat net names of a design: bus bits `x[i]`
+/// collapse to `x`; top-level names come first, then by depth and name.
+pub fn signal_candidates<'a>(net_names: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    let mut v: Vec<String> = net_names
+        .into_iter()
+        .map(|n| match n.rfind('[') {
+            Some(i) if n.ends_with(']') && n[i + 1..n.len() - 1].parse::<u32>().is_ok() => &n[..i],
+            _ => n,
+        })
+        .filter(|n| !n.is_empty())
+        .map(str::to_string)
+        .collect();
+    v.sort_by(|a, b| {
+        let da = a.matches('/').count();
+        let db = b.matches('/').count();
+        da.cmp(&db).then_with(|| a.cmp(b))
+    });
+    v.dedup();
+    v
+}
+
+/// Candidates matching every whitespace-separated term of `query` (case-insensitive), at most
+/// `limit` of them.
+pub fn filter_candidates<'a>(cands: &'a [String], query: &str, limit: usize) -> Vec<&'a str> {
+    let terms: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
+    cands
+        .iter()
+        .filter(|c| {
+            let l = c.to_lowercase();
+            terms.iter().all(|t| l.contains(t.as_str()))
+        })
+        .take(limit)
+        .map(String::as_str)
+        .collect()
 }
 
 /// How a signal's value is printed.
@@ -374,19 +589,45 @@ mod tests {
         assert_eq!(
             r,
             vec![
-                Run { x0: 0.0, x1: 10.0, kind: RunKind::Value(p(0)) },
-                Run { x0: 10.0, x1: 25.0, kind: RunKind::Value(p(1)) },
-                Run { x0: 25.0, x1: 40.0, kind: RunKind::Value(p(2)) },
+                Run {
+                    x0: 0.0,
+                    x1: 10.0,
+                    kind: RunKind::Value(p(0))
+                },
+                Run {
+                    x0: 10.0,
+                    x1: 25.0,
+                    kind: RunKind::Value(p(1))
+                },
+                Run {
+                    x0: 25.0,
+                    x1: 40.0,
+                    kind: RunKind::Value(p(2))
+                },
             ]
         );
         // Starting mid-run: the value at the left edge is known.
         let v2 = WaveView { start: 12.0, ..v };
         let r = runs(&h, &v2, 100.0, 40);
-        assert_eq!(r[0], Run { x0: 0.0, x1: 13.0, kind: RunKind::Value(p(1)) });
+        assert_eq!(
+            r[0],
+            Run {
+                x0: 0.0,
+                x1: 13.0,
+                kind: RunKind::Value(p(1))
+            }
+        );
         // Before the first change nothing is drawn.
         let h2: VecDeque<_> = [(50, p(7))].into_iter().collect();
         let r = runs(&h2, &v, 100.0, 80);
-        assert_eq!(r, vec![Run { x0: 50.0, x1: 80.0, kind: RunKind::Value(p(7)) }]);
+        assert_eq!(
+            r,
+            vec![Run {
+                x0: 50.0,
+                x1: 80.0,
+                kind: RunKind::Value(p(7))
+            }]
+        );
     }
 
     #[test]

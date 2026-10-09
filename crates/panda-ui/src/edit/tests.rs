@@ -1094,3 +1094,216 @@ fn kernel_rejection_rolls_the_action_back() {
         ed.message
     );
 }
+
+// ---------------------------------------------------------------------------------------
+// Undo / redo of every action, in one chain
+// ---------------------------------------------------------------------------------------
+
+#[test]
+fn every_action_round_trips_through_undo_and_redo() {
+    let (mut ed, mut t) = fixture();
+    let mut states = vec![state(&t.doc)];
+    let mut labels = Vec::new();
+    let mut record = |ed: &Editor, t: &Rec, states: &mut Vec<_>| {
+        states.push(state(&t.doc));
+        labels.push(ed.history.undo_label().unwrap().to_string());
+    };
+    // Place an atom, a pin and a package-free XOR; wire with a T onto an existing wire.
+    ed.place(
+        &mut t,
+        "top",
+        &PlaceRequest::Atom(Atom::Gate {
+            op: GateOp::Xor,
+            inputs: 2,
+            width: 1,
+            reduce: false,
+        }),
+        gp(30, 20),
+    )
+    .unwrap();
+    record(&ed, &t, &mut states);
+    ed.place(
+        &mut t,
+        "top",
+        &PlaceRequest::Pin {
+            dir: Dir::Out,
+            width: 1,
+        },
+        gp(40, 20),
+    )
+    .unwrap();
+    record(&ed, &t, &mut states);
+    wire(&mut ed, &mut t, "xor1.out", "out3").unwrap();
+    record(&ed, &t, &mut states);
+    // T from xor1.in0 onto net A's wire (y = 0, x = 10).
+    let p = port(&t.doc, "xor1.in0").pos;
+    ed.draw_wire(
+        &mut t,
+        "top",
+        &route(p, Some(Axis::Horizontal), gp(10, 0), None),
+    )
+    .unwrap();
+    record(&ed, &t, &mut states);
+    // Merge nets A and B.
+    ed.draw_wire(&mut t, "top", &[gp(20, 0), gp(20, 8)])
+        .unwrap();
+    record(&ed, &t, &mut states);
+    // Move, rotate, flip.
+    ed.click_select(Some(ItemRef::Instance("xor1".into())), None, false);
+    ed.move_selection(&mut t, "top", gp(-2, 3)).unwrap();
+    record(&ed, &t, &mut states);
+    ed.rotate_selection(&mut t, "top", false).unwrap();
+    record(&ed, &t, &mut states);
+    ed.flip_selection(&mut t, "top").unwrap();
+    record(&ed, &t, &mut states);
+    // Copy / paste.
+    ed.click_select(Some(ItemRef::Instance("and1".into())), None, false);
+    ed.click_select(Some(ItemRef::Instance("const1".into())), None, true);
+    assert_eq!(ed.copy(&t.doc, "top"), 2);
+    ed.paste(&mut t, "top", Some(gp(0, 40))).unwrap();
+    record(&ed, &t, &mut states);
+    // Delete the bridge (split) and an instance.
+    let a = net_with(&t.doc, "in1").unwrap().id.clone();
+    ed.click_select(None, Some(WireSeg::new(a, gp(20, 0), gp(20, 8))), false);
+    ed.delete_selection(&mut t, "top").unwrap();
+    record(&ed, &t, &mut states);
+    ed.click_select(Some(ItemRef::Instance("not1".into())), None, false);
+    ed.delete_selection(&mut t, "top").unwrap();
+    record(&ed, &t, &mut states);
+    // Inspector actions.
+    ed.set_atom(
+        &mut t,
+        "top",
+        "or1",
+        &Atom::Gate {
+            op: GateOp::Nor,
+            inputs: 3,
+            width: 1,
+            reduce: false,
+        },
+        false,
+    )
+    .unwrap();
+    record(&ed, &t, &mut states);
+    let n = net_with(&t.doc, "or1.in0").unwrap().id.clone();
+    ed.set_termination(&mut t, "top", &n, Termination::PullDown)
+        .unwrap();
+    record(&ed, &t, &mut states);
+    assert_valid(&t.doc);
+
+    let n_actions = states.len() - 1;
+    assert_eq!(ed.history.undo_len(), n_actions + 12, "fixture actions + these");
+    // Undo back to the fixture, checking every intermediate state; each must validate.
+    for k in (0..n_actions).rev() {
+        let l = ed.undo(&mut t).unwrap().unwrap();
+        assert_eq!(l, labels[k]);
+        assert_eq!(state(&t.doc), states[k], "after undoing '{l}'");
+        assert_valid(&t.doc);
+    }
+    // And forward again.
+    for k in 1..=n_actions {
+        ed.redo(&mut t).unwrap().unwrap();
+        assert_eq!(state(&t.doc), states[k], "after redoing '{}'", labels[k - 1]);
+    }
+    assert_eq!(ed.history.redo_len(), 0);
+    assert_valid(&t.doc);
+    // The final design simulates: xor1 = in1 ^ or1.in1-net (in1 via the T) → in1 ^ in1 = 0;
+    // out2 = and1(net B pulled down, 1) = 0.
+    let r = simulate(&t.doc, &[("in1", true)], &["out2", "out3"]);
+    assert_eq!(r[0], Some(0));
+}
+
+#[test]
+fn undo_never_clobbers_changes_made_outside_the_history() {
+    let (mut ed, mut t) = fixture();
+    let undo = ed.history.undo_len();
+    assert!(undo > 0);
+    // Another module changes the top def without recording it here.
+    t.doc
+        .apply_ops(&[EditOp::AddPin {
+            def: "top".into(),
+            pin: panda_netlist::PinDecl {
+                name: "extra".into(),
+                dir: Dir::In,
+                width: 1,
+            },
+        }])
+        .unwrap();
+    let outside = state(&t.doc);
+    let e = ed.undo(&mut t).unwrap_err();
+    assert!(e.contains("changed outside"), "{e}");
+    assert_eq!(state(&t.doc), outside, "the outside change survives");
+    assert_eq!(ed.history.undo_len(), 0);
+    // Recording through the history keeps everything undoable in order.
+    ed.place(
+        &mut t,
+        "top",
+        &PlaceRequest::Atom(Atom::Not { width: 1 }),
+        gp(0, 30),
+    )
+    .unwrap();
+    let before = state(&t.doc);
+    ed.history
+        .commit(
+            &mut t,
+            "outside",
+            &["top".into()],
+            vec![EditOp::AddPin {
+                def: "top".into(),
+                pin: panda_netlist::PinDecl {
+                    name: "extra2".into(),
+                    dir: Dir::In,
+                    width: 1,
+                },
+            }],
+            |_| {},
+        )
+        .unwrap();
+    assert_eq!(ed.undo(&mut t).unwrap().as_deref(), Some("outside"));
+    assert_eq!(state(&t.doc), before);
+    assert_eq!(ed.undo(&mut t).unwrap().as_deref(), Some("place NOT"));
+    assert_eq!(state(&t.doc), outside);
+}
+
+#[test]
+fn opening_another_document_clears_the_history() {
+    let (mut ed, t) = fixture();
+    ed.sync(&t.doc, "", "top");
+    ed.click_select(Some(ItemRef::Instance("or1".into())), None, false);
+    assert!(ed.history.undo_len() > 0);
+    let fresh = empty();
+    ed.sync(&fresh.doc, "", "top");
+    assert_eq!(ed.history.undo_len(), 0);
+    assert!(ed.selection.is_empty());
+}
+
+#[test]
+fn wire_from_free_space_onto_a_port_and_a_wire_end() {
+    let (mut ed, mut t) = fixture();
+    // A stub from free space to a free port: a one-ended net (AddNet), wire kept.
+    let p = port(&t.doc, "or1.in1").pos;
+    ed.draw_wire(&mut t, "top", &[p - gp(6, 0), p]).unwrap();
+    let n = net_with(&t.doc, "or1.in1").unwrap().clone();
+    assert_eq!(n.ends, vec![ep("or1.in1")]);
+    assert!(matches!(&t.log.last().unwrap()[0], EditOp::AddNet { .. }));
+    // Continuing from the stub's free end onto net A's wire: the two nets merge (net A has
+    // more ends and is kept); the stub's end point becomes a corner.
+    let a = net_with(&t.doc, "in1").unwrap().id.clone();
+    ed.draw_wire(&mut t, "top", &[p - gp(6, 0), gp(8, 0)])
+        .unwrap();
+    let merged = net_with(&t.doc, "or1.in1").unwrap();
+    assert_eq!(merged.id, a);
+    assert!(top(&t.doc).nets.iter().all(|x| x.id != n.id));
+    assert!(
+        t.doc.editor("top").unwrap().wires[&a]
+            .junctions
+            .contains(&gp(8, 0))
+    );
+    assert_valid(&t.doc);
+    // Nothing junction-like at the corner (only two directions meet there).
+    assert!(
+        !t.doc.editor("top").unwrap().wires[&a]
+            .junctions
+            .contains(&(p - gp(6, 0)))
+    );
+}

@@ -64,14 +64,18 @@ fn check(design: Design, def: &str, sel: &[String], ticks: u64, every: u64) -> P
     let change: DocChange = (&plan).into();
     let mut doc2 = doc.clone();
     change.apply_doc(&mut doc2).unwrap();
-    assert!(geometry_complete(&plan.package, doc2.editor("pkg_t").unwrap()));
+    assert!(geometry_complete(
+        &plan.package,
+        doc2.editor("pkg_t").unwrap()
+    ));
     assert!(doc2.editor(def).unwrap().covers(doc2.def(def).unwrap()));
     assert!(doc2.defs_missing_layout().is_empty());
     // … and the kernel path (what the sim thread does) agree.
     let orig_flat = flatten(&design).unwrap();
     let mut a = kernel(design.clone(), Mode::Timing);
     let mut b = kernel(design.clone(), Mode::Timing);
-    b.edit(&plan.ops()).unwrap_or_else(|e| panic!("kernel rejected: {e:?}"));
+    b.edit(&plan.ops())
+        .unwrap_or_else(|e| panic!("kernel rejected: {e:?}"));
     assert_eq!(b.design().unwrap().defs.len(), doc2.design.defs.len());
     let d_paths: Vec<String> = orig_flat
         .instances
@@ -177,7 +181,10 @@ fn sr_latch_half_at_top_level() {
     let first = d.top_def().unwrap().instances[0].id.clone();
     let plan = check(d, &top, &[first], 400, 1);
     assert_eq!(plan.pins.len(), 3);
-    assert_eq!(plan.pins.iter().filter(|p| p.decl.dir == Dir::Out).count(), 1);
+    assert_eq!(
+        plan.pins.iter().filter(|p| p.decl.dir == Dir::Out).count(),
+        1
+    );
 }
 
 #[test]

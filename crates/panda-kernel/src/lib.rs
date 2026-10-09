@@ -439,6 +439,9 @@ pub const OBSERVER_BATCH: usize = 4096;
 struct Samples {
     ticks: Vec<u64>,
     values: Vec<Logic>,
+    /// The observed nets include lazily computed nets of the active Fast engine (computed once
+    /// per `step_counted` call: the engine cannot change inside one).
+    lazy: bool,
 }
 
 impl Samples {
@@ -1249,6 +1252,9 @@ impl Kernel {
             return 0;
         }
         self.poll(false).ok();
+        if let (Some(obs), Some(Active::Fast { engine, .. })) = (obs.as_deref(), &self.active) {
+            self.samples.lazy = engine.needs_materialize(obs.nets());
+        }
         let start = self.tick();
         let mut done = 0;
         match unit {
@@ -1486,7 +1492,8 @@ impl Kernel {
                     samples.values.resize(at + nets.len(), Logic::X);
                     engine.gather(nets, &mut samples.values[at..]);
                 }
-                engine.run_sampled(last, nets, &mut samples.ticks, &mut samples.values);
+                let lazy = samples.lazy;
+                engine.run_sampled(last, nets, lazy, &mut samples.ticks, &mut samples.values);
                 if samples.ticks.len() >= OBSERVER_BATCH {
                     samples.flush(obs);
                 }
@@ -1595,6 +1602,52 @@ impl Kernel {
             values: self.current_values(),
             inputs,
             pending,
+        }
+    }
+
+    /// [`Kernel::snapshot`] into an existing [`State`], reusing its buffers: no allocation once
+    /// `s` has held a snapshot of this design (the input lists are rebuilt only when they
+    /// changed). For callers that snapshot periodically (e.g. checkpoints for waveform replay).
+    ///
+    /// # Panics
+    ///
+    /// If no design is loaded.
+    pub fn snapshot_into(&self, s: &mut State) {
+        let flat = self.flat();
+        s.tick = self.tick();
+        s.mode = self.mode;
+        if !Arc::ptr_eq(&s.flat, flat) {
+            s.flat = flat.clone();
+        }
+        s.values.clear();
+        match &self.active {
+            Some(Active::Timing(t)) => {
+                let sim = &t.sim;
+                s.values
+                    .extend((0..sim.netlist().num_nets).map(|n| sim.get(n)));
+            }
+            Some(Active::Fast { engine, .. }) => s.values.extend_from_slice(engine.values()),
+            None => {}
+        }
+        let applied_same = s.inputs.len() == self.applied.len()
+            && s.inputs.iter().all(|(k, v)| self.applied.get(k) == Some(v));
+        if !applied_same {
+            s.inputs.clear();
+            s.inputs
+                .extend(self.applied.iter().map(|(k, v)| (k.clone(), v.clone())));
+            s.inputs.sort_by(|a, b| a.0.cmp(&b.0));
+        }
+        let n_pending = self
+            .inputs
+            .iter()
+            .filter(|(k, v)| self.applied.get(*k) != Some(*v))
+            .count();
+        let pending_same = s.pending.len() == n_pending
+            && s.pending.iter().all(|(k, v)| {
+                self.inputs.get(k) == Some(v) && self.applied.get(k) != Some(v)
+            });
+        if !pending_same {
+            s.pending = self.pending_inputs();
         }
     }
 
