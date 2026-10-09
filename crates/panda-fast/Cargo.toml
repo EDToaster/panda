@@ -13,3 +13,7 @@ panda-compile.workspace = true
 panda-difftest.workspace = true
 panda-circuits.workspace = true
 panda-cpu8.workspace = true
+
+[features]
+# Cycle-counter probes in the event loop (`panda_fast::probe`), for profiling without a profiler.
+prof = []

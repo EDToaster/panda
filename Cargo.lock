@@ -67,7 +67,12 @@ dependencies = [
 name = "panda-fast"
 version = "0.1.0"
 dependencies = [
+ "panda-circuits",
+ "panda-compile",
+ "panda-cpu8",
+ "panda-difftest",
  "panda-netlist",
+ "panda-timing",
 ]
 
 [[package]]
@@ -81,7 +86,15 @@ dependencies = [
 name = "panda-kernel"
 version = "0.1.0"
 dependencies = [
+ "panda-circuits",
+ "panda-compile",
+ "panda-cpu8",
+ "panda-difftest",
+ "panda-fast",
  "panda-netlist",
+ "panda-sta",
+ "panda-timing",
+ "serde_json",
 ]
 
 [[package]]
