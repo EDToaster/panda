@@ -25,6 +25,7 @@
 | D12 | Fast-mode reference | FastRef, a direct interpreter of §6.2, is the oracle. Compiled engines must match it bit-for-bit, including diagnostics kinds per event. |
 | D13 | Compiled execution | Round-faithful (kernels transition only at round boundaries). Kernel ops are specialized per clock phase into opaque/transparent fast paths with exactness proven from the tables. Single-pass phases are not used. |
 | D14 | Reference CPU ROM | Panda-8 default ROM is a sum-of-products decoder (3,671 gates total). The literal mux-tree ROM (7,726 gates) remains a variant. Both compile to LUTs. |
+| D15 | UI stack | **egui + wgpu (eframe), desktop first.** The UI runs in-process with the kernel; the simulation runs on its own thread and must keep ≥ 95% of headless throughput with the editor open (docs/M6-UI.md). |
 
 ---
 
@@ -67,7 +68,7 @@
 | `panda-kernel` | Facade (§10): modes, edits, snapshots, classification, background compile, tiering |
 | `panda-cli` | `panda` binary: run/test/sta/classify/kernels/gen/bench, VCD, test vectors |
 | `panda-difftest` | Random design generators and differential harnesses (Timing ↔ FastRef ↔ FastSim ↔ JIT) |
-| `panda-ui` | Editor/renderer (M6; tech choice deferred — egui/wgpu, Bevy, or web over WASM) |
+| `panda-ui` | Editor (M6): eframe/egui + wgpu, sim thread + lock-free snapshots (docs/M6-UI.md) |
 
 ---
 
