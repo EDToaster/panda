@@ -26,8 +26,8 @@
 //!   inverters, path-condition restrictions). Which state nets can change, the structural minimum
 //!   and the tabulated maximum latency, entry-derived literals. Nets that may change only
 //!   *transiently* (a pulse back to the initial value) are found by unit-delay simulation of the
-//!   entries (exact bursts) or from the ternary A states (other bursts) and also get a (glitchy)
-//!   window. Kernels without a table are treated conservatively (any input change may change
+//!   entries (exact bursts), from the timed check, or from the ternary A states (other bursts)
+//!   and also get a (glitchy) window. Kernels without a table are treated conservatively (any input change may change
 //!   every output, settle bound `4 × nets + 8 + 2 × p2_limit`).
 //!
 //! The analysis iterates to a fixpoint; an event whose rounds exceed `delta_limit`, or whose
@@ -40,19 +40,31 @@
 //!   that phase). `min_period` per clock is the smallest even period (keeping the clock's
 //!   high/period ratio) for which every event of that clock settles in its part of the cycle.
 //! * **Hold** (§9.2): at every kernel, all input changes of round `r' > r` must arrive no earlier
-//!   than the round-`r` transition has settled (`last round-r arrival + latency`, the tick of the
-//!   last kernel-net change). At that tick the kernel holds the stable state Fast mode computed,
-//!   so the later burst is an ordinary table transition in both modes; the condition is therefore
-//!   exact at equality (`≥`, not `>`). Overlapping rounds are still accepted when the *merged*
-//!   burst is burst-safe (below), e.g. data reaching a latch that is still opening.
+//!   than the round-`r` transition has settled (the tick of the last kernel-net change). At that
+//!   tick the kernel holds the stable state Fast mode computed, so the later burst is an ordinary
+//!   table transition in both modes; the condition is therefore exact at equality (`≥`, not `>`).
+//!   Overlapping rounds are still accepted when the *merged* burst passes the timed check or is
+//!   burst-safe (below), e.g. a flip-flop's own feedback (or another flip-flop's output)
+//!   reaching it after its master closed but while its slave is still settling, or data reaching
+//!   a latch that is still opening.
 //! * **Bursts and guard hazards** (§9.3, §6.3 cond. 3–4): a round's burst at a kernel is *exact*
-//!   when one clean input changes, or all changing inputs change cleanly at the same tick. Any
-//!   other burst (skewed arrival, glitching inputs) must be *burst-safe*: Eichelberger ternary
-//!   simulation (changing inputs at `X`, then their final values) ends in the state the table
-//!   predicts, for every feasible entry, so arrival order, skew and glitches cannot matter. A
-//!   failing burst with glitching inputs is a `GuardHazard` (glitchy enables, pulse-generated
-//!   clocks); with clean but skewed inputs it is a `HoldViolation`. Glitches on data inputs of
-//!   opaque or transparent latches pass this check.
+//!   when one clean input changes, or all changing inputs change cleanly at the same tick; its
+//!   output windows come from unit-delay simulation of every feasible entry (each net's own first
+//!   and last change, not the whole transition's latency). Any other burst (skewed arrival,
+//!   glitching inputs, overlapping rounds) is accepted if it passes the *timed check*: every
+//!   feasible entry is simulated with Timing mode's unit delays in ternary logic, each changing
+//!   input holding its initial value before its arrival window, `X` inside it and its final value
+//!   after it (exact outside the windows, so a clock change that arrives cleanly first is
+//!   simulated exactly), and must end in the binary state Fast mode computes (the table
+//!   transition, or for overlapping rounds the chain of round transitions, with every possible
+//!   intermediate value of an input that changes in several rounds); period-2 collapse is
+//!   accounted for. Its output windows are the simulated change ticks. Otherwise the burst must
+//!   be *burst-safe*: Eichelberger ternary simulation (changing inputs at `X`, then their final
+//!   values) ends in the state the table predicts, for every feasible entry, so arrival order,
+//!   skew and glitches cannot matter. A failing burst with glitching inputs is a `GuardHazard`
+//!   (glitchy enables, pulse-generated clocks); with clean but skewed inputs it is a
+//!   `HoldViolation`. Timed checks have a work budget per event (beyond it, only burst safety is
+//!   tried), and kernel output windows only grow during the fixpoint iteration.
 //! * **DelaySensitive** (advisory, info severity): a reachable table entry with several inputs
 //!   changing in one round is flagged order-sensitive by characterization.
 //! * Kernels with an input vector without stable state (oscillators, §6.3 cond. 5) are an
@@ -73,8 +85,9 @@
 //! never glitches internally (only inputs changing at different ticks make it change several
 //! times). Block elements absorbed into a kernel as private fan-in make the rounds in which an
 //! input reaching them changes delay-independent (ternary burst safety even for one clean change)
-//! with the blocks' latency added; a block element on a feedback loop of a kernel is an error
-//! (Fast mode's transitions simulate its gates one by one).
+//! with the blocks' latency added (the timed check, which assumes unit-delay gates, is not used
+//! for them); a block element on a feedback loop of a kernel is an error (Fast mode's transitions
+//! simulate its gates one by one).
 //!
 //! # Scope
 //!

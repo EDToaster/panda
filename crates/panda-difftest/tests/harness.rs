@@ -120,9 +120,12 @@ fn minimizer_shrinks_a_mismatching_design() {
     let o = (0..60u64)
         .map(|s| run_seed(s, &cfg))
         .find(|o| {
+            // Not an ideal-block run: the minimizer inlines the design, which removes the
+            // packages Timing mode would evaluate as ideal blocks.
             o.class == Class::FlaggedMismatch
                 && o.runtime_flags.is_empty()
                 && o.explained.is_empty()
+                && !o.features.contains(&"ideal_blocks")
         })
         .expect("a flagged-and-mismatching design");
     let g = panda_difftest::generate(o.seed, &cfg.generator, o.scale);

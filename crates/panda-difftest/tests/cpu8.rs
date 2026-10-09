@@ -58,39 +58,33 @@ fn panda8_every_program_and_ideal_blocks() {
             },
         );
     }
-    // Ideal blocks take their full latency on every output change, so they need a longer period
-    // than the glass-box STA minimum (see the crate docs); 1.5× the default minimum suffices.
+    // Ideal blocks: STA analyzes for ideal blocks too (each block output changes its full latency
+    // after an input change), so the STA minimum period is used directly.
     for p in [programs::FIBONACCI, programs::MULTIPLY] {
         let image = p.image();
         for variant in Variant::ALL {
             for rom in ROMS {
-                let min = run_cpu8(
-                    variant,
-                    rom,
-                    &image,
-                    &Cpu8Config {
-                        cycles: 1,
-                        ..Cpu8Config::default()
-                    },
-                )
-                .unwrap()
-                .min_period;
-                let period = Some((min * 3 / 2).next_multiple_of(2));
                 let r = run_cpu8(
                     variant,
                     rom,
                     &image,
                     &Cpu8Config {
                         cycles: 2000,
-                        period,
+                        period: None,
                         ideal_blocks: true,
                     },
                 )
                 .unwrap();
+                println!(
+                    "{} {variant:?} {rom:?} ideal blocks: min period {} compared {}",
+                    p.name, r.min_period, r.diff.compared
+                );
                 assert!(
                     r.ok(),
-                    "{} {variant:?} {rom:?} ideal blocks @ {period:?}: {:?}",
+                    "{} {variant:?} {rom:?} ideal blocks @ {}: STA {:?}, {:?}",
                     p.name,
+                    r.period,
+                    r.sta_errors,
                     r.diff.first().map(ToString::to_string)
                 );
             }

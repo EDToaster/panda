@@ -14,7 +14,11 @@
 //! * the first mismatch involves only `X`/`Z` values and a `Contention` diagnostic was raised in
 //!   that window (bus contention creates `X`; STA reasons about binary values);
 //! * [`recheck`] attributes a clean mismatch to phases that were too short for a documented
-//!   reason (`IdealLatency`, `XSettle`).
+//!   reason (`XSettle`).
+//!
+//! Designs whose Timing-mode run uses ideal blocks are analyzed by STA for ideal blocks too
+//! ([`StaOptions::ideal_blocks`], with the driver's glass-box set), so clock periods and input
+//! placement account for the blocks' latencies.
 //!
 //! Everything else that mismatches is [`Class::CleanMismatch`] — a bug.
 
@@ -86,10 +90,6 @@ pub struct HarnessConfig {
     /// seed loops, smaller/larger Table kernels; the choice is a function of the seed).
     /// Correctness must not depend on which kernels are found (SPEC §8.3).
     pub extract_variant_pct: u32,
-    /// Time-unit multiplier for ideal-block runs. STA analyzes the glass-box gates, but an ideal
-    /// block's output always changes after its full (max-depth) latency, so ideal-block designs
-    /// can need longer phases than STA's `min_period`.
-    pub ideal_scale_factor: u32,
 }
 
 impl Default for HarnessConfig {
@@ -103,7 +103,6 @@ impl Default for HarnessConfig {
             max_scale: 1024,
             timing_flags: true,
             ideal_pct: 30,
-            ideal_scale_factor: 2,
             extract_variant_pct: 20,
             input_settle_factor: 1,
         }
@@ -135,9 +134,8 @@ pub struct Outcome {
     pub features: Vec<&'static str>,
     /// Why the design was skipped.
     pub skip_reason: Option<String>,
-    /// Other explanations of a mismatch found by the harness (e.g. `"IdealLatency"`: the mismatch
-    /// disappears when the ideal-block run gets much longer phases — STA analyzes glass-box gates,
-    /// while an ideal block always takes its full latency).
+    /// Other explanations of a mismatch found by the harness (e.g. `"XSettle"`, see
+    /// [`recheck`]).
     pub explained: Vec<&'static str>,
     /// Wall time spent on this design (milliseconds).
     pub millis: u64,
@@ -285,10 +283,17 @@ pub fn prepare_with(
     let mut vr = crate::rng::Rng::new(seed ^ 0xE57_AC7);
     let variant = vr.chance(cfg.extract_variant_pct);
     let owned;
-    let cfg = if variant {
+    let cfg = if variant || ideal_blocks {
         let mut c = cfg.clone();
-        c.fast.extract.max_loop = *vr.pick(&[2, 3, 4, 8]);
-        c.fast.extract.max_bits = *vr.pick(&[4, 6, 8, 10]);
+        if variant {
+            c.fast.extract.max_loop = *vr.pick(&[2, 3, 4, 8]);
+            c.fast.extract.max_bits = *vr.pick(&[4, 6, 8, 10]);
+        }
+        if ideal_blocks {
+            // STA for the Timing mode the driver runs: ideal blocks, same glass-box set.
+            c.sta.ideal_blocks = true;
+            c.sta.glass_box = c.driver.timing.glass_box.clone();
+        }
         owned = c;
         &owned
     } else {
@@ -296,7 +301,6 @@ pub fn prepare_with(
     };
     let mut scale = cfg.initial_scale;
     let mut tried = 0;
-    let mut stretched = false;
     let (g, flat, a, ks, tables) = loop {
         let g = make(scale);
         scale = g.scale;
@@ -319,10 +323,6 @@ pub fn prepare_with(
         };
         match next {
             Some(n) if n <= cfg.max_scale && tried < 6 => scale = n,
-            _ if ideal_blocks && !fixed_scale && !stretched => {
-                stretched = true;
-                scale = (scale * cfg.ideal_scale_factor).next_multiple_of(2);
-            }
             _ => break (g, flat, a, ks, tables),
         }
     };
@@ -343,9 +343,6 @@ pub fn prepare_with(
     };
     let mut plan = plan_from_report(&a.report, &flat, compare_from(&g), seed, scale / 4);
     plan.input_settle *= u64::from(cfg.input_settle_factor);
-    if ideal_blocks {
-        plan.input_settle *= u64::from(cfg.ideal_scale_factor);
-    }
     if ideal_blocks {
         out.features.push("ideal_blocks");
     }
@@ -516,15 +513,13 @@ pub fn stretch_design(design: &panda_netlist::Design, k: u32) -> panda_netlist::
 
 /// Re-examine a clean-but-mismatch outcome: rerun the same design with every period, the reset
 /// and the input settle allowance 4× longer. If both engines then agree, the mismatch came from
-/// phases that were too short, which STA cannot see in two documented cases:
-/// * `"IdealLatency"`: Timing mode ran with ideal blocks, whose outputs always take the full
-///   (max-depth) latency, while STA analyzes the glass-box gates;
+/// phases that were too short, which STA cannot see in one documented case:
 /// * `"XSettle"`: every disagreeing net involves `X` — STA reasons about binary values (e.g.
 ///   `a AND NOT a = 0` blocks a path that an `X` on `a` sensitizes), and a persistent `X` (state
 ///   never reset) makes the real settle time longer.
 ///
-/// Otherwise (binary values, glass-box) the outcome stays a bug; a note records whether longer
-/// phases help (an STA setup bound that is too small) or not.
+/// Otherwise (binary values) the outcome stays a bug; a note records whether longer phases help
+/// (an STA setup bound that is too small) or not.
 pub fn recheck(g: &Generated, o: &mut Outcome, cfg: &HarnessConfig) {
     if o.class != Class::CleanMismatch {
         return;
@@ -551,9 +546,7 @@ pub fn recheck(g: &Generated, o: &mut Outcome, cfg: &HarnessConfig) {
         .as_ref()
         .and_then(DiffResult::first)
         .is_some_and(|m| m.only_unknown);
-    if agrees && o.features.contains(&"ideal_blocks") {
-        o.explained.push("IdealLatency");
-    } else if agrees && only_unknown {
+    if agrees && only_unknown {
         o.explained.push("XSettle");
     } else {
         o.notes

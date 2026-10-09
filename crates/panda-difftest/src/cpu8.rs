@@ -8,7 +8,7 @@ use panda_compile::{FastOptions, FastRef, KernelOptions, compile_kernels};
 use panda_cpu8::emu::Emulator;
 use panda_cpu8::{Options, RomStyle, Variant, panda8_with};
 use panda_netlist::flatten;
-use panda_sta::analyze;
+use panda_sta::{StaOptions, analyze_with};
 
 use crate::driver::{self, DiffResult, DriverOptions, Plan};
 
@@ -53,7 +53,7 @@ pub struct Cpu8Config {
     pub cycles: u64,
     /// Clock period; `None` = the STA minimum period (rounded up to an even value ≥ 8).
     pub period: Option<u32>,
-    /// Run Timing mode with ideal blocks (SPEC §5.2).
+    /// Run Timing mode with ideal blocks (SPEC §5.2); STA then analyzes for ideal blocks too.
     pub ideal_blocks: bool,
 }
 
@@ -75,10 +75,18 @@ pub fn run_cpu8(
     cfg: &Cpu8Config,
 ) -> Result<Cpu8Report, String> {
     let (cycles, period) = (cfg.cycles, cfg.period);
+    let timing = DriverOptions::default()
+        .timing
+        .with_ideal_blocks(cfg.ideal_blocks);
+    let sta = StaOptions {
+        ideal_blocks: timing.ideal_blocks,
+        glass_box: timing.glass_box.clone(),
+        ..StaOptions::default()
+    };
     let base = Options::new(variant).with_rom(rom);
     let flat0 = flatten(&panda8_with(program, &base)).map_err(|e| format!("{e:?}"))?;
     let (ks0, t0) = compile_kernels(&flat0, &KernelOptions::default());
-    let r0 = analyze(&flat0, &ks0, &t0);
+    let r0 = analyze_with(&flat0, &ks0, &t0, &sta);
     let min_period = r0.max_min_period().ok_or("no min period")?;
     if min_period == u32::MAX {
         return Err("unbounded min period".into());
@@ -87,7 +95,7 @@ pub fn run_cpu8(
     let opts = base.with_period(p);
     let flat = Arc::new(flatten(&panda8_with(program, &opts)).map_err(|e| format!("{e:?}"))?);
     let (ks, tables) = compile_kernels(&flat, &KernelOptions::default());
-    let r = analyze(&flat, &ks, &tables);
+    let r = analyze_with(&flat, &ks, &tables, &sta);
     let sta_errors = r.errors().map(|d| d.to_string()).collect();
     let fast = FastRef::from_parts(flat.clone(), FastOptions::default(), ks, tables)
         .map_err(|e| format!("{e:?}"))?;
@@ -104,9 +112,7 @@ pub fn run_cpu8(
     let dopts = DriverOptions {
         phases: reset_phases + 2 * cycles as usize,
         stop_at_first: true,
-        timing: DriverOptions::default()
-            .timing
-            .with_ideal_blocks(cfg.ideal_blocks),
+        timing,
         ..DriverOptions::default()
     };
     let (period64, phase64) = (u64::from(p), u64::from(p / 2));

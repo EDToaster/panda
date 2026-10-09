@@ -15,16 +15,19 @@
 //!   pass). Contributions with contradictory conditions are dropped. The output may glitch
 //!   (`multi`) if two compatible contributions of the same label arrive at different ticks, or one
 //!   of them glitches.
-//! * **Kernels** are queried per input label through [`Model::round`] (see `kernel_round`); rounds
-//!   of one kernel whose bursts overlap in time are grouped and accepted only if the merged burst
-//!   is burst-safe (see `kernel_eval`).
+//! * **Kernels** are queried per input label through [`Model::round`] (see `kernel_round`);
+//!   non-exact bursts go through the timed check ([`Model::timed`]) first. Rounds of one kernel
+//!   whose bursts overlap in time are grouped and accepted only if the merged burst passes the
+//!   timed check or is burst-safe (see `kernel_eval`).
 //!
 //! The hold condition is exact at equality: if a later burst reaches the kernel's inputs at tick
 //! `t ≥ S`, where `S` is the tick of the last kernel-net change of the earlier transition, then at
 //! `t` the kernel holds its stable state and the gates reading the new inputs evaluate from exactly
 //! the values the table transition starts from.
 //!
-//! The analysis iterates to a fixpoint (everything grows monotonically). Labels beyond the delta
+//! The analysis iterates to a fixpoint (everything grows monotonically; kernel output windows are
+//! joined with those of the previous iteration, since a burst may pass the timed check with
+//! narrow input windows and need the coarser analysis with wider ones). Labels beyond the delta
 //! limit mean the event may never settle (e.g. a loop through transparent kernels).
 
 use std::collections::BTreeSet;
@@ -35,7 +38,7 @@ use panda_netlist::flat::{Driver, FlatNetlist, FlatOp, NetIdx};
 use panda_netlist::{DiagKind, Diagnostic, Logic, Severity, Termination};
 
 use crate::cond::Cond;
-use crate::model::{Burst, INF, Model, ModelLimits, RoundSig, Transient};
+use crate::model::{Arrival, Burst, INF, Model, ModelLimits, RoundSig, Timed, Transient};
 use crate::schedule::EventSpec;
 
 /// Largest number of kernel inputs a [`RoundSig`] describes (bit masks are `u32`); kernels with
@@ -110,7 +113,13 @@ pub(crate) struct Ctx<'a, 't> {
     /// Window bound: a change later than this means the event may never settle.
     pub max_window: u32,
     pub advisory: bool,
+    /// Element evaluations left for timed burst checks in the current event (beyond: the
+    /// delay-independent ternary analysis is used).
+    timed_budget: u64,
 }
+
+/// Element evaluations of timed burst checks per event.
+const TIMED_EVENT_BUDGET: u64 = 1 << 22;
 
 /// Result of one event.
 #[derive(Clone, Debug, Default)]
@@ -288,6 +297,7 @@ impl<'a, 't> Ctx<'a, 't> {
             max_iterations: 20_000,
             max_window,
             advisory,
+            timed_budget: TIMED_EVENT_BUDGET,
         }
     }
 
@@ -342,6 +352,7 @@ impl<'a, 't> Ctx<'a, 't> {
 
     /// Analyze one event.
     pub(crate) fn run_event(&mut self, spec: &EventSpec) -> EventOutcome {
+        self.timed_budget = TIMED_EVENT_BUDGET;
         let pre_src: Vec<Logic> = spec.src.iter().map(|s| s.pre).collect();
         let post_src: Vec<Logic> = spec.src.iter().map(|s| s.post).collect();
         let n = self.flat.num_nets as usize;
@@ -406,6 +417,10 @@ impl<'a, 't> Ctx<'a, 't> {
                 kernel_dirty[kid] = false;
                 let outs = self.kernel_outputs(kid, &mut ev);
                 for (o, w) in outs {
+                    // Kernel output windows only grow from one iteration to the next (a burst may
+                    // pass the timed check with narrow input windows and fall back to the coarser
+                    // analysis with wider ones): the fixpoint iteration stays monotone.
+                    let w = join_wins(&ev.act[o as usize], w);
                     if w != ev.act[o as usize] {
                         if w.iter().any(|x| x.max > self.max_window) {
                             ev.unbounded = true;
@@ -746,6 +761,23 @@ impl<'a, 't> Ctx<'a, 't> {
                     .unwrap_or_else(|| Burst::unsafe_with(rr.lat_all, m)),
             )
         };
+        // Timed check of a non-exact burst: exact unit-delay simulation outside the inputs'
+        // arrival windows (see `Model::timed`).
+        let timed = if !exact && !conservative && extra == 0 && rr.entries > 0 {
+            let (arr, t0) = arrivals(&cwins, k, r);
+            model
+                .timed(&sig, &arr, 1, &self.limits, &mut self.timed_budget)
+                .filter(|t| t.safe)
+                .map(|t| (t, t0))
+        } else {
+            None
+        };
+        let timed = timed.map(|(td, t0)| {
+            (
+                timed_windows(&td, t0, &cwins, &in_roots),
+                t0.saturating_add(td.settle),
+            )
+        });
         let (safe, bsteps) = burst.as_ref().map_or((true, 0), |b| (b.safe, b.steps));
         // Transiently changing state nets: from unit-delay simulation for exact bursts, from the
         // ternary A states otherwise.
@@ -819,6 +851,16 @@ impl<'a, 't> Ctx<'a, 't> {
                 if min == INF {
                     min = min_arr;
                 }
+                // Exact burst: the unit-delay simulation of every feasible entry gives the ticks
+                // (after the burst's change) at which this net changes.
+                let sim_span = if exact {
+                    rr.span.as_ref().and_then(|sp| sp[p])
+                } else {
+                    None
+                };
+                if let Some((f, _)) = sim_span {
+                    min = min.max(min_arr.saturating_add(f));
+                }
                 let mut cond = cond.unwrap_or_default();
                 let lits: Vec<(NetIdx, bool)> = (0..k)
                     .filter(|&j| lit_mask >> j & 1 == 1)
@@ -827,9 +869,11 @@ impl<'a, 't> Ctx<'a, 't> {
                 if let Some(u) = Cond::from_lits(lits).and_then(|l| cond.union(&l)) {
                     cond = u;
                 }
-                let max = max_arr
-                    .saturating_add(lat.saturating_add(extra).max(lat_extra))
-                    .max(min);
+                let max = match sim_span {
+                    Some((_, l)) => max_arr.saturating_add(l),
+                    None => max_arr.saturating_add(lat.saturating_add(extra).max(lat_extra)),
+                }
+                .max(min);
                 outs.push((
                     o,
                     Win {
@@ -843,18 +887,55 @@ impl<'a, 't> Ctx<'a, 't> {
                 ));
             }
         }
-        let settle = max_arr.saturating_add(if rr.entries > 0 {
+        let mut settle = max_arr.saturating_add(if rr.entries > 0 {
             rr.lat_all.saturating_add(extra).max(lat_extra)
         } else {
             0
         });
+        let mut safe = safe || rr.entries == 0;
+        if let Some((wins, tsettle)) = timed {
+            // The burst passed the timed check: its windows are sound. If the ternary check passed
+            // too, both window sets are, and so is their intersection.
+            let mut touts = Vec::new();
+            if r + 1 < self.delta_limit {
+                for (oi, &o) in kernel.outputs.iter().enumerate() {
+                    let p = self.kernel_out_pos[kid][oi];
+                    let Some((tmin, tmax, tmulti, tcond)) = &wins[p] else {
+                        continue;
+                    };
+                    let mut w = Win {
+                        label: r + 1,
+                        min: *tmin,
+                        max: *tmax,
+                        multi: *tmulti,
+                        cond: tcond.clone(),
+                        pred,
+                    };
+                    if safe {
+                        let Some((_, ow)) = outs.iter().find(|(n, _)| *n == o) else {
+                            continue;
+                        };
+                        w.min = w.min.max(ow.min);
+                        w.max = w.max.min(ow.max).max(w.min);
+                        w.multi &= ow.multi;
+                        if let Some(c) = w.cond.union(&ow.cond) {
+                            w.cond = c;
+                        }
+                    }
+                    touts.push((o, w));
+                }
+            }
+            outs = touts;
+            settle = if safe { settle.min(tsettle) } else { tsettle };
+            safe = true;
+        }
         RoundOutcome {
             outs,
             settle,
             min_arr,
             max_arr,
             exact,
-            safe: safe || rr.entries == 0,
+            safe,
             c_inputs: cwins.iter().map(|&(j, _)| kernel.inputs[j]).collect(),
             multi_inputs: cwins
                 .iter()
@@ -969,106 +1050,33 @@ impl<'a, 't> Ctx<'a, 't> {
             }
         }
         // Group rounds whose bursts overlap in time (a later round arrives before the earlier one
-        // settled). A group is acceptable if the merged burst is burst-safe.
+        // settled). A group is acceptable if the timed check of the merged burst passes (rounds
+        // are added one at a time while the group's exact settle time still overlaps the next
+        // round), or else if the merged burst is burst-safe (ternary, any delays).
         let mut i = 0;
         while i < rounds.len() {
             let mut j = i;
             let mut gsettle = rounds[i].1.settle;
-            let mut checked_upto = i;
-            let mut merged_safe = true;
-            let mut merged: Option<MergedBurst> = None;
-            loop {
-                while j + 1 < rounds.len() && rounds[j + 1].1.min_arr < gsettle {
-                    j += 1;
-                    gsettle = gsettle.max(rounds[j].1.settle);
-                }
-                if j == checked_upto {
-                    break;
-                }
-                checked_upto = j;
-                let (lo, hi) = (rounds[i].0, rounds[j].0);
-                let mb = self.merged_burst(kid, lo, hi, ev);
-                let (safe, bsteps) = (mb.safe, mb.steps);
-                merged = Some(mb);
-                let max_arr = rounds[i..=j].iter().map(|x| x.1.max_arr).max().unwrap_or(0);
-                if !safe {
-                    merged_safe = false;
-                    // Report the first overlapping pair.
-                    let mut s = rounds[i].1.settle;
-                    for x in i + 1..=j {
-                        if rounds[x].1.min_arr < s {
-                            let (r1, r2) = (rounds[x - 1].0, rounds[x].0);
-                            let early = rounds[x]
-                                .1
-                                .c_inputs
-                                .iter()
-                                .copied()
-                                .min_by_key(|&n| {
-                                    ev.act[n as usize]
-                                        .iter()
-                                        .find(|w| w.label == r2)
-                                        .map_or(INF, |w| w.min)
-                                })
-                                .expect("nonempty");
-                            ke.hold.push(HoldIssue {
-                                early_round: r2,
-                                early_net: early,
-                                early_tick: rounds[x].1.min_arr,
-                                round: r1,
-                                inputs: rounds[x - 1].1.c_inputs.clone(),
-                                settle: s,
-                            });
-                            break;
-                        }
-                        s = s.max(rounds[x].1.settle);
+            let mut timed: Option<(Timed, u32, Vec<Option<TimedWin>>)> = None;
+            let mut fallback = false;
+            while j + 1 < rounds.len() && rounds[j + 1].1.min_arr < gsettle {
+                j += 1;
+                match self.timed_group(kid, rounds[i].0, rounds[j].0, ev) {
+                    Some(tg) => {
+                        gsettle = tg.1.saturating_add(tg.0.settle);
+                        timed = Some(tg);
                     }
-                    break;
+                    None => {
+                        timed = None;
+                        fallback = true;
+                        break;
+                    }
                 }
-                gsettle =
-                    gsettle.max(max_arr.saturating_add(bsteps).saturating_add(
-                        self.round_extra(kid, 0..self.ks.kernels[kid].inputs.len()),
-                    ));
             }
-            if j > i && merged_safe {
-                for x in &mut rounds[i..=j] {
-                    x.1.settle = gsettle;
-                    for (_, w) in &mut x.1.outs {
-                        w.max = w.max.max(gsettle);
-                        w.multi = true;
-                    }
-                }
-                // Nets that may change only under the merged (interleaved) burst: give them a
-                // window in the group's first round, covering the whole group.
-                if let Some(mb) = &merged {
-                    let (lo, pred) = (rounds[i].0, rounds[i].1.pred);
-                    let ks = self.ks;
-                    let kernel = &ks.kernels[kid];
-                    if lo + 1 < self.delta_limit {
-                        for (oi, &o) in kernel.outputs.iter().enumerate() {
-                            let p = self.kernel_out_pos[kid][oi];
-                            let Some(c) = &mb.changes[p] else { continue };
-                            let gmin = mb.earliest[p];
-                            let outs = &mut rounds[i].1.outs;
-                            match outs.iter_mut().find(|(n, _)| *n == o) {
-                                Some((_, w)) => {
-                                    w.min = w.min.min(gmin);
-                                    w.cond = w.cond.intersect(c);
-                                }
-                                None => outs.push((
-                                    o,
-                                    Win {
-                                        label: lo + 1,
-                                        min: gmin,
-                                        max: gsettle,
-                                        multi: true,
-                                        cond: c.clone(),
-                                        pred,
-                                    },
-                                )),
-                            }
-                        }
-                    }
-                }
+            if fallback {
+                self.group_fallback(kid, ev, &mut rounds, i, &mut j, &mut ke);
+            } else if let Some((_, _, wins)) = timed {
+                self.apply_timed_group(kid, &mut rounds[i..=j], gsettle, &wins);
             }
             i = j + 1;
         }
@@ -1087,6 +1095,221 @@ impl<'a, 't> Ctx<'a, 't> {
         }
         ke.rounds = rounds;
         ke
+    }
+
+    /// Timed check of the merged burst of labels `lo..=hi` at kernel `kid` (see `Model::timed`):
+    /// `Some((result, burst start tick, per state net window))` if it passes.
+    fn timed_group(
+        &mut self,
+        kid: usize,
+        lo: u16,
+        hi: u16,
+        ev: &Ev,
+    ) -> Option<(Timed, u32, Vec<Option<TimedWin>>)> {
+        let k = self.ks.kernels[kid].inputs.len();
+        if k > MAX_SIG_INPUTS || self.kernel_conservative[kid] {
+            return None;
+        }
+        let sb = self.build_sig(kid, lo, hi, ev);
+        if sb.cwins.is_empty() || self.round_extra(kid, sb.cwins.iter().map(|&(j, _)| j)) != 0 {
+            return None;
+        }
+        let (arr, t0) = arrivals(&sb.cwins, k, lo);
+        let mi = self.kernel_model[kid];
+        let td = self.models[mi]
+            .timed(
+                &sb.sig,
+                &arr,
+                hi - lo + 1,
+                &self.limits,
+                &mut self.timed_budget,
+            )
+            .filter(|t| t.safe)?;
+        let wins = timed_windows(&td, t0, &sb.cwins, &sb.in_roots);
+        Some((td, t0, wins))
+    }
+
+    /// Accept a group of overlapping rounds whose merged burst passed the timed check: every
+    /// round settles at `gsettle`; each output's windows in the group all get the same tick range
+    /// (covering the timed simulation's changes and every round's earliest change) and are
+    /// marked glitchy, so later kernels see them as one overlapping burst; an output that changes
+    /// in Timing mode without a round window gets one in the group's first round.
+    fn apply_timed_group(
+        &self,
+        kid: usize,
+        group: &mut [(u16, RoundOutcome)],
+        gsettle: u32,
+        wins: &[Option<TimedWin>],
+    ) {
+        let (lo, pred) = (group[0].0, group[0].1.pred);
+        for x in group.iter_mut() {
+            x.1.settle = gsettle;
+            x.1.safe = true;
+        }
+        let kernel = &self.ks.kernels[kid];
+        for (oi, &o) in kernel.outputs.iter().enumerate() {
+            let p = self.kernel_out_pos[kid][oi];
+            let tw = &wins[p];
+            let mut hmin = tw.as_ref().map_or(INF, |w| w.0);
+            let mut hmax = tw.as_ref().map_or(0, |w| w.1);
+            let mut any = false;
+            for x in group.iter() {
+                for (n, w) in &x.1.outs {
+                    if *n == o {
+                        hmin = hmin.min(w.min);
+                        any = true;
+                    }
+                }
+            }
+            if !any && tw.is_none() {
+                continue;
+            }
+            hmax = hmax.max(hmin);
+            for x in group.iter_mut() {
+                for (n, w) in &mut x.1.outs {
+                    if *n == o {
+                        w.min = hmin;
+                        w.max = hmax;
+                        w.multi = true;
+                        if let Some(tw) = tw {
+                            w.cond = w.cond.intersect(&tw.3);
+                        }
+                    }
+                }
+            }
+            if !any
+                && lo + 1 < self.delta_limit
+                && let Some(tw) = tw
+            {
+                group[0].1.outs.push((
+                    o,
+                    Win {
+                        label: lo + 1,
+                        min: hmin,
+                        max: hmax,
+                        multi: true,
+                        cond: tw.3.clone(),
+                        pred,
+                    },
+                ));
+            }
+        }
+    }
+
+    /// The ternary merged-burst check of the group of overlapping rounds `i..=*j`: extends the
+    /// group while rounds overlap and accepts it if the merged burst is burst-safe (outputs get
+    /// the merged settle bound and are marked glitchy), otherwise records a [`HoldIssue`].
+    fn group_fallback(
+        &mut self,
+        kid: usize,
+        ev: &Ev,
+        rounds: &mut [(u16, RoundOutcome)],
+        i: usize,
+        j: &mut usize,
+        ke: &mut KernelEval,
+    ) {
+        let mut gsettle = rounds[i..=*j].iter().map(|x| x.1.settle).max().unwrap_or(0);
+        let mut checked_upto = i;
+        let mut merged_safe = true;
+        let mut merged: Option<MergedBurst> = None;
+        loop {
+            while *j + 1 < rounds.len() && rounds[*j + 1].1.min_arr < gsettle {
+                *j += 1;
+                gsettle = gsettle.max(rounds[*j].1.settle);
+            }
+            if *j == checked_upto {
+                break;
+            }
+            checked_upto = *j;
+            let (lo, hi) = (rounds[i].0, rounds[*j].0);
+            let mb = self.merged_burst(kid, lo, hi, ev);
+            let (safe, bsteps) = (mb.safe, mb.steps);
+            merged = Some(mb);
+            let max_arr = rounds[i..=*j]
+                .iter()
+                .map(|x| x.1.max_arr)
+                .max()
+                .unwrap_or(0);
+            if !safe {
+                merged_safe = false;
+                // Report the first overlapping pair.
+                let mut s = rounds[i].1.settle;
+                for x in i + 1..=*j {
+                    if rounds[x].1.min_arr < s {
+                        let (r1, r2) = (rounds[x - 1].0, rounds[x].0);
+                        let early = rounds[x]
+                            .1
+                            .c_inputs
+                            .iter()
+                            .copied()
+                            .min_by_key(|&n| {
+                                ev.act[n as usize]
+                                    .iter()
+                                    .find(|w| w.label == r2)
+                                    .map_or(INF, |w| w.min)
+                            })
+                            .expect("nonempty");
+                        ke.hold.push(HoldIssue {
+                            early_round: r2,
+                            early_net: early,
+                            early_tick: rounds[x].1.min_arr,
+                            round: r1,
+                            inputs: rounds[x - 1].1.c_inputs.clone(),
+                            settle: s,
+                        });
+                        break;
+                    }
+                    s = s.max(rounds[x].1.settle);
+                }
+                break;
+            }
+            gsettle = gsettle.max(
+                max_arr
+                    .saturating_add(bsteps)
+                    .saturating_add(self.round_extra(kid, 0..self.ks.kernels[kid].inputs.len())),
+            );
+        }
+        if *j > i && merged_safe {
+            for x in &mut rounds[i..=*j] {
+                x.1.settle = gsettle;
+                for (_, w) in &mut x.1.outs {
+                    w.max = w.max.max(gsettle);
+                    w.multi = true;
+                }
+            }
+            // Nets that may change only under the merged (interleaved) burst: give them a
+            // window in the group's first round, covering the whole group.
+            if let Some(mb) = &merged {
+                let (lo, pred) = (rounds[i].0, rounds[i].1.pred);
+                let ks = self.ks;
+                let kernel = &ks.kernels[kid];
+                if lo + 1 < self.delta_limit {
+                    for (oi, &o) in kernel.outputs.iter().enumerate() {
+                        let p = self.kernel_out_pos[kid][oi];
+                        let Some(c) = &mb.changes[p] else { continue };
+                        let gmin = mb.earliest[p];
+                        let outs = &mut rounds[i].1.outs;
+                        match outs.iter_mut().find(|(n, _)| *n == o) {
+                            Some((_, w)) => {
+                                w.min = w.min.min(gmin);
+                                w.cond = w.cond.intersect(c);
+                            }
+                            None => outs.push((
+                                o,
+                                Win {
+                                    label: lo + 1,
+                                    min: gmin,
+                                    max: gsettle,
+                                    multi: true,
+                                    cond: c.clone(),
+                                    pred,
+                                },
+                            )),
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Burst analysis of the merged burst of labels `lo..=hi` at kernel `kid`: safety, settle
@@ -1552,6 +1775,7 @@ fn make_conservative(rr: &mut crate::model::RoundResult, cmask: u32, bound: u32)
     rr.lat_all = lat;
     let m = rr.pos.len();
     rr.glitch = Some(Transient::all(m));
+    rr.span = None;
     rr.burst = Some(Burst::unsafe_with(lat, m));
     rr.entries = rr.entries.max(1);
 }
@@ -1604,4 +1828,104 @@ struct Ev {
     post: Vec<Logic>,
     act: Vec<Vec<Win>>,
     unbounded: bool,
+}
+
+/// A state net's window from a timed burst: `(min, max, multi, cond)` in absolute ticks.
+type TimedWin = (u32, u32, bool, Cond);
+
+/// Arrivals of the changing inputs of a burst (`cwins`, labels from `lo`), relative to the
+/// burst's first arrival, and that first arrival tick.
+fn arrivals(cwins: &[(usize, &Win)], k: usize, lo: u16) -> (Vec<Option<Arrival>>, u32) {
+    let t0 = cwins.iter().map(|(_, w)| w.min).min().unwrap_or(0);
+    let mut arr: Vec<Option<Arrival>> = vec![None; k];
+    let mut count = vec![0u32; k];
+    for &(j, w) in cwins {
+        count[j] += 1;
+        let l = w.label - lo;
+        arr[j] = Some(match arr[j] {
+            None => Arrival {
+                min: w.min - t0,
+                max: w.max - t0,
+                clean: !w.multi,
+                first_label: l,
+                last_label: l,
+            },
+            Some(a) => Arrival {
+                min: a.min.min(w.min - t0),
+                max: a.max.max(w.max - t0),
+                clean: false,
+                first_label: a.first_label.min(l),
+                last_label: a.last_label.max(l),
+            },
+        });
+    }
+    (arr, t0)
+}
+
+/// Per state net, the window of a passed timed burst starting at `t0`: the condition is the
+/// weakest one of the changes of the inputs with activity in the entries where the net changes
+/// (one of them must happen), plus the entry-derived literals.
+fn timed_windows(
+    td: &Timed,
+    t0: u32,
+    cwins: &[(usize, &Win)],
+    in_roots: &[(NetIdx, bool)],
+) -> Vec<Option<TimedWin>> {
+    td.nets
+        .iter()
+        .map(|tn| {
+            if !tn.active {
+                return None;
+            }
+            let mut base: Option<Cond> = None;
+            for (j, w) in cwins {
+                if tn.contrib >> j & 1 == 1 {
+                    base = Some(match base {
+                        None => w.cond.clone(),
+                        Some(c) => c.intersect(&w.cond),
+                    });
+                }
+            }
+            // No input had activity: the net changes without any (cannot happen in a passed
+            // check, but stay weak).
+            let base = base.unwrap_or_default();
+            let lits: Vec<(NetIdx, bool)> = (0..in_roots.len())
+                .filter(|&j| tn.lit_mask >> j & 1 == 1)
+                .map(|j| (in_roots[j].0, (tn.lit_val >> j & 1 == 1) ^ in_roots[j].1))
+                .collect();
+            let cond = Cond::from_lits(lits)
+                .and_then(|l| base.union(&l))
+                .unwrap_or_else(|| base.clone());
+            Some((
+                t0.saturating_add(tn.first),
+                t0.saturating_add(tn.last),
+                tn.multi,
+                cond,
+            ))
+        })
+        .collect()
+}
+
+/// Per label, the hull of the windows of `old` and `new` (conditions intersected, `multi` if
+/// either is). Each describes the possible changes soundly, so the hull does too.
+fn join_wins(old: &[Win], mut new: Vec<Win>) -> Vec<Win> {
+    for o in old {
+        match new.iter_mut().find(|w| w.label == o.label) {
+            None => new.push(o.clone()),
+            Some(w) => {
+                if w == o {
+                    continue;
+                }
+                w.min = w.min.min(o.min);
+                if o.max > w.max {
+                    w.max = o.max;
+                    w.pred = o.pred;
+                }
+                w.multi |= o.multi;
+                w.cond = w.cond.intersect(&o.cond);
+            }
+        }
+    }
+    new.sort_by_key(|w| w.label);
+    new
 }

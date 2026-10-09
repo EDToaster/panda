@@ -114,6 +114,32 @@ fn hold_violation_from_delayed_clock_is_flagged_and_real() {
 }
 
 #[test]
+fn data_reaching_a_settling_flip_flop_is_clean() {
+    // A 2-bit synchronous counter of toggle flip-flops (`Q ← Q ^ T`, synchronous reset), with
+    // `t1.T = t0.Q`. Each flip-flop (with its XOR) is one kernel. At a rising edge the round-1
+    // change of `t1.T` reaches `t1` while its round-0 transition (the slave opening) is still
+    // settling, but after the master has closed. The timed burst check accepts this; a ternary
+    // check of the merged burst (clock at `X`) cannot.
+    let mut db = DesignBuilder::new();
+    let tff = toggle_ff(&mut db);
+    let mut b = DefBuilder::new("counter2");
+    let clk = b.clock(64, 32, 32);
+    b.name(clk, "clk");
+    let rst = b.power_on_reset(2 * 64 + 16);
+    let one = b.lit(1, 1);
+    let q0 = b.inst_named("t0", &tff, &[one, rst, clk])[0];
+    let q1 = b.inst_named("t1", &tff, &[q0, rst, clk])[0];
+    b.output("Q0", q0);
+    b.output("Q1", q1);
+    let top = db.add(b.finish());
+    let flat = flat_of(&db.build(&top));
+    let r = sta(&flat);
+    dump("counter2", &r);
+    assert!(r.is_clean(), "{:?}", r.errors().collect::<Vec<_>>());
+    assert!(differential(&flat, 200, 200).expect("FastRef == Timing") > 150);
+}
+
+#[test]
 fn gated_clock_with_glitchy_enable_is_a_guard_hazard() {
     // en = s·1 + ¬s·1 (static-1 hazard when s changes), s toggles at every rising edge, and
     // gclk = clk · en is shared by two flip-flops.

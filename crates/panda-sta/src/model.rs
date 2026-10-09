@@ -15,7 +15,13 @@
 //!   skew and glitches of the changing inputs, under arbitrary delays. The number of B steps bounds
 //!   the settle time after the last input change.
 //! * **output glitches** — unit-delay simulation ([`KernelSim`]) of every feasible entry, recording
-//!   state nets that change more than once during the transition.
+//!   state nets that change more than once during the transition, and the first and last tick at
+//!   which each state net changes.
+//!
+//! A third check is a separate query, [`Model::timed`]: unit-delay ternary simulation of every
+//! feasible entry with the changing inputs at `X` only inside their arrival windows, compared
+//! with Fast mode's result (the table transition, or the chain of transitions of several
+//! overlapping rounds).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -197,6 +203,53 @@ impl Burst {
     }
 }
 
+/// When one changing kernel input of a timed burst may change (see [`Model::timed`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Arrival {
+    /// First and last tick, relative to the start of the burst, at which the input may change.
+    /// Before `min` it has its initial value, from `max` on its final value.
+    pub min: u32,
+    pub max: u32,
+    /// The input changes at most once (one clean window): it keeps its value in entries where the
+    /// final value equals the initial one.
+    pub clean: bool,
+    /// Fast round labels (relative to the burst's first round) of its first and last window.
+    pub first_label: u16,
+    pub last_label: u16,
+}
+
+/// What one state net does in a timed burst, over all feasible entries.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct TimedNet {
+    /// It may change (finally or transiently) in some entry.
+    pub active: bool,
+    /// First and last tick (relative to the burst start) at which it may change.
+    pub first: u32,
+    pub last: u32,
+    /// It may change more than once in some entry.
+    pub multi: bool,
+    /// Entry-derived literals common to the entries in which it may change.
+    pub lit_mask: u32,
+    pub lit_val: u32,
+    /// Union of the inputs with activity in those entries.
+    pub contrib: u32,
+}
+
+/// Result of a timed burst check (see [`Model::timed`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Timed {
+    /// Every feasible entry ends, in Timing mode, in the state Fast mode computes.
+    pub safe: bool,
+    /// Last tick (relative to the burst start) at which an input or a state net may change.
+    pub settle: u32,
+    /// Per state net (meaningful when `safe`).
+    pub nets: Vec<TimedNet>,
+}
+
+/// Largest number of inputs with a free intermediate value in one round of the Fast round chain
+/// of a multi-round timed burst.
+const MAX_CHAIN_FREE: u32 = 10;
+
 /// What one state net (position in `Kernel::nets`) does in a round.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct PosInfo {
@@ -229,6 +282,9 @@ pub(crate) struct RoundResult {
     /// value) during a single exact transition (lazily; bit `p` = state net `p`, all ones if
     /// unknown).
     pub glitch: Option<Transient>,
+    /// Computed with `glitch`: per state net, the first and last tick (after the input change) at
+    /// which it changes in some feasible entry (`None` inside = never; `None` = unknown).
+    pub span: Option<Spans>,
     /// Burst safety, settle bound and transient nets (lazily).
     pub burst: Option<Burst>,
     /// Some feasible transition may never settle (an oscillation with period > 2 that the table
@@ -268,7 +324,8 @@ pub(crate) struct Model<'t> {
     /// Max latency over the whole table (or the settle bound without a table).
     pub max_latency: u32,
     sim: Option<KernelSim>,
-    glitch_cache: HashMap<(u32, u32), u64>,
+    /// Unit-delay simulation of `(s, v)`: nets changing ≥ 2 times, per-net change span.
+    glitch_cache: HashMap<(u32, u32), Sim1>,
     /// Settling of non-binary table entries `(s, v)`: true = quiescent within the bound.
     settle_cache: HashMap<(u32, u32), bool>,
     /// Kernels without a table: settling of `(state, new inputs)` transitions.
@@ -277,6 +334,8 @@ pub(crate) struct Model<'t> {
     /// other elements (lazily; `None` inside = could not be built).
     cut_plan: Option<Option<CutPlan>>,
     rounds: HashMap<Vec<u32>, RoundResult>,
+    /// Timed burst checks by query key and arrivals (`None` = too much work).
+    timed_cache: HashMap<Vec<u32>, Option<Timed>>,
 }
 
 impl<'t> Model<'t> {
@@ -352,6 +411,7 @@ impl<'t> Model<'t> {
             sim_settle_cache: HashMap::new(),
             cut_plan: None,
             rounds: HashMap::new(),
+            timed_cache: HashMap::new(),
         }
     }
 
@@ -383,8 +443,10 @@ impl<'t> Model<'t> {
             self.rounds.insert(sig.key.clone(), r);
         }
         if need_glitch && self.rounds[&sig.key].glitch.is_none() {
-            let g = self.compute_glitch(sig, lim);
-            self.rounds.get_mut(&sig.key).expect("cached").glitch = Some(g);
+            let (g, span) = self.compute_glitch(sig, lim);
+            let r = self.rounds.get_mut(&sig.key).expect("cached");
+            r.glitch = Some(g);
+            r.span = span;
         }
         if need_burst && self.rounds[&sig.key].burst.is_none() {
             let b = self.compute_burst(sig, lim);
@@ -636,10 +698,12 @@ impl<'t> Model<'t> {
         res
     }
 
-    fn compute_glitch(&mut self, sig: &RoundSig, lim: &ModelLimits) -> Transient {
+    /// Glitching state nets of the feasible entries (unit-delay simulation of each), and the span
+    /// of ticks at which each state net changes (`None` if not simulated).
+    fn compute_glitch(&mut self, sig: &RoundSig, lim: &ModelLimits) -> (Transient, Option<Spans>) {
         let m = self.m;
         let Some(t) = self.table else {
-            return Transient::all(m);
+            return (Transient::all(m), None);
         };
         let mut todo: Vec<(u32, u32, u32)> = Vec::new();
         let mut over = false;
@@ -658,7 +722,7 @@ impl<'t> Model<'t> {
             }
         });
         if over {
-            return Transient::all(m);
+            return (Transient::all(m), None);
         }
         todo.sort_unstable_by_key(|&(s, _, v)| (s, v));
         todo.dedup_by_key(|e| (e.0, e.2));
@@ -667,36 +731,42 @@ impl<'t> Model<'t> {
             .filter(|&&(s, _, v)| !self.glitch_cache.contains_key(&(s, v)))
             .count();
         if fresh > lim.max_glitch_sims {
-            return Transient::all(m);
+            return (Transient::all(m), None);
         }
         let mut tr = Transient::none(m);
+        let mut span: Option<Spans> = Some(vec![None; m]);
         for (s, u, v) in todo {
-            let g = match self.glitch_cache.get(&(s, v)) {
-                Some(&g) => g,
-                None => {
-                    let g = self.simulate_glitches(t, s, u, v);
-                    self.glitch_cache.insert((s, v), g);
-                    g
-                }
-            };
-            let mut g = g;
-            while g != 0 {
-                let p = g.trailing_zeros() as usize;
-                g &= g - 1;
+            if !self.glitch_cache.contains_key(&(s, v)) {
+                let g = self.simulate_glitches(t, s, u, v);
+                self.glitch_cache.insert((s, v), g);
+            }
+            let g = &self.glitch_cache[&(s, v)];
+            let mut mask = g.multi;
+            while mask != 0 {
+                let p = mask.trailing_zeros() as usize;
+                mask &= mask - 1;
                 tr.add(p, sig.v_lit_mask, v & sig.v_lit_mask);
             }
+            match (&mut span, &g.span) {
+                (Some(acc), Some(sp)) => {
+                    for (a, &x) in acc.iter_mut().zip(sp.iter()) {
+                        if let Some((f, l)) = x {
+                            *a = Some(a.map_or((f, l), |(af, al)| (af.min(f), al.max(l))));
+                        }
+                    }
+                }
+                _ => span = None,
+            }
         }
-        tr
+        (tr, span)
     }
 
     /// Unit-delay simulation of entry `(s, u → v)`: mask of state nets that change ≥ 2 times
-    /// (a glitch, or a pulse back to the initial value).
-    fn simulate_glitches(&mut self, t: &KernelTable, s: u32, u: u32, v: u32) -> u64 {
+    /// (a glitch, or a pulse back to the initial value), and per state net the first and last tick
+    /// (after the input change) at which it changes.
+    fn simulate_glitches(&mut self, t: &KernelTable, s: u32, u: u32, v: u32) -> Sim1 {
         let k = self.k;
         let m = self.m;
-        if m > 64 {
-            return u64::MAX;
-        }
         let (sub, map, charz) = (&self.sub, &self.map, &self.charz);
         let ks = self
             .sim
@@ -705,7 +775,10 @@ impl<'t> Model<'t> {
         ks.load_state(&t.states[s as usize], &input_vector(u, k));
         ks.apply_inputs(&input_vector(v, k));
         let sim = ks.sim_mut();
+        // The inputs change at the next tick.
+        let start = sim.tick() + 1;
         let mut counts = vec![0u32; m];
+        let mut span: Vec<Option<(u32, u32)>> = vec![None; m];
         let mut quiet = false;
         for _ in 0..bound {
             if sim.is_quiescent() {
@@ -713,21 +786,30 @@ impl<'t> Model<'t> {
                 break;
             }
             sim.step();
+            let off = sim.tick().saturating_sub(start).min(u64::from(u32::MAX)) as u32;
             for &n in sim.last_changed() {
                 if n as usize >= k {
-                    counts[n as usize - k] += 1;
+                    let p = n as usize - k;
+                    counts[p] += 1;
+                    span[p] = Some(span[p].map_or((off, off), |(f, _)| (f, off)));
                 }
             }
         }
         sim.take_diagnostics();
-        if !quiet && !sim.is_quiescent() {
-            return u64::MAX;
+        if !quiet && !sim.is_quiescent() || m > 64 {
+            return Sim1 {
+                multi: u64::MAX,
+                span: None,
+            };
         }
-        counts
-            .iter()
-            .enumerate()
-            .filter(|&(_, &c)| c >= 2)
-            .fold(0u64, |acc, (p, _)| acc | 1 << p)
+        Sim1 {
+            multi: counts
+                .iter()
+                .enumerate()
+                .filter(|&(_, &c)| c >= 2)
+                .fold(0u64, |acc, (p, _)| acc | 1 << p),
+            span: Some(span),
+        }
     }
 
     fn compute_burst(&self, sig: &RoundSig, lim: &ModelLimits) -> Burst {
@@ -809,6 +891,601 @@ impl<'t> Model<'t> {
             transient,
         }
     }
+
+    /// Timed burst check (cached). Every feasible entry `(s, u → v)` is simulated from the stable
+    /// state `s` with Timing mode's unit delays in ternary logic, where a changing input `j` has
+    /// the value `u_j` before `arr[j].min`, `X` from `arr[j].min` to `arr[j].max - 1` (unless it
+    /// cannot change in that entry: a clean input whose final value equals its initial one, or
+    /// one whose path condition fails) and `v_j` from `arr[j].max` on. The simulation covers
+    /// every Timing-mode behavior compatible with the arrival windows (ternary simulation is
+    /// monotone). It must end in a binary stable state equal to Fast mode's result: the table
+    /// transition `T(s, v)` for a one-round burst (`stages == 1`), otherwise the chain of table
+    /// transitions of rounds `0..stages`, where an input changing in several rounds takes every
+    /// binary value between its first and last round. Period-2 collapse is accounted for: nets
+    /// that could be collapsed (a possibly self-sustained alternation of `2 × p2_limit` ticks) are
+    /// set to `X` in the simulation.
+    ///
+    /// `arr[j]` is `Some` exactly for the changing inputs (`sig.cmask`). `None` if the kernel has
+    /// no table or the work exceeds the limits (per query, and the caller's `budget` of element
+    /// evaluations, which is reduced by the work done).
+    pub(crate) fn timed(
+        &mut self,
+        sig: &RoundSig,
+        arr: &[Option<Arrival>],
+        stages: u16,
+        lim: &ModelLimits,
+        budget: &mut u64,
+    ) -> Option<Timed> {
+        let mut key = sig.key.clone();
+        key.push(u32::from(stages));
+        for a in arr {
+            match a {
+                None => key.push(u32::MAX),
+                Some(a) => key.extend([
+                    a.min,
+                    a.max,
+                    u32::from(a.clean),
+                    u32::from(a.first_label) << 16 | u32::from(a.last_label),
+                ]),
+            }
+        }
+        if let Some(r) = self.timed_cache.get(&key) {
+            return r.clone();
+        }
+        let r = self.compute_timed(sig, arr, stages, lim, budget);
+        self.timed_cache.insert(key, r.clone());
+        r
+    }
+
+    fn compute_timed(
+        &self,
+        sig: &RoundSig,
+        arr: &[Option<Arrival>],
+        stages: u16,
+        lim: &ModelLimits,
+        total: &mut u64,
+    ) -> Option<Timed> {
+        let t = self.table?;
+        let k = self.k;
+        let m = self.m;
+        if stages == 0 || stages > 32 || arr.len() != k {
+            return None;
+        }
+        let mut work: u64 = 0;
+        for u in 0..(1u32 << k) {
+            if sig.u_ok(u) {
+                work += t.states_by_input[u as usize].len() as u64;
+            }
+        }
+        work = work.saturating_mul(1u64 << sig.cmask.count_ones());
+        let t_in = arr.iter().flatten().map(|a| a.max).max().unwrap_or(0);
+        let max_steps = self.bound.max(4 * self.sub.num_nets + 8);
+        if work > lim.max_glitch_sims as u64 * 4 {
+            return None;
+        }
+        let start = TIMED_MAX_EVALS.min(*total);
+        let mut budget = start;
+        let mut over = false;
+        let l2 = 2 * self.charz.timing.p2_limit;
+        let sim = TimedSim::new(&self.sub, k, m);
+        let mut res = Timed {
+            safe: true,
+            settle: t_in,
+            nets: vec![TimedNet::default(); m],
+        };
+        Self::for_each_entry(t, sig, |s, u, v, tr| {
+            if !res.safe {
+                return;
+            }
+            let fast = if stages == 1 {
+                tr.next
+            } else {
+                match fast_chain(t, arr, stages, s, u, v, &mut budget) {
+                    Ok(f) => f,
+                    Err(()) => {
+                        over = true;
+                        None
+                    }
+                }
+            };
+            let Some(fast) = fast else {
+                res.safe = false;
+                return;
+            };
+            // Inputs with activity in this entry.
+            let rs = sig.restr_sat(v);
+            let mut act = 0u32;
+            for (j, a) in arr.iter().enumerate() {
+                if let Some(a) = a
+                    && ((u ^ v) >> j & 1 == 1 || (!a.clean && rs >> j & 1 == 1))
+                {
+                    act |= 1 << j;
+                }
+            }
+            let input_at = |j: usize, tick: u32| -> Logic {
+                let bit = |x: u32| Logic::from_bool(x >> j & 1 == 1);
+                match arr[j] {
+                    Some(a) if act >> j & 1 == 1 => {
+                        if tick < a.min {
+                            bit(u)
+                        } else if tick >= a.max {
+                            bit(v)
+                        } else {
+                            Logic::X
+                        }
+                    }
+                    _ => bit(u),
+                }
+            };
+            let mut bounds: Vec<u32> = arr
+                .iter()
+                .enumerate()
+                .filter(|&(j, _)| act >> j & 1 == 1)
+                .flat_map(|(_, a)| a.map(|a| [a.min, a.max]).unwrap_or_default())
+                .collect();
+            bounds.sort_unstable();
+            bounds.dedup();
+            let tr = match sim.run(
+                &t.states[s as usize],
+                u,
+                &input_at,
+                &bounds,
+                t_in,
+                max_steps,
+                l2,
+                &mut budget,
+            ) {
+                Ok(Some(tr)) => tr,
+                Ok(None) => {
+                    res.safe = false;
+                    return;
+                }
+                Err(()) => {
+                    over = true;
+                    res.safe = false;
+                    return;
+                }
+            };
+            if tr.fin[..] != t.states[fast as usize][..] {
+                res.safe = false;
+                return;
+            }
+            res.settle = res.settle.max(tr.settle);
+            let e_mask = sig.v_lit_mask;
+            let e_val = v & e_mask;
+            for (p, tn) in res.nets.iter_mut().enumerate() {
+                let Some((first, last)) = tr.span[p] else {
+                    continue;
+                };
+                if tn.active {
+                    tn.first = tn.first.min(first);
+                    tn.last = tn.last.max(last);
+                    tn.lit_mask &= e_mask & !(tn.lit_val ^ e_val);
+                    tn.lit_val &= tn.lit_mask;
+                    tn.contrib |= act;
+                } else {
+                    *tn = TimedNet {
+                        active: true,
+                        first,
+                        last,
+                        multi: false,
+                        lit_mask: e_mask,
+                        lit_val: e_val,
+                        contrib: act,
+                    };
+                }
+                tn.multi |= tr.multi[p];
+            }
+        });
+        *total -= start - budget;
+        (!over).then_some(res)
+    }
+}
+
+/// Work limit of one timed burst check, in element evaluations.
+const TIMED_MAX_EVALS: u64 = 1 << 21;
+
+/// The Fast-mode result of a multi-round burst for entry `(s, u → v)`: the chain of table
+/// transitions of rounds `0..stages`. After round `l`, a changing input has its initial value
+/// before its first round, its final value from its last round on, and any value in between.
+/// The reachable `(state, input vector)` pairs are propagated round by round; all must end in the
+/// same state. `Ok(None)` if a transition is non-binary, the results differ, or a round has too
+/// many free inputs; `Err` if `budget` (table lookups) runs out.
+fn fast_chain(
+    t: &KernelTable,
+    arr: &[Option<Arrival>],
+    stages: u16,
+    s: u32,
+    u: u32,
+    v: u32,
+    budget: &mut u64,
+) -> Result<Option<u32>, ()> {
+    let mut set: Vec<(u32, u32)> = vec![(s, u)];
+    for l in 0..stages {
+        // Inputs fixed after round `l`, and the free ones.
+        let mut base = u;
+        let mut free: Vec<u32> = Vec::new();
+        for (j, a) in arr.iter().enumerate() {
+            let Some(a) = a else { continue };
+            let bit = 1u32 << j;
+            if l >= a.last_label {
+                base = (base & !bit) | (v & bit);
+            } else if l >= a.first_label {
+                base &= !bit;
+                free.push(bit);
+            }
+        }
+        if free.len() as u32 > MAX_CHAIN_FREE {
+            return Ok(None);
+        }
+        let mut next: Vec<(u32, u32)> = Vec::with_capacity(set.len() << free.len());
+        for &(state, prev) in &set {
+            for assign in 0..(1u32 << free.len()) {
+                let mut vec = base;
+                for (i, &bit) in free.iter().enumerate() {
+                    if assign >> i & 1 == 1 {
+                        vec |= bit;
+                    }
+                }
+                let st = if vec == prev {
+                    state
+                } else {
+                    *budget = budget.checked_sub(1).ok_or(())?;
+                    match t.transition(state, vec).next {
+                        Some(n) => n,
+                        None => return Ok(None),
+                    }
+                };
+                next.push((st, vec));
+            }
+        }
+        next.sort_unstable();
+        next.dedup();
+        set = next;
+    }
+    let mut result: Option<u32> = None;
+    for &(state, prev) in &set {
+        let fin = if prev == v {
+            state
+        } else {
+            match t.transition(state, v).next {
+                Some(n) => n,
+                None => return Ok(None),
+            }
+        };
+        match result {
+            None => result = Some(fin),
+            Some(r) if r != fin => return Ok(None),
+            Some(_) => {}
+        }
+    }
+    Ok(result)
+}
+
+/// Trace of one timed simulation.
+struct TimedTrace {
+    /// Final (binary, stable) state.
+    fin: Vec<Logic>,
+    /// Per state net: first and last tick at which it may change (`None` = never).
+    span: Vec<Option<(u32, u32)>>,
+    /// Per state net: it may change more than once.
+    multi: Vec<bool>,
+    /// Last tick at which an input or a state net may change.
+    settle: u32,
+}
+
+/// Unit-delay ternary simulation of a kernel sub-netlist with timed inputs.
+struct TimedSim<'s> {
+    sub: &'s FlatNetlist,
+    k: usize,
+    m: usize,
+    /// Per state net: the nets its driver reads.
+    drv_in: Vec<Vec<usize>>,
+    /// Per state net: its driver can output `Z` (a tri-state gate or an unterminated resolver).
+    may_z: Vec<bool>,
+}
+
+/// Index of a definite value for the change-count DP (`X` has none).
+fn val_idx(v: Logic) -> Option<usize> {
+    match v {
+        Logic::Zero => Some(0),
+        Logic::One => Some(1),
+        Logic::Z => Some(2),
+        Logic::X => None,
+    }
+}
+
+impl<'s> TimedSim<'s> {
+    fn new(sub: &'s FlatNetlist, k: usize, m: usize) -> TimedSim<'s> {
+        let mut drv_in = vec![Vec::new(); m];
+        let mut may_z = vec![false; m];
+        for g in &sub.gates {
+            let o = g.output as usize;
+            if o >= k {
+                drv_in[o - k] = g.inputs.iter().map(|&i| i as usize).collect();
+                may_z[o - k] = g.op == panda_netlist::flat::FlatOp::Tri;
+            }
+        }
+        for r in &sub.resolvers {
+            let o = r.output as usize;
+            if o >= k {
+                drv_in[o - k] = r.drivers.iter().map(|&i| i as usize).collect();
+                may_z[o - k] = r.termination == panda_netlist::Termination::None;
+            }
+        }
+        TimedSim {
+            sub,
+            k,
+            m,
+            drv_in,
+            may_z,
+        }
+    }
+
+    /// Resolvers of tick `t` (zero delay) from the tick-`t` driver values in `next`, keepers
+    /// holding their tick-`t - 1` value from `prev`.
+    fn resolvers(&self, next: &mut [Logic], prev: &[Logic], buf: &mut Vec<Logic>) {
+        for _ in 0..=self.sub.resolvers.len() {
+            let mut ch = false;
+            for r in &self.sub.resolvers {
+                buf.clear();
+                buf.extend(r.drivers.iter().map(|&n| next[n as usize]));
+                let o = r.output as usize;
+                let nv = resolve(buf, r.termination, prev[o]).value;
+                if next[o] != nv {
+                    next[o] = nv;
+                    ch = true;
+                }
+            }
+            if !ch {
+                break;
+            }
+        }
+    }
+
+    /// Simulate from stable state `state` (stable under the initial input vector `init`) until
+    /// stable with the final inputs (`input_at(j, t)`: value of input `j` at tick `t`, final for
+    /// `t ≥ t_in`; `bounds`: the sorted ticks at which an input may change value). `None` if the
+    /// result is not binary or not stable within `t_in + max_steps` (a possible period-2 collapse,
+    /// `l2` = window, 0 = none, sets the nets concerned to `X`); `Err` if the evaluation `budget` ran out. Ticks at which nothing can change (a fixed point
+    /// with unchanged inputs) cost no gate evaluations.
+    #[allow(clippy::too_many_arguments)]
+    fn run(
+        &self,
+        state: &[Logic],
+        init: u32,
+        input_at: &dyn Fn(usize, u32) -> Logic,
+        bounds: &[u32],
+        t_in: u32,
+        max_steps: u32,
+        l2: u32,
+        budget: &mut u64,
+    ) -> Result<Option<TimedTrace>, ()> {
+        let (k, m) = (self.k, self.m);
+        let n = self.sub.num_nets as usize;
+        let mut buf = Vec::new();
+        let mut span: Vec<Option<(u32, u32)>> = vec![None; m];
+        // Change-count DP per state net (max changes, capped at 2) and possible-alternation runs.
+        const NEG: i8 = i8::MIN / 2;
+        let mut dp: Vec<[i8; 3]> = state
+            .iter()
+            .map(|&v| {
+                let mut d = [NEG; 3];
+                if let Some(i) = val_idx(v) {
+                    d[i] = 0;
+                }
+                d
+            })
+            .collect();
+        let mut alt = vec![0u32; m];
+        // Last tick of a definite change (two different definite values) per net.
+        let mut last_def = vec![None::<u32>; n];
+        let mut hist2: Vec<Logic> = state.to_vec(); // state at tick t-2
+        let mut hist1: Vec<Logic> = state.to_vec(); // state at tick t-1
+        let mut settle = t_in;
+        let mut tick: u32 = 0;
+        // Tick -1: the stable state with the initial inputs. Tick 0: inputs of tick 0, gate
+        // outputs unchanged (they were stable), resolvers recomputed.
+        let mut base = vec![Logic::X; n];
+        for (j, b) in base.iter_mut().enumerate().take(k) {
+            *b = Logic::from_bool(init >> j & 1 == 1);
+        }
+        base[k..].copy_from_slice(state);
+        let mut prev_in: Vec<Logic> = base[..k].to_vec();
+        let mut cur = base.clone();
+        for (j, c) in cur.iter_mut().enumerate().take(k) {
+            *c = input_at(j, 0);
+        }
+        self.resolvers(&mut cur, &base, &mut buf);
+        let mut next = cur.clone();
+        // `next == cur` after the last evaluation: with unchanged inputs nothing changes.
+        let mut fixed = false;
+        let cost = (self.sub.gates.len() + self.sub.resolvers.len() + n + 1) as u64;
+        loop {
+            // Record tick `tick` (values in `cur`, predecessors in `prev_in` / `hist1`).
+            for j in 0..k {
+                let (a, b) = (prev_in[j], cur[j]);
+                if a != Logic::X && b != Logic::X && a != b {
+                    last_def[j] = Some(tick);
+                }
+                prev_in[j] = b;
+            }
+            // Alternation runs and definite changes (from the values before a collapse).
+            for p in 0..m {
+                let (a, b) = (hist1[p], cur[k + p]);
+                if a == Logic::X || b == Logic::X || a != b {
+                    if a != Logic::X && b != Logic::X {
+                        last_def[k + p] = Some(tick);
+                    }
+                    let compat2 = |x: Logic, y: Logic| x == Logic::X || y == Logic::X || x == y;
+                    alt[p] = if alt[p] >= 1 && compat2(b, hist2[p]) {
+                        alt[p] + 1
+                    } else {
+                        1
+                    };
+                } else {
+                    alt[p] = 0;
+                }
+            }
+            // Period-2 collapse: candidates with an alternation-compatible run of `l2` ticks,
+            // reduced to a self-sustained set. A candidate is dropped only if a driver input
+            // outside the set *definitely* changed in the window or none is in the set, so the set
+            // contains every set Timing mode could collapse here. Its binary-valued nets are set to `X`, which
+            // covers both outcomes (collapsed or not); their runs restart as in Timing mode.
+            if l2 > 0 && alt.iter().any(|&a| a >= l2) {
+                let lo = (tick + 1).saturating_sub(l2);
+                let quiet = |x: usize| last_def[x].is_none_or(|t| t < lo);
+                let mut inset: Vec<bool> = alt.iter().map(|&a| a >= l2).collect();
+                loop {
+                    let mut ch = false;
+                    for p in 0..m {
+                        let ins = |x: usize| x >= k && inset[x - k];
+                        // Dropped: a driver input outside the set definitely changed, or no driver
+                        // input is in the set (with its other inputs constant, the net is constant:
+                        // Timing mode's set has a driver in the set for every net).
+                        if inset[p]
+                            && (self.drv_in[p].iter().any(|&x| !(quiet(x) || ins(x)))
+                                || !self.drv_in[p].iter().any(|&x| ins(x)))
+                        {
+                            inset[p] = false;
+                            ch = true;
+                        }
+                    }
+                    if !ch {
+                        break;
+                    }
+                }
+                let mut forced = false;
+                for p in 0..m {
+                    if inset[p] && cur[k + p] != Logic::X {
+                        cur[k + p] = Logic::X;
+                        alt[p] = 1;
+                        forced = true;
+                    }
+                }
+                if forced {
+                    // Resolvers see the collapsed values at the same tick (keepers hold their
+                    // tick-(t-1) value).
+                    let mut prev_t = cur.clone();
+                    prev_t[k..].copy_from_slice(&hist1);
+                    self.resolvers(&mut cur, &prev_t, &mut buf);
+                    fixed = false;
+                }
+            }
+            // Possible changes at this tick (final values) and the change-count DP.
+            for p in 0..m {
+                let (a, b) = (hist1[p], cur[k + p]);
+                if a == Logic::X || b == Logic::X || a != b {
+                    span[p] = Some(span[p].map_or((tick, tick), |(f, _)| (f, tick)));
+                    settle = settle.max(tick);
+                }
+                let d = dp[p];
+                let mut nd = [NEG; 3];
+                for (c, slot) in nd.iter_mut().enumerate() {
+                    // `X` is `0` or `1`, or also `Z` at a net whose driver can output it.
+                    let allowed = match val_idx(b) {
+                        Some(i) => i == c,
+                        None => c < 2 || self.may_z[p],
+                    };
+                    if allowed {
+                        let mut best = d[c];
+                        for (bb, &x) in d.iter().enumerate() {
+                            if bb != c {
+                                best = best.max(x.saturating_add(1));
+                            }
+                        }
+                        *slot = best.min(2);
+                    }
+                }
+                dp[p] = nd;
+            }
+            // Next tick.
+            let mut same_inputs = (0..k).all(|j| input_at(j, tick + 1) == cur[j]);
+            if fixed && same_inputs && tick < t_in {
+                // Nothing changes until the next input boundary: record the idle ticks
+                // `tick + 1 ..= target - 1` in bulk (only `X` nets may change there, and never
+                // definitely).
+                let target = bounds
+                    .iter()
+                    .copied()
+                    .find(|&b| b > tick + 1)
+                    .unwrap_or(t_in)
+                    .min(t_in);
+                if target > tick + 1 {
+                    let (from, to) = (tick + 1, target - 1);
+                    let d = to - from + 1;
+                    for p in 0..m {
+                        if cur[k + p] != Logic::X {
+                            alt[p] = 0;
+                            continue;
+                        }
+                        span[p] = Some(span[p].map_or((from, to), |(f, _)| (f, to)));
+                        settle = settle.max(to);
+                        alt[p] = alt[p].saturating_add(d);
+                        for _ in 0..d.min(2) {
+                            let x = dp[p][0].max(dp[p][1]).max(dp[p][2]);
+                            let y = x.saturating_add(1).min(2);
+                            dp[p] = [y, y, if self.may_z[p] { y } else { NEG }];
+                        }
+                    }
+                    hist1.copy_from_slice(&cur[k..]);
+                    hist2.copy_from_slice(&cur[k..]);
+                    tick = to;
+                    same_inputs = (0..k).all(|j| input_at(j, tick + 1) == cur[j]);
+                }
+            }
+            if !(fixed && same_inputs) {
+                *budget = budget.checked_sub(cost).ok_or(())?;
+                next.copy_from_slice(&cur);
+                for g in &self.sub.gates {
+                    buf.clear();
+                    buf.extend(g.inputs.iter().map(|&i| cur[i as usize]));
+                    next[g.output as usize] = eval_gate(g.op, &buf);
+                }
+                for (j, x) in next.iter_mut().enumerate().take(k) {
+                    *x = input_at(j, tick + 1);
+                }
+                self.resolvers(&mut next, &cur, &mut buf);
+                fixed = next == cur;
+            }
+            if tick >= t_in && fixed {
+                break;
+            }
+            if tick > t_in.saturating_add(max_steps) {
+                return Ok(None);
+            }
+            hist2.copy_from_slice(&hist1);
+            hist1.copy_from_slice(&cur[k..]);
+            std::mem::swap(&mut cur, &mut next);
+            tick += 1;
+        }
+        let fin = cur[k..].to_vec();
+        if fin.contains(&Logic::X) {
+            return Ok(None);
+        }
+        let multi = dp
+            .iter()
+            .map(|d| d.iter().copied().max().unwrap_or(0) >= 2)
+            .collect();
+        Ok(Some(TimedTrace {
+            fin,
+            span,
+            multi,
+            settle,
+        }))
+    }
+}
+
+/// Per state net: first and last change tick (`None` = never).
+pub(crate) type Spans = Vec<Option<(u32, u32)>>;
+
+/// Result of one unit-delay entry simulation (see [`Model::simulate_glitches`]).
+#[derive(Clone, Debug)]
+struct Sim1 {
+    /// State nets changing ≥ 2 times (all ones = unknown).
+    multi: u64,
+    /// Per state net: first and last change tick after the input change (`None` = unknown).
+    span: Option<Spans>,
 }
 
 /// Largest `free input bits + cut bits` enumerated to prove that a kernel without a table settles.
@@ -1151,6 +1828,62 @@ mod tests {
         s.rnever = 1 << di;
         s.finish();
         assert!(!m.round(&s, &LIM, false, false).pos[q].changes);
+    }
+
+    #[test]
+    fn timed_bursts_on_a_closing_latch() {
+        let mut table = None;
+        let (flat, di, ei) = latch_model(&mut table);
+        let (ks, _) = compile_kernels(&flat, &KernelOptions::default());
+        let (sub, map) = kernel_subnet(&flat, &ks.kernels[0]);
+        let mut m = Model::new(sub, map, table.as_deref(), &CharzOptions::default());
+        let q = ks.kernels[0]
+            .nets
+            .binary_search(&flat.net_by_name("Q").unwrap())
+            .unwrap();
+        // EN closes (1 → 0) cleanly at tick 0; D may glitch during its window.
+        let s = sig((1 << di) | (1 << ei), &[(ei, true)], &[(ei, false)], 2);
+        let arr = |en: u32, dmin: u32, dmax: u32, dl: u16| {
+            let mut a = vec![None; 2];
+            a[ei] = Some(Arrival {
+                min: en,
+                max: en,
+                clean: true,
+                first_label: 0,
+                last_label: 0,
+            });
+            a[di] = Some(Arrival {
+                min: dmin,
+                max: dmax,
+                clean: false,
+                first_label: dl,
+                last_label: dl,
+            });
+            a
+        };
+        let mut budget = u64::MAX;
+        // The ternary (any-delay) check rejects this burst: D may glitch while EN closes.
+        let r = m.round(&s, &LIM, false, true);
+        assert_eq!(r.burst.map(|b| b.safe), Some(false));
+        // D's activity starts after the closing EN has reached the latch: Q keeps its value.
+        let t = m.timed(&s, &arr(0, 4, 8, 0), 1, &LIM, &mut budget).unwrap();
+        assert!(t.safe);
+        assert!(t.settle >= 8);
+        assert!(!t.nets[q].active, "{:?}", t.nets[q]);
+        // The same with D changing one Fast round later (the chain T(T(s, EN=0), D)).
+        let t = m.timed(&s, &arr(0, 4, 8, 1), 2, &LIM, &mut budget).unwrap();
+        assert!(t.safe);
+        // Even a D glitch starting with the EN change is harmless: the gates reading D see the
+        // closed EN at the same tick.
+        let t = m.timed(&s, &arr(0, 0, 3, 0), 1, &LIM, &mut budget).unwrap();
+        assert!(t.safe);
+        // D glitching while the latch is still open (EN closes at tick 2): it may capture the
+        // glitch.
+        let t = m.timed(&s, &arr(2, 0, 4, 0), 1, &LIM, &mut budget).unwrap();
+        assert!(!t.safe);
+        // An exhausted budget gives no answer.
+        let mut none = 0u64;
+        assert!(m.timed(&s, &arr(0, 5, 9, 0), 1, &LIM, &mut none).is_none());
     }
 
     #[test]

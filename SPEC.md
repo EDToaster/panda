@@ -492,7 +492,7 @@ Engineering rules from the start: struct-of-arrays state (Turing Complete hit a 
   - random power-on;
   - the ternary advisory lint.
 - **Known limits:**
-  - STA is conservative and often pessimistic on random designs; normal synchronous designs such as Panda-8 come out clean.
+  - STA is conservative and still pessimistic on random designs. The timed burst check (unit-delay ternary simulation with `X` only inside each input's arrival window) raised the clean rate on the 5,000-design soak from 866 to 1,424 designs, with 0 clean-but-mismatch. 68% of flagged designs still match Timing. Panda-8 comes out clean, though its setup bound (74 ticks) is above the empirical minimum (54).
   - The JIT reached 1.8× over the interpreter (target was 2×). The remaining cost is per-kernel round logic.
   - STA reasons about binary values; persistently-X state is outside its scope.
 - **Tunables as shipped:** partition size 32 ops, `lut_max_bits` 10, `lut_min_gates` 16, `KERNEL_MAX_LOOP` 6, `KERNEL_MAX_BITS` 12, Sim-kernel settle bound 4·nets + 8 + 2·p2_limit, `P2_LIMIT` 4.
