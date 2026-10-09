@@ -1,0 +1,28 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+license = "MIT"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+panda-netlist = { path = "crates/panda-netlist" }
+panda-timing = { path = "crates/panda-timing" }
+panda-circuits = { path = "crates/panda-circuits" }
+panda-cpu8 = { path = "crates/panda-cpu8" }
+panda-compile = { path = "crates/panda-compile" }
+panda-fast = { path = "crates/panda-fast" }
+panda-jit = { path = "crates/panda-jit" }
+panda-kernel = { path = "crates/panda-kernel" }
+
+[profile.release]
+debug = 1
+codegen-units = 1
+lto = "thin"
+
+[profile.test]
+opt-level = 2
