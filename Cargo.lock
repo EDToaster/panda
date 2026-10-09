@@ -37,6 +37,7 @@ name = "panda-compile"
 version = "0.1.0"
 dependencies = [
  "panda-netlist",
+ "panda-timing",
 ]
 
 [[package]]
@@ -45,6 +46,18 @@ version = "0.1.0"
 dependencies = [
  "panda-circuits",
  "panda-netlist",
+ "panda-timing",
+]
+
+[[package]]
+name = "panda-difftest"
+version = "0.1.0"
+dependencies = [
+ "panda-circuits",
+ "panda-compile",
+ "panda-cpu8",
+ "panda-netlist",
+ "panda-sta",
  "panda-timing",
 ]
 
@@ -75,6 +88,14 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "panda-sta"
+version = "0.1.0"
+dependencies = [
+ "panda-compile",
+ "panda-netlist",
 ]
 
 [[package]]

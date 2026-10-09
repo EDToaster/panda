@@ -1,0 +1,13 @@
+[package]
+name = "panda-difftest"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+panda-netlist.workspace = true
+panda-timing.workspace = true
+panda-compile.workspace = true
+panda-sta.workspace = true
+panda-circuits.workspace = true
+panda-cpu8.workspace = true

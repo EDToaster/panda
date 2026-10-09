@@ -103,3 +103,24 @@ pub fn analyze(flat: &FlatNetlist, kernels: &KernelSet, tables: &[Option<KernelT
 ```
 Must be conservative: if STA reports no violations and the clock period ≥ min_period, FastRef and
 Timing must agree at phase boundaries (this is what the differential fuzzer checks).
+
+## Notes from M1 (facts about the existing crates)
+- `TimingSim::force_net`: counts as a source change; a forced *gate output* persists until that gate
+  is next evaluated (i.e. until one of its inputs changes); a forced *source* net reverts at the
+  next tick. To load a kernel state into a sub-netlist sim: reset, set inputs, force every kernel
+  net, then settle — a consistent (stable) state stays put.
+- Panda-8 (`panda-cpu8`): `panda8_with(program, &Options{variant, rom, period, reset_cycles})`,
+  RomStyle::{SumOfProducts (default, 3671 gates), MuxTree (7726), Decoder}; `sim` module wraps
+  TimingSim; `emu` gives the golden OUT sequence. Use both SumOfProducts and MuxTree in tests.
+- panda-circuits: `seq::{d_latch, ms_dff, dff_rst, dff_en, register, register_gated, toggle_ff, ...}`,
+  `counters::{sync_counter, ripple_counter}`, `regfile::register_file(.., RegFileStyle)`,
+  `testbench`, `transform::inline_all`. The d_latch has a known Q=Q_n=1 1-tick glitch when D
+  changes while transparent (fine; may produce order-sensitive table entries).
+
+## Ideal blocks (Timing mode, SPEC §5.2) — implemented in panda-timing
+`TimingOptions { ideal_blocks: bool, glass_box: HashSet<String /*instance path*/> , .. }`.
+An instance is an ideal block if its subtree is acyclic, contains no sources, and it is the
+outermost such instance (top is never one). Output j changes at t+L_j to f_j(inputs at t)
+(transport). Internal nets of an ideal block are not simulated; `read`/`get` of them returns the
+value computed from the block's current input values (lazy). Differential requirement: for any
+input sequence held ≥ max latency, ideal-block outputs settle to the same values as glass-box.

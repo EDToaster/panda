@@ -6,3 +6,4 @@ license.workspace = true
 
 [dependencies]
 panda-netlist.workspace = true
+panda-timing.workspace = true

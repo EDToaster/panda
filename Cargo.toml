@@ -18,6 +18,8 @@ panda-compile = { path = "crates/panda-compile" }
 panda-fast = { path = "crates/panda-fast" }
 panda-jit = { path = "crates/panda-jit" }
 panda-kernel = { path = "crates/panda-kernel" }
+panda-sta = { path = "crates/panda-sta" }
+panda-difftest = { path = "crates/panda-difftest" }
 
 [profile.release]
 debug = 1
