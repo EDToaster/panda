@@ -1226,11 +1226,21 @@ impl Inspector {
                 IdKind::Instance => "id",
                 IdKind::Net => "name",
             });
-            let r = ui.add(
-                egui::TextEdit::singleline(text)
-                    .desired_width(120.0)
-                    .font(egui::TextStyle::Monospace),
-            );
+            let out = egui::TextEdit::singleline(text)
+                .desired_width(120.0)
+                .font(egui::TextStyle::Monospace)
+                .show(ui);
+            let r = out.response;
+            if std::mem::take(&mut ed.focus_name) {
+                // F2: focus the field with the whole name selected (typing replaces it).
+                let mut state = out.state;
+                state
+                    .cursor
+                    .set_char_range(Some(egui::text::CCursorRange::select_all(&out.galley)));
+                state.store(ui.ctx(), r.id);
+                r.request_focus();
+                ui.ctx().request_repaint();
+            }
             apply = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             if changed
                 && ui
@@ -1617,7 +1627,8 @@ impl Panel for Inspector {
                             "Click to select, drag a box, Shift toggles.\n\
                              Right-click an item for its menu.\n\
                              Drag from a pin to draw a wire (W: wire tool).\n\
-                             R rotate · F flip · Del delete\n\
+                             R rotate · F flip · Del delete · F2 rename\n\
+                             A add · C connect · Tab next · ? all shortcuts\n\
                              Ctrl+C/X/V/D · Ctrl+Z / Ctrl+Shift+Z",
                         )
                         .small()

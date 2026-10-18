@@ -37,6 +37,7 @@
 pub mod actions;
 pub mod history;
 pub mod inspector;
+pub mod keys;
 pub mod menus;
 pub mod route;
 mod tool;

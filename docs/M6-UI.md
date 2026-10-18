@@ -63,6 +63,13 @@ or a sampling list the engine copies after each event). Must not slow `run` when
    draw wires with orthogonal (Manhattan) routing and auto-junctions, connect to pins/wires,
    inspector for atom parameters / widths / clock period-high-phase / constants / net termination,
    undo/redo of every edit. Every structural edit becomes `EditOp`s applied to the kernel.
+   **Keyboard-first** (`edit/keys.rs`): a circuit can be built without the mouse. `A` opens a
+   search box over everything placeable (Enter puts it to the right of the selection), `C`
+   wires the previously selected item (or the other of two selected) to the next free input,
+   Tab / Shift+Tab cycle the selection, `N` selects the wires on a chip, F2 renames the
+   selected wire or chip, arrows nudge (Shift: 5) or pan, Enter opens a package, Space toggles
+   the selected input pin, Home fits, `+` / `-` zoom. A hint bar along the bottom of the canvas
+   shows the keys for the current selection and tool; `?` shows every shortcut.
 4. **Hierarchy & packaging**: open/enter/exit package instances (breadcrumbs), create a package
    from a selection (crossing nets become pins), package symbol auto-layout, library palette
    (starts from NAND plus the primitives NAND cannot build: tri-state buffer, split / merge,

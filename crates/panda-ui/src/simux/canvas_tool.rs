@@ -424,6 +424,24 @@ impl CanvasTool for SimTool {
         if r.secondary_clicked() {
             self.menu_pos = r.interact_pointer_pos();
         }
+        // Space toggles the selected top-level input pin (1-bit), or opens its value editor.
+        if !ui.ctx().egui_wants_keyboard_input()
+            && let sel = crate::edit::current_selection(ui.ctx())
+            && sel.items.len() == 1
+            && sel.wires.is_empty()
+            && let Some(ItemRef::Pin(pin)) = sel.items.iter().next().cloned()
+            && top_input(app, &pin).is_some()
+            && ui
+                .ctx()
+                .input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Space))
+        {
+            let at = scene
+                .item(&ItemRef::Pin(pin.clone()))
+                .map_or(canvas.rect.center(), |p| {
+                    xf.rect_to_screen(&p.rect()).right_center()
+                });
+            self.click_input(app, &pin, at);
+        }
         if self.edit.is_none()
             && !context_menu_open(ui.ctx())
             && let Some(pr) = &probe
