@@ -18,19 +18,32 @@ use panda_netlist::{Dir, GateOp};
 use crate::geom::{GridPt, Orient, Side, Symbol, SymbolKind};
 
 use super::scene::SymText;
-use super::style::Palette;
+use super::style::{Palette, chip_index};
 
 type P = [f32; 2];
+
+/// Colour role of a filled glyph part (resolved against the [`Palette`] when tessellating).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Fill {
+    /// Chip body colour `Palette::chips[i]`.
+    Chip(u8),
+    /// Source body (constant, clock, power-on reset).
+    Source,
+    /// Light fill (pin pills).
+    Light,
+    /// Ink (pin sockets, splitter bars).
+    Ink,
+}
 
 /// Glyph geometry in local grid coordinates.
 #[derive(Clone, Debug, Default)]
 pub struct Glyph {
-    /// Filled star-shaped polygons: (outline, fan center, use the header colour).
-    pub fills: Vec<(Vec<P>, P, bool)>,
-    /// Stroked polylines: (points, closed, width multiplier).
+    /// Filled star-shaped polygons: (outline, fan center, colour role).
+    pub fills: Vec<(Vec<P>, P, Fill)>,
+    /// Ink polylines: (points, closed, width multiplier).
     pub strokes: Vec<(Vec<P>, bool, f32)>,
-    /// Discs: (center, radius) filled with the fill colour and stroked.
-    pub discs: Vec<(P, f32)>,
+    /// Filled discs: (center, radius, colour role), drawn on top.
+    pub discs: Vec<(P, f32, Fill)>,
 }
 
 /// Template cache key: everything that changes a glyph's geometry.
@@ -54,9 +67,9 @@ pub enum TemplateKey {
     Por,
     /// Pin marker (direction, width).
     Pin(Dir, i32),
-    /// Package box: size, and per pin its side, position along the side and whether it is a
-    /// bus.
-    Package(i32, i32, Vec<(Side, i32, bool)>),
+    /// Package box: size, chip colour index, and per pin its side, position along the side
+    /// and whether it is a bus.
+    Package(i32, i32, u8, Vec<(Side, i32, bool)>),
 }
 
 /// Template key of a symbol.
@@ -73,9 +86,10 @@ pub fn template_key(s: &Symbol) -> TemplateKey {
         SymbolKind::Clock => TemplateKey::Clock,
         SymbolKind::PowerOnReset => TemplateKey::Por,
         SymbolKind::Pin { dir, .. } => TemplateKey::Pin(*dir, s.size.x),
-        SymbolKind::Package { .. } => TemplateKey::Package(
+        SymbolKind::Package { title, .. } => TemplateKey::Package(
             s.size.x,
             s.size.y,
+            chip_index(title) as u8,
             s.ports
                 .iter()
                 .map(|p| {
@@ -90,197 +104,145 @@ pub fn template_key(s: &Symbol) -> TemplateKey {
     }
 }
 
-fn quad_bezier(a: P, c: P, b: P, n: usize, out: &mut Vec<P>) {
-    for i in 1..=n {
-        let t = i as f32 / n as f32;
-        let u = 1.0 - t;
-        out.push([
-            u * u * a[0] + 2.0 * u * t * c[0] + t * t * b[0],
-            u * u * a[1] + 2.0 * u * t * c[1] + t * t * b[1],
-        ]);
-    }
-}
-
 fn rect(x0: f32, y0: f32, x1: f32, y1: f32) -> Vec<P> {
     vec![[x0, y0], [x1, y0], [x1, y1], [x0, y1]]
 }
 
-/// x of the OR back curve (quadratic from (x0, y0) to (x0, y1) bulging to x0 + bulge) at `y`.
-fn or_back_x(x0: f32, bulge: f32, y0: f32, y1: f32, y: f32) -> f32 {
-    let t = ((y - y0) / (y1 - y0)).clamp(0.0, 1.0);
-    // Control point at 2*bulge gives a peak of `bulge` at t = 0.5.
-    x0 + 2.0 * bulge * 2.0 * t * (1.0 - t)
+/// Rounded rectangle outline (corner radius `r`, clamped to half the shorter side).
+fn rrect(x0: f32, y0: f32, x1: f32, y1: f32, r: f32) -> Vec<P> {
+    let r = r.min((x1 - x0) / 2.0).min((y1 - y0) / 2.0).max(0.0);
+    if r <= 0.0 {
+        return rect(x0, y0, x1, y1);
+    }
+    const STEPS: usize = 6;
+    let corners = [
+        ([x1 - r, y0 + r], -std::f32::consts::FRAC_PI_2),
+        ([x1 - r, y1 - r], 0.0),
+        ([x0 + r, y1 - r], std::f32::consts::FRAC_PI_2),
+        ([x0 + r, y0 + r], std::f32::consts::PI),
+    ];
+    let mut pts = Vec::with_capacity(4 * (STEPS + 1));
+    for (c, a0) in corners {
+        for i in 0..=STEPS {
+            let a = a0 + std::f32::consts::FRAC_PI_2 * i as f32 / STEPS as f32;
+            pts.push([c[0] + r * a.cos(), c[1] + r * a.sin()]);
+        }
+    }
+    pts
 }
 
-/// The glyph of a symbol.
+/// Radius of a pin socket (grid units).
+pub const SOCKET_R: f32 = 0.27;
+/// Corner radius of chip bodies (grid units).
+const CHIP_R: f32 = 0.6;
+
+/// Center of the value indicator of a pin marker (local grid coordinates) and its radius.
+pub fn pin_indicator(dir: Dir, w: f32) -> (P, f32) {
+    let x = if dir == Dir::In { w - 1.0 } else { 1.0 };
+    ([x, 1.0], 0.42)
+}
+
+/// A chip: rounded body over the whole box (`y` inset) with a socket at every port.
+fn chip(g: &mut Glyph, s: &Symbol, inset: f32, fill: Fill) {
+    let (w, h) = (s.size.x as f32, s.size.y as f32);
+    g.fills.push((
+        rrect(0.0, inset, w, h - inset, CHIP_R),
+        [w / 2.0, h / 2.0],
+        fill,
+    ));
+    sockets(g, s);
+}
+
+/// An ink socket on every port (slightly larger for buses).
+fn sockets(g: &mut Glyph, s: &Symbol) {
+    for p in &s.ports {
+        let r = if p.width > 1 {
+            SOCKET_R * 1.1
+        } else {
+            SOCKET_R
+        };
+        g.discs
+            .push(([p.pos.x as f32, p.pos.y as f32], r, Fill::Ink));
+    }
+}
+
+/// The glyph of a symbol: Digital-Logic-Sim style chips (rounded bodies, pin sockets on the
+/// edge, the name in the middle).
 pub fn glyph(s: &Symbol) -> Glyph {
     let (w, h) = (s.size.x as f32, s.size.y as f32);
     let mut g = Glyph::default();
     match &s.kind {
         SymbolKind::Gate { op, .. } => {
-            let bubble = matches!(op, GateOp::Nand | GateOp::Nor | GateOp::Xnor);
-            let mid = h / 2.0;
-            let bh = h.min(8.0);
-            let (y0, y1) = (mid - bh / 2.0, mid + bh / 2.0);
-            let bw = if bubble { 3.4 } else { 4.0 };
-            let in_ys: Vec<f32> = s
-                .ports
-                .iter()
-                .filter(|p| p.dir == Dir::In)
-                .map(|p| p.pos.y as f32)
-                .collect();
-            let (ymin, ymax) = in_ys
-                .iter()
-                .fold((y0, y1), |(a, b), &y| (a.min(y), b.max(y)));
-            let ors = matches!(op, GateOp::Or | GateOp::Nor | GateOp::Xor | GateOp::Xnor);
-            let xors = matches!(op, GateOp::Xor | GateOp::Xnor);
-            let x0 = if xors { 0.6 } else { 0.0 };
-            let bulge = 0.45;
-            if ors {
-                let mut pts: Vec<P> = vec![[x0, y0]];
-                quad_bezier([x0, y0], [x0 + bw * 0.55, y0], [bw, mid], 12, &mut pts);
-                quad_bezier([bw, mid], [x0 + bw * 0.55, y1], [x0, y1], 12, &mut pts);
-                quad_bezier([x0, y1], [x0 + 2.0 * bulge, mid], [x0, y0], 8, &mut pts);
-                pts.pop();
-                g.fills
-                    .push((pts.clone(), [x0 + (bw - x0) * 0.45, mid], false));
-                g.strokes.push((pts, true, 1.0));
-                if xors {
-                    let mut back = vec![[0.0, y1]];
-                    quad_bezier([0.0, y1], [2.0 * bulge, mid], [0.0, y0], 8, &mut back);
-                    g.strokes.push((back, false, 1.0));
-                }
-                // Input stubs from the pin to the back curve.
-                for &y in &in_ys {
-                    if y > y0 && y < y1 {
-                        let xb = or_back_x(x0, bulge, y0, y1, y);
-                        g.strokes.push((vec![[0.0, y], [xb, y]], false, 1.0));
-                    }
-                }
+            let fill = if *op == GateOp::Nand {
+                Fill::Chip(1)
             } else {
-                let xs = bw * 0.45;
-                let mut pts: Vec<P> = vec![[0.0, y0], [xs, y0]];
-                let (rx, ry) = (bw - xs, bh / 2.0);
-                for i in 1..16 {
-                    let a = -std::f32::consts::FRAC_PI_2 + std::f32::consts::PI * i as f32 / 16.0;
-                    pts.push([xs + rx * a.cos(), mid + ry * a.sin()]);
-                }
-                pts.push([xs, y1]);
-                pts.push([0.0, y1]);
-                g.fills.push((pts.clone(), [bw * 0.4, mid], false));
-                g.strokes.push((pts, true, 1.0));
-            }
-            // Extension bar for inputs beyond the body (wide gates).
-            if ymin < y0 {
-                g.strokes.push((vec![[0.0, ymin], [0.0, y0]], false, 1.0));
-            }
-            if ymax > y1 {
-                g.strokes.push((vec![[0.0, y1], [0.0, ymax]], false, 1.0));
-            }
-            if bubble {
-                g.discs.push(([bw + 0.3, mid], 0.3));
-            }
+                Fill::Chip(0)
+            };
+            chip(&mut g, s, 0.1, fill);
         }
-        SymbolKind::Not | SymbolKind::Buf => {
-            let not = matches!(s.kind, SymbolKind::Not);
-            let bw = if not { 3.4 } else { 4.0 };
-            let pts = vec![[0.0, 0.05], [bw, 1.0], [0.0, 1.95]];
-            g.fills.push((pts.clone(), [bw * 0.33, 1.0], false));
-            g.strokes.push((pts, true, 1.0));
-            if not {
-                g.discs.push(([3.7, 1.0], 0.3));
-            }
-        }
-        SymbolKind::Tri => {
-            let pts = vec![[0.5, 0.5], [3.5, 2.0], [0.5, 3.5]];
-            g.fills.push((pts.clone(), [1.5, 2.0], false));
-            g.strokes.push((pts, true, 1.0));
-            g.strokes.push((vec![[0.0, 2.0], [0.5, 2.0]], false, 1.0));
-            g.strokes.push((vec![[3.5, 2.0], [4.0, 2.0]], false, 1.0));
-            g.strokes.push((vec![[2.0, 4.0], [2.0, 2.75]], false, 1.0));
-        }
-        SymbolKind::Splitter { parts } => {
+        SymbolKind::Not | SymbolKind::Buf => chip(&mut g, s, 0.1, Fill::Chip(0)),
+        SymbolKind::Tri => chip(&mut g, s, 0.1, Fill::Chip(2)),
+        SymbolKind::Splitter { .. } => {
+            // A slim ink bar; the whole bus enters on the left, the parts leave on the right.
+            g.fills.push((
+                rrect(0.7, 0.15, 1.3, h - 0.15, 0.3),
+                [1.0, h / 2.0],
+                Fill::Ink,
+            ));
             g.strokes
-                .push((vec![[1.0, 0.4], [1.0, h - 0.4]], false, 2.5));
-            g.strokes
-                .push((vec![[0.0, h / 2.0], [1.0, h / 2.0]], false, 1.6));
-            for i in 0..parts.len() {
-                let y = 1.0 + 2.0 * i as f32;
-                g.strokes.push((vec![[1.0, y], [2.0, y]], false, 1.0));
+                .push((vec![[0.0, h / 2.0], [0.7, h / 2.0]], false, 2.4));
+            for p in s.ports.iter().skip(1) {
+                let y = p.pos.y as f32;
+                let wm = if p.width > 1 { 2.0 } else { 1.2 };
+                g.strokes.push((vec![[1.3, y], [2.0, y]], false, wm));
             }
+            sockets(&mut g, s);
         }
         SymbolKind::Constant { .. } => {
-            let r = rect(0.0, 0.2, w, 1.8);
-            g.fills.push((r.clone(), [w / 2.0, 1.0], false));
-            g.strokes.push((r, true, 1.0));
+            g.fills
+                .push((rrect(0.0, 0.2, w, 1.8, 0.5), [w / 2.0, 1.0], Fill::Source));
+            sockets(&mut g, s);
         }
         SymbolKind::Clock => {
-            let r = rect(0.0, 0.1, w, 1.9);
-            g.fills.push((r.clone(), [w / 2.0, 1.0], false));
-            g.strokes.push((r, true, 1.0));
+            g.fills
+                .push((rrect(0.0, 0.1, w, 1.9, 0.5), [w / 2.0, 1.0], Fill::Source));
             g.strokes.push((
                 vec![
-                    [0.5, 1.5],
-                    [1.1, 1.5],
-                    [1.1, 0.5],
-                    [2.0, 0.5],
-                    [2.0, 1.5],
-                    [2.9, 1.5],
-                    [2.9, 0.5],
-                    [3.5, 0.5],
+                    [0.6, 1.4],
+                    [1.2, 1.4],
+                    [1.2, 0.6],
+                    [2.0, 0.6],
+                    [2.0, 1.4],
+                    [2.8, 1.4],
+                    [2.8, 0.6],
+                    [3.3, 0.6],
                 ],
                 false,
-                1.0,
+                1.4,
             ));
+            sockets(&mut g, s);
         }
         SymbolKind::PowerOnReset => {
-            let r = rect(0.0, 0.1, w, 1.9);
-            g.fills.push((r.clone(), [w / 2.0, 1.0], false));
-            g.strokes.push((r, true, 1.0));
+            g.fills
+                .push((rrect(0.0, 0.1, w, 1.9, 0.5), [w / 2.0, 1.0], Fill::Source));
+            sockets(&mut g, s);
         }
         SymbolKind::Pin { dir, .. } => {
-            let pts = match dir {
-                Dir::In => vec![
-                    [0.0, 0.2],
-                    [w - 1.0, 0.2],
-                    [w, 1.0],
-                    [w - 1.0, 1.8],
-                    [0.0, 1.8],
-                ],
-                _ => vec![[0.0, 1.0], [1.0, 0.2], [w, 0.2], [w, 1.8], [1.0, 1.8]],
-            };
-            g.fills.push((pts.clone(), [w / 2.0, 1.0], true));
-            g.strokes.push((pts, true, 1.0));
+            // A cream pill with an ink ring around the live value indicator.
+            let pill = rrect(0.0, 0.15, w, 1.85, 0.85);
+            g.fills.push((pill.clone(), [w / 2.0, 1.0], Fill::Light));
+            g.strokes.push((pill, true, 1.0));
+            let (c, r) = pin_indicator(*dir, w);
+            g.discs.push((c, r + 0.12, Fill::Ink));
+            sockets(&mut g, s);
         }
-        SymbolKind::Package { .. } => {
-            let body = rect(0.0, 0.0, w, h);
-            g.fills.push((body.clone(), [w / 2.0, h / 2.0], false));
-            // The title band; with pins on the top edge the title moves into the body.
-            if has_header(s) {
-                let header = rect(0.0, 0.0, w, 2.0);
-                g.fills.push((header, [w / 2.0, 1.0], true));
-                g.strokes.push((vec![[0.0, 2.0], [w, 2.0]], false, 0.6));
-            }
-            // A short tick inside the box at every pin (thicker for buses).
-            for p in &s.ports {
-                let (x, y) = (p.pos.x as f32, p.pos.y as f32);
-                let (dx, dy) = match p.side {
-                    Side::Left => (PIN_TICK, 0.0),
-                    Side::Right => (-PIN_TICK, 0.0),
-                    Side::Top => (0.0, PIN_TICK),
-                    Side::Bottom => (0.0, -PIN_TICK),
-                };
-                let wm = if p.width > 1 { 2.2 } else { 1.2 };
-                g.strokes.push((vec![[x, y], [x + dx, y + dy]], false, wm));
-            }
-            g.strokes.push((body, true, 1.2));
+        SymbolKind::Package { title, .. } => {
+            chip(&mut g, s, 0.0, Fill::Chip(chip_index(title) as u8));
         }
     }
     g
 }
 
-/// Length of the pin ticks inside package boxes (grid units).
-const PIN_TICK: f32 = 0.45;
 /// Inset of pin labels from the box edge (grid units).
 const LABEL_INSET: f32 = 0.7;
 /// Width of one character per unit of [`SymText::size`] (grid units; the canvas draws text at
@@ -308,28 +270,71 @@ fn fit(text: &str, room: f32, max: f32) -> f32 {
 /// title band, or the body when pins occupy the top edge.
 pub fn symbol_texts(s: &Symbol) -> Vec<SymText> {
     let (w, h) = (s.size.x as f32, s.size.y as f32);
+    let on_chip = matches!(
+        s.kind,
+        SymbolKind::Gate { .. }
+            | SymbolKind::Not
+            | SymbolKind::Buf
+            | SymbolKind::Tri
+            | SymbolKind::Package { .. }
+    );
     let t = |pos: [f32; 2], text: &str, size: f32, align: Align2, dim: bool| SymText {
         pos,
         text: text.to_string(),
         size,
         align,
         dim,
+        on_chip,
         vertical: false,
     };
+    let name = |text: &str| {
+        t(
+            [w / 2.0, h / 2.0],
+            text,
+            fit(text, w - 0.9, 1.15),
+            Align2::CENTER_CENTER,
+            false,
+        )
+    };
     match &s.kind {
+        SymbolKind::Gate { op, .. } => vec![name(match op {
+            GateOp::And => "AND",
+            GateOp::Or => "OR",
+            GateOp::Nand => "NAND",
+            GateOp::Nor => "NOR",
+            GateOp::Xor => "XOR",
+            GateOp::Xnor => "XNOR",
+        })],
+        SymbolKind::Not => vec![name("NOT")],
+        SymbolKind::Buf => vec![name("BUF")],
+        SymbolKind::Tri => vec![name("TRI")],
         SymbolKind::Constant { text } => {
-            vec![t([w / 2.0, 1.0], text, fit(text, w - 0.4, 1.1), Align2::CENTER_CENTER, false)]
+            vec![t(
+                [w / 2.0, 1.0],
+                text,
+                fit(text, w - 0.4, 1.1),
+                Align2::CENTER_CENTER,
+                false,
+            )]
         }
         SymbolKind::PowerOnReset => {
             vec![t([w / 2.0, 1.0], "POR", 1.1, Align2::CENTER_CENTER, false)]
         }
         SymbolKind::Pin { name, dir } => {
+            // The name fills the pill beside the value indicator.
+            let room = w - 2.1;
             let x = if *dir == Dir::In {
-                (w - 1.0) / 2.0
+                0.35 + room / 2.0
             } else {
-                (w + 1.0) / 2.0
+                w - 0.35 - room / 2.0
             };
-            vec![t([x, 1.0], name, fit(name, w - 1.2, 1.1), Align2::CENTER_CENTER, false)]
+            vec![t(
+                [x, 1.0],
+                name,
+                fit(name, room, 1.1),
+                Align2::CENTER_CENTER,
+                false,
+            )]
         }
         SymbolKind::Package { title, .. } => {
             let mut v = Vec::with_capacity(s.ports.len() + 1);
@@ -405,11 +410,23 @@ pub fn symbol_texts(s: &Symbol) -> Vec<SymText> {
                 v.push(label);
             }
             if header {
-                v.push(t([w / 2.0, 1.0], title, fit(title, w - 0.8, 1.15), Align2::CENTER_CENTER, false));
+                v.push(t(
+                    [w / 2.0, 1.0],
+                    title,
+                    fit(title, w - 0.8, 1.15),
+                    Align2::CENTER_CENTER,
+                    false,
+                ));
             } else {
                 // Between the left and right label columns, below the top labels.
                 let room = w - 2.0 * LABEL_INSET - 2.0;
-                v.push(t([w / 2.0, h / 2.0], title, fit(title, room, 1.15), Align2::CENTER_CENTER, false));
+                v.push(t(
+                    [w / 2.0, h / 2.0],
+                    title,
+                    fit(title, room, 1.15),
+                    Align2::CENTER_CENTER,
+                    false,
+                ));
             }
             v
         }
@@ -423,9 +440,9 @@ pub fn symbol_texts(s: &Symbol) -> Vec<SymText> {
                     format!("{hi}:{lo}")
                 };
                 t(
-                    [1.25, 1.0 + 2.0 * i as f32 - 0.15],
+                    [1.45, 1.0 + 2.0 * i as f32 - 0.2],
                     &label,
-                    0.75,
+                    0.7,
                     Align2::LEFT_BOTTOM,
                     true,
                 )
@@ -454,7 +471,10 @@ pub fn place_text(t: &SymText, o: Orient, size: GridPt) -> TextPlacement {
     let origin = o.apply_f([0.0, 0.0], size);
     let map = |v: [f32; 2]| {
         let p = o.apply_f(v, size);
-        [(p[0] - origin[0]).round() as i32, (p[1] - origin[1]).round() as i32]
+        [
+            (p[0] - origin[0]).round() as i32,
+            (p[1] - origin[1]).round() as i32,
+        ]
     };
     // Local reading direction and the local "down" of the text.
     let (b_local, n_local) = if t.vertical {
@@ -567,23 +587,21 @@ fn tessellator(ppp: f32) -> Tessellator {
 fn build_template(g: &Glyph, zoom: f32, ppp: f32, pal: &Palette, sw: f32) -> Mesh {
     let mut mesh = Mesh::default();
     let px = |p: P| pos2(p[0] * zoom, p[1] * zoom);
-    for (pts, c, header) in &g.fills {
-        let color = if *header {
-            pal.package_header
-        } else {
-            pal.fill
-        };
-        let base = mesh.vertices.len() as u32;
-        mesh.colored_vertex(px(*c), color);
-        for &p in pts {
-            mesh.colored_vertex(px(p), color);
-        }
-        let n = pts.len() as u32;
-        for i in 0..n {
-            mesh.add_triangle(base, base + 1 + i, base + 1 + (i + 1) % n);
-        }
-    }
+    let color = |f: Fill| match f {
+        Fill::Chip(i) => pal.chips[i as usize % pal.chips.len()],
+        Fill::Source => pal.source,
+        Fill::Light => pal.fill,
+        Fill::Ink => pal.stroke,
+    };
     let mut t = tessellator(ppp);
+    for (pts, _c, f) in &g.fills {
+        // Anti-aliased convex fill (the tessellator feathers the edge).
+        let points: Vec<Pos2> = pts.iter().map(|&p| px(p)).collect();
+        t.tessellate_path(
+            &PathShape::convex_polygon(points, color(*f), PathStroke::NONE),
+            &mut mesh,
+        );
+    }
     for (pts, closed, wm) in &g.strokes {
         let points: Vec<Pos2> = pts.iter().map(|&p| px(p)).collect();
         let stroke = PathStroke::new(sw * wm, pal.stroke);
@@ -594,13 +612,13 @@ fn build_template(g: &Glyph, zoom: f32, ppp: f32, pal: &Palette, sw: f32) -> Mes
         };
         t.tessellate_path(&shape, &mut mesh);
     }
-    for &(c, r) in &g.discs {
+    for &(c, r, f) in &g.discs {
         t.tessellate_shape(
             Shape::Circle(egui::epaint::CircleShape {
                 center: px(c),
                 radius: r * zoom,
-                fill: pal.fill,
-                stroke: Stroke::new(sw, pal.stroke),
+                fill: color(f),
+                stroke: Stroke::NONE,
             }),
             &mut mesh,
         );
@@ -696,9 +714,10 @@ mod tests {
             let m = t.get(&s).clone();
             assert!(!m.is_empty(), "{a:?}");
             let (w, h) = (s.size.x as f32 * 10.0, s.size.y as f32 * 10.0);
+            // Pin sockets straddle the box edge (radius 2.7 px plus anti-aliasing feather).
             for v in &m.vertices {
                 assert!(
-                    v.pos.x > -3.0 && v.pos.y > -3.0 && v.pos.x < w + 3.0 && v.pos.y < h + 3.0,
+                    v.pos.x > -3.5 && v.pos.y > -3.5 && v.pos.x < w + 3.5 && v.pos.y < h + 3.5,
                     "{a:?}: {:?}",
                     v.pos
                 );
@@ -728,7 +747,9 @@ mod tests {
     /// World-frame (oriented local) bounding box of a placed text of `chars` characters.
     fn text_box(t: &SymText, tp: &TextPlacement) -> egui::Rect {
         let len = CHAR_W * t.size * t.text.chars().count() as f32;
-        let r = tp.align.anchor_size(pos2(tp.pos[0], tp.pos[1]), egui::vec2(len, 0.8 * t.size));
+        let r = tp
+            .align
+            .anchor_size(pos2(tp.pos[0], tp.pos[1]), egui::vec2(len, 0.8 * t.size));
         if tp.angle == 0.0 {
             return r;
         }
@@ -743,7 +764,10 @@ mod tests {
         use crate::geom::{SymbolLayout, SymbolPin, gp, package_symbol};
         use panda_netlist::DefBuilder;
         let mut b = DefBuilder::new("pkg");
-        let ins: Vec<_> = ["A", "BUS", "SEL", "EN"].iter().map(|n| b.input(n, 1)).collect();
+        let ins: Vec<_> = ["A", "BUS", "SEL", "EN"]
+            .iter()
+            .map(|n| b.input(n, 1))
+            .collect();
         let y = b.and(&ins);
         b.output("Y", y);
         b.output("OVF", ins[0]);

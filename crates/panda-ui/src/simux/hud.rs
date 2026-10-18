@@ -106,9 +106,9 @@ impl Tier {
 
     fn color(self, text: Color32) -> Color32 {
         match self {
-            Tier::Jit => Color32::from_rgb(90, 200, 120),
-            Tier::Compiled => Color32::from_rgb(110, 170, 255),
-            Tier::Reference | Tier::Compiling => Color32::from_rgb(230, 180, 60),
+            Tier::Jit => crate::theme::TEAL,
+            Tier::Compiled => crate::theme::STEEL,
+            Tier::Reference | Tier::Compiling => crate::theme::OCHRE,
             Tier::None | Tier::Timing => text,
         }
     }
@@ -191,8 +191,7 @@ impl Panel for Hud {
             ));
         if app.wave.gaps > 0 {
             ui.label(
-                RichText::new(format!("wave gaps {}", app.wave.gaps))
-                    .color(Color32::from_rgb(230, 180, 60)),
+                RichText::new(format!("wave gaps {}", app.wave.gaps)).color(crate::theme::OCHRE),
             )
             .on_hover_text(
                 "Waveform intervals skipped while the simulation ran faster than capture",

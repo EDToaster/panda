@@ -15,8 +15,8 @@ use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use egui::{
-    Align2, Color32, FontId, Key, Mesh, Modifiers, PointerButton, Pos2, Rect, Stroke, StrokeKind,
-    Ui, pos2, vec2,
+    Align2, FontId, Key, Mesh, Modifiers, PointerButton, Pos2, Rect, Stroke, StrokeKind, Ui, pos2,
+    vec2,
 };
 
 use super::SharedEditor;
@@ -393,7 +393,7 @@ impl CanvasTool for EditTool {
 
         // ---- overlays -----------------------------------------------------------------
         let ed = self.ed.borrow();
-        let wire_w = (xf.zoom * 0.13).clamp(1.0, 3.5);
+        let wire_w = (xf.zoom * 0.2).clamp(1.5, 6.0);
         for w in &ed.selection.wires {
             let r = Rect::from_two_pos(xf.grid_to_screen(w.a), xf.grid_to_screen(w.b));
             painter.rect_filled(
@@ -456,8 +456,11 @@ impl CanvasTool for EditTool {
                     }
                     if let Some(e) = err {
                         let at = xf.grid_to_screen(g) + vec2(10.0, -10.0);
-                        let galley =
-                            painter.layout_no_wrap(e, FontId::proportional(13.0), Color32::WHITE);
+                        let galley = painter.layout_no_wrap(
+                            e,
+                            FontId::proportional(13.0),
+                            crate::theme::NAVY,
+                        );
                         let mut box_ = Align2::LEFT_BOTTOM
                             .anchor_size(at, galley.size())
                             .expand(4.0);
@@ -471,7 +474,7 @@ impl CanvasTool for EditTool {
                             box_ = box_.translate(vec2(0.0, canvas.rect.top() - box_.top() + 2.0));
                         }
                         painter.rect_filled(box_, 3.0, pal.x.gamma_multiply(0.9));
-                        painter.galley(box_.min + vec2(4.0, 4.0), galley, Color32::WHITE);
+                        painter.galley(box_.min + vec2(4.0, 4.0), galley, crate::theme::NAVY);
                     }
                 }
             }
@@ -513,14 +516,14 @@ impl CanvasTool for EditTool {
             let galley = painter.layout(
                 m.clone(),
                 FontId::proportional(13.0),
-                Color32::WHITE,
+                crate::theme::NAVY,
                 canvas.rect.width() - 40.0,
             );
             let box_ = Align2::LEFT_BOTTOM
                 .anchor_size(at, galley.size())
                 .expand(5.0);
             painter.rect_filled(box_, 4.0, pal.x.gamma_multiply(0.9));
-            painter.galley(box_.min + vec2(5.0, 5.0), galley, Color32::WHITE);
+            painter.galley(box_.min + vec2(5.0, 5.0), galley, crate::theme::NAVY);
             ui.ctx().request_repaint_after(Duration::from_millis(250));
         }
         if self.published != ed.selection {

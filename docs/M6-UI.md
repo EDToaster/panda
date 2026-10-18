@@ -51,17 +51,22 @@ or a sampling list the engine copies after each event). Must not slow `run` when
    (instance position/rotation/flip, wire polylines per net with junctions, labels, package symbol
    pin layout). Round-trips through the JSON format. Designs without geometry (generated:
    panda-circuits, Panda-8) get an automatic layered layout on open.
-2. **Canvas**: pan/zoom (smooth, cursor-anchored), grid, IEEE distinctive gate shapes
-   (AND/OR/XOR/NAND/NOR/XNOR/NOT/BUF/TRI), splitters, constants, clocks, POR, package boxes with pin
-   labels, wires coloured by live value (0, 1, X, Z, contention), buses thicker with a hex value
-   label, culling of off-screen items so 10k+ gate designs stay at 60 fps.
+2. **Canvas**: pan/zoom (smooth, cursor-anchored), dot grid, Digital-Logic-Sim style chips
+   (rounded bodies named in the middle, pin sockets on the edge; NAND, other gates, NOT/BUF/TRI,
+   packages coloured per name), splitter bars, constants, clocks, POR, pin pills whose indicator
+   lights with the live value, grid-snapped wires with rounded bends and round ends coloured by
+   live value (0, 1, X, Z, contention), buses thicker with a dark casing and a hex value badge,
+   culling of off-screen items so 10k+ gate designs stay at 60 fps. The look (eggshell
+   background, maroon / red / navy / steel palette and derived tones) lives in
+   `panda-ui/src/theme.rs` and `canvas/style.rs`.
 3. **Editing**: select (click, box, shift), move, delete, rotate, copy/paste, place from palette,
    draw wires with orthogonal (Manhattan) routing and auto-junctions, connect to pins/wires,
    inspector for atom parameters / widths / clock period-high-phase / constants / net termination,
    undo/redo of every edit. Every structural edit becomes `EditOp`s applied to the kernel.
 4. **Hierarchy & packaging**: open/enter/exit package instances (breadcrumbs), create a package
    from a selection (crossing nets become pins), package symbol auto-layout, library palette
-   (atoms, user packages, panda-circuits blocks), classification badge per def
+   (starts from NAND plus the primitives NAND cannot build: tri-state buffer, split / merge,
+   constant, clock, power-on reset; then the user's packages), classification badge per def
    (combinational/sequential/oscillator, clock-like pins).
 5. **Simulation UX**: mode toggle Timing/Fast, run/pause/step (tick/phase/cycle), speed
    (unlimited or target rate), reset, click top-level inputs on the canvas to toggle/edit, live

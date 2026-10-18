@@ -45,3 +45,4 @@ pub mod hier;
 pub mod layout;
 pub mod simhost;
 pub mod simux;
+pub mod theme;
