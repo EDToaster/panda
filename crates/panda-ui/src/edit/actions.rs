@@ -483,6 +483,9 @@ pub struct Editor {
     pub clipboard: Option<Clipboard>,
     /// Last message for the user (errors from actions), newest wins.
     pub message: Option<String>,
+    /// One-shot request (F2) to focus the inspector's name field with the whole name selected,
+    /// ready to type a new one. Taken by the inspector when it draws the field.
+    pub focus_name: bool,
     view: Option<(String, DefId)>,
     revision: u64,
     /// [`Document::id`] of the document the history and selection belong to.

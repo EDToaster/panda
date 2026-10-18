@@ -382,6 +382,12 @@ impl PandaApp {
     pub fn show(&mut self, ui: &mut Ui) {
         let t0 = Instant::now();
         crate::theme::apply(ui.ctx());
+        // Tab belongs to the canvas (cycle the selection) unless a text field has focus: stop
+        // egui from moving keyboard focus into the side panels.
+        if ui.ctx().memory(|m| m.focused().is_none()) {
+            ui.ctx()
+                .memory_mut(|m| m.move_focus(egui::FocusDirection::None));
+        }
         let events = self.state.update();
         for p in &mut self.registry.panels {
             p.on_frame(ui.ctx(), &mut self.state);
