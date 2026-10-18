@@ -101,7 +101,7 @@ fn panda8_breadcrumbs_badge_and_library() {
             .filter(|d| d.id != a.state.doc.design.top)
             .all(|d| badge_ready(&hs, &d.id))
     });
-    hs.borrow_mut().selected_entry = Some("ripple adder".into());
+    hs.borrow_mut().selected_entry = Some("NAND".into());
     h.step();
     save(&mut h, "panda8-alu-breadcrumbs");
     // The instance tree tab.
@@ -289,14 +289,12 @@ fn library_block_click_then_canvas_click_places_it() {
     let (app, hs) = app(state);
     let mut h = harness(app, 1200.0, 700.0);
     step_until(&mut h, 20.0, |a| a.state.live.values().is_some());
-    hs.borrow_mut().filter = "adder".into();
+    hs.borrow_mut().filter = "nand".into();
     h.step();
-    h.get_by_label("ripple adder").click();
+    h.get_by_label("NAND").click();
     h.step();
     h.step();
-    // The block's defs were added (undoable), the edit module's place tool is armed.
-    assert!(h.state().state.doc.def("ripple_adder_8").is_some());
-    assert!(h.state().state.doc.def("full_adder").is_some());
+    // The edit module's place tool is armed with the NAND atom.
     let top = h.state().state.doc.design.top.clone();
     let before = h.state().state.doc.def(&top).unwrap().instances.len();
     // Move over an empty part of the canvas and click.
@@ -316,10 +314,12 @@ fn library_block_click_then_canvas_click_places_it() {
     h.step();
     let def = h.state().state.doc.def(&top).unwrap().clone();
     assert_eq!(def.instances.len(), before + 1, "nothing placed");
-    assert!(
-        def.instances
-            .iter()
-            .any(|i| matches!(&i.kind, panda_netlist::InstKind::Def(d) if d == "ripple_adder_8"))
-    );
+    assert!(def.instances.iter().any(|i| matches!(
+        &i.kind,
+        panda_netlist::InstKind::Atom(panda_netlist::Atom::Gate {
+            op: panda_netlist::GateOp::Nand,
+            ..
+        })
+    )));
     save(&mut h, "library-placed");
 }

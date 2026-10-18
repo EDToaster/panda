@@ -34,7 +34,7 @@ use super::locate::{nets_in_view, path_entry_net, resolve_location};
 use super::{SharedRef, jump_to};
 
 /// Colour for "meets timing".
-const GOOD: Color32 = Color32::from_rgb(90, 200, 120);
+const GOOD: Color32 = crate::theme::TEAL;
 
 /// A `Clock` atom somewhere in the hierarchy.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -668,6 +668,7 @@ impl Panel for StaPanel {
     }
 
     fn ui(&mut self, ui: &mut Ui, app: &mut AppState) {
+        crate::theme::apply(ui.ctx());
         self.header(ui, app);
         ui.separator();
         // Every branch fills the panel, so the bottom panel keeps its size across tabs.

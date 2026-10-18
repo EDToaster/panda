@@ -40,7 +40,7 @@ const LABEL_CHAR_W: f32 = 6.7;
 /// Max entries listed by the signal picker.
 const PICKER_LIMIT: usize = 200;
 /// Colour of capture-gap hatching.
-const GAP_COLOR: Color32 = Color32::from_rgb(230, 170, 50);
+const GAP_COLOR: Color32 = crate::theme::OCHRE;
 
 /// Names of the signals currently in the viewer.
 pub fn signal_names(app: &AppState) -> Vec<String> {
@@ -376,6 +376,7 @@ impl Panel for WaveformPanel {
     }
 
     fn ui(&mut self, ui: &mut Ui, app: &mut AppState) {
+        crate::theme::apply(ui.ctx());
         let (tick, running, mode) = {
             let s = &app.live.snapshot;
             (s.tick, s.running, s.mode)

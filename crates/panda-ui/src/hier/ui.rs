@@ -36,12 +36,12 @@ const PACKAGE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key:
 
 fn badge_color(kind: ClassKind, dark: bool) -> Color32 {
     match (kind, dark) {
-        (ClassKind::Combinational, true) => Color32::from_rgb(110, 200, 120),
-        (ClassKind::Combinational, false) => Color32::from_rgb(30, 130, 50),
-        (ClassKind::Sequential, true) => Color32::from_rgb(120, 170, 255),
-        (ClassKind::Sequential, false) => Color32::from_rgb(30, 80, 190),
-        (ClassKind::Oscillator, true) => Color32::from_rgb(255, 170, 80),
-        (ClassKind::Oscillator, false) => Color32::from_rgb(190, 100, 0),
+        (ClassKind::Combinational, true) => crate::theme::STEEL,
+        (ClassKind::Combinational, false) => crate::theme::TEAL,
+        (ClassKind::Sequential, true) => Color32::from_rgb(0xE6, 0x6B, 0x6B),
+        (ClassKind::Sequential, false) => crate::theme::BRICK,
+        (ClassKind::Oscillator, true) => crate::theme::AMBER,
+        (ClassKind::Oscillator, false) => crate::theme::OCHRE,
     }
 }
 

@@ -13,7 +13,7 @@
 
 use std::cell::RefCell;
 
-use egui::{Color32, FontId, Id, Key, Order, Pos2, Rect, Ui, pos2, vec2};
+use egui::{FontId, Id, Key, Order, Pos2, Rect, Ui, pos2, vec2};
 use panda_netlist::{Dir, Endpoint, PinDecl, Value};
 
 use crate::app::{AppState, CanvasTool};
@@ -349,7 +349,7 @@ impl SimTool {
                         submit = true;
                     }
                     if let Some(err) = &e.error {
-                        ui.colored_label(Color32::from_rgb(240, 80, 80), err);
+                        ui.colored_label(crate::theme::RED, err);
                     }
                     ui.horizontal(|ui| {
                         submit |= ui.button("Set").clicked();

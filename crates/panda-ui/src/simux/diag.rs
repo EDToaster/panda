@@ -38,9 +38,9 @@ pub fn severity_rank(s: Severity) -> u8 {
 /// Colour of a severity.
 pub fn severity_color(s: Severity) -> Color32 {
     match s {
-        Severity::Error => Color32::from_rgb(240, 80, 80),
-        Severity::Warning => Color32::from_rgb(235, 180, 60),
-        Severity::Info => Color32::from_rgb(110, 170, 255),
+        Severity::Error => crate::theme::RED,
+        Severity::Warning => crate::theme::OCHRE,
+        Severity::Info => crate::theme::TEAL,
     }
 }
 
@@ -367,6 +367,7 @@ impl Panel for DiagPanel {
     }
 
     fn ui(&mut self, ui: &mut Ui, app: &mut AppState) {
+        crate::theme::apply(ui.ctx());
         let model = self.model(app);
         ui.horizontal(|ui| {
             for (k, (label, on)) in [

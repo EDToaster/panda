@@ -216,7 +216,10 @@ fn library_entries_place_through_the_edit_module() {
     let n0 = app.doc.def(&top).unwrap().instances.len();
     let mut ed = Editor::new();
     // A parameterized block: its defs are added (one undoable action), then placed.
-    let mut entry = hs.builtin.iter().find(|e| e.name == "mux").unwrap().clone();
+    let mut entry = panda_ui::hier::library::catalog_entries()
+        .into_iter()
+        .find(|e| e.name == "mux")
+        .unwrap();
     entry.params[0].value = 1;
     entry.params[1].value = 4;
     let req = actions::arm_entry(&mut hs, None, &mut app, &entry).unwrap();
@@ -226,7 +229,12 @@ fn library_entries_place_through_the_edit_module() {
     assert!(app.doc.def(id).is_some(), "{id}");
     ed.place(&mut app, &top, &req, gp(60, 4)).unwrap();
     // An atom with parameters, and a user def of the document.
-    let mut and = hs.builtin.iter().find(|e| e.name == "AND").unwrap().clone();
+    let mut and = hs
+        .builtin
+        .iter()
+        .find(|e| e.name == "NAND")
+        .unwrap()
+        .clone();
     and.params[0].value = 3;
     and.params[1].value = 8;
     let req = actions::arm_entry(&mut hs, None, &mut app, &and).unwrap();

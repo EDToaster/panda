@@ -38,7 +38,7 @@ impl Category {
     /// Section title.
     pub fn title(self) -> &'static str {
         match self {
-            Category::Atoms => "Atoms",
+            Category::Atoms => "Built-in",
             Category::User => "Packages in this design",
             Category::Arithmetic => "Arithmetic",
             Category::Sequential => "Sequential",
@@ -206,8 +206,36 @@ fn g(op: GateOp, v: &[u32]) -> Atom {
     }
 }
 
-/// The built-in entries (atoms and panda-circuits blocks) with default parameters.
+/// The starting palette, in the spirit of Digital Logic Sim: a NAND gate plus the few
+/// primitives that cannot be built out of NAND gates (a tri-state buffer for shared buses,
+/// splitting / merging buses, constants and the two sources, clock and power-on reset).
+/// Everything else is meant to be built (and packaged) by the user.
 pub fn builtin_entries() -> Vec<LibEntry> {
+    const STARTER: [&str; 6] = [
+        "NAND",
+        "TRI",
+        "Splitter",
+        "Constant",
+        "Clock",
+        "Power-on reset",
+    ];
+    let mut v: Vec<LibEntry> = catalog_entries()
+        .into_iter()
+        .filter(|e| STARTER.contains(&e.name.as_str()))
+        .collect();
+    for e in &mut v {
+        match e.name.as_str() {
+            "TRI" => e.name = "Tri-state buffer".into(),
+            "Splitter" => e.name = "Split / merge".into(),
+            _ => {}
+        }
+    }
+    v
+}
+
+/// Every atom and parameterized panda-circuits block (not shown in the palette, which starts
+/// from [`builtin_entries`]; kept for programmatic placement and tests).
+pub fn catalog_entries() -> Vec<LibEntry> {
     use Category::*;
     use EntryKind::{Atom as A, Block as B};
     let gi = [param("inputs", 2, 1, 16), param("width", 1, 1, 64)];
@@ -450,7 +478,7 @@ mod tests {
         let mut doc = Document::new(examples::counter());
         doc.layout_missing();
         let top = doc.design.top.clone();
-        for (k, e) in builtin_entries().iter().enumerate() {
+        for (k, e) in catalog_entries().iter().enumerate() {
             let p = e
                 .resolve(&doc.design)
                 .unwrap_or_else(|err| panic!("{}: {err}", e.name));
@@ -487,6 +515,27 @@ mod tests {
     }
 
     #[test]
+    fn palette_starts_from_nand() {
+        let names: Vec<String> = builtin_entries().into_iter().map(|e| e.name).collect();
+        assert_eq!(
+            names,
+            [
+                "NAND",
+                "Tri-state buffer",
+                "Split / merge",
+                "Constant",
+                "Clock",
+                "Power-on reset"
+            ]
+        );
+        assert!(
+            builtin_entries()
+                .iter()
+                .all(|e| e.category == Category::Atoms)
+        );
+    }
+
+    #[test]
     fn cycles_and_sources_are_rejected() {
         let doc = Document::new(examples::counter());
         // sync_counter_4 contains register_4: placing the counter into the register is a cycle.
@@ -506,7 +555,7 @@ mod tests {
     #[test]
     fn block_ids_encode_parameters() {
         let d = examples::counter();
-        let mut e = builtin_entries()
+        let mut e = catalog_entries()
             .into_iter()
             .find(|e| e.name == "register")
             .unwrap();

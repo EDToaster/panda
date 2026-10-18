@@ -381,6 +381,7 @@ impl PandaApp {
     /// Draw one frame into `ui` (the root ui of eframe, or a kittest harness).
     pub fn show(&mut self, ui: &mut Ui) {
         let t0 = Instant::now();
+        crate::theme::apply(ui.ctx());
         let events = self.state.update();
         for p in &mut self.registry.panels {
             p.on_frame(ui.ctx(), &mut self.state);

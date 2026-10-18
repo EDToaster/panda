@@ -1104,9 +1104,9 @@ fn report(ed: &mut Editor, r: Result<(), String>) -> Result<(), String> {
 // =====================================================================================
 
 /// Colour of inline errors.
-pub const ERROR: Color32 = Color32::from_rgb(230, 80, 70);
+pub const ERROR: Color32 = crate::theme::RED;
 /// Colour of inline warnings (conflicts that "Apply & disconnect" resolves).
-pub const WARN: Color32 = Color32::from_rgb(225, 165, 50);
+pub const WARN: Color32 = crate::theme::OCHRE;
 
 /// Key of a draft: `(def, selection key, document revision)`; a draft is reloaded when the
 /// selection or the document changes.

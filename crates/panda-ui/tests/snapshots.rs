@@ -124,3 +124,43 @@ fn panda8_top_level_and_core() {
     h.step();
     save(&mut h, "panda8-alu-zoom");
 }
+
+/// The starting palette (NAND + primitives) next to a NAND SR latch holding `Q = 1`: chips with
+/// pin sockets, lit pin indicators and rounded wire corners.
+#[test]
+fn nand_latch_and_starter_palette() {
+    let mut state = AppState::new(examples::sr_latch(), SimOptions::default());
+    state.wait_layout();
+    let mut h = harness(PandaApp::new(state), 1100.0, 640.0);
+    step_until(&mut h, 10.0, |a| a.state.live.values().is_some());
+    let s = &mut h.state_mut().state;
+    for (pin, v) in [("S_n", false), ("R_n", true)] {
+        s.sim.send(Command::SetInput {
+            pin: pin.into(),
+            value: Value::from_bool(v),
+        });
+    }
+    s.sim.send(Command::Step {
+        n: 4,
+        unit: StepUnit::Tick,
+    });
+    let tick0 = h.state().state.live.snapshot.tick;
+    step_until(&mut h, 10.0, |a| {
+        a.state.live.snapshot.tick > tick0 && a.state.live.values().is_some()
+    });
+    let s = &mut h.state_mut().state;
+    s.sim.send(Command::SetInput {
+        pin: "S_n".into(),
+        value: Value::from_bool(true),
+    });
+    s.sim.send(Command::Step {
+        n: 4,
+        unit: StepUnit::Tick,
+    });
+    let tick1 = tick0 + 4;
+    step_until(&mut h, 10.0, |a| {
+        a.state.live.snapshot.tick >= tick1 && a.state.live.values().is_some()
+    });
+    let img = save(&mut h, "nand-latch");
+    assert!(colours(&img) > 20);
+}
