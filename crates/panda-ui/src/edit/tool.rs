@@ -442,9 +442,10 @@ impl EditTool {
         if pressed(Modifiers::NONE, Key::W) {
             ed.tool = Tool::Wire;
         }
-        // F2: rename the selected net (or instance) in the inspector.
+        // F2: rename the selected net, instance or pin in the inspector.
         if pressed(Modifiers::NONE, Key::F2)
-            && (ed.selection.single_net().is_some() || ed.selection.single_instance().is_some())
+            && (ed.selection.single_net().is_some()
+                || (ed.selection.wires.is_empty() && ed.selection.items.len() == 1))
         {
             ed.focus_name = true;
             ui.ctx().request_repaint();

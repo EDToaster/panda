@@ -41,7 +41,7 @@ pub const SHEET: &[(&str, &[(&str, &str)])] = &[
             ("W", "wire tool (drag from a port)"),
             ("S", "select tool"),
             ("N", "select the wires on this chip (repeat: next wire)"),
-            ("F2", "rename the selected wire or chip"),
+            ("F2", "rename the selected wire, chip or pin"),
         ],
     ),
     (
@@ -57,7 +57,8 @@ pub const SHEET: &[(&str, &[(&str, &str)])] = &[
     (
         "Packages",
         &[
-            ("Ctrl+G", "package the selection"),
+            ("Ctrl+G", "package the selection (type a name, Enter)"),
+            ("Shift+F2", "rename the package of the selected chip"),
             ("Enter", "open the selected package"),
             ("Alt+Up", "up one level"),
         ],
@@ -100,7 +101,7 @@ pub enum HintCtx {
         input: bool,
         /// It is a package instance (Enter opens it).
         package: bool,
-        /// It can be renamed (instances).
+        /// It can be renamed (instances and pins).
         renamable: bool,
         /// `C` would wire the previous item to it.
         connect: bool,
@@ -211,7 +212,7 @@ pub fn hints(ctx: &HintCtx) -> Vec<(&'static str, &'static str)> {
             connect,
         } => {
             if *connect {
-                v.push(("C", "connect from previous"));
+                v.push(("C", "connect"));
             }
             if *input {
                 v.push(("Space", "toggle"));
@@ -221,6 +222,9 @@ pub fn hints(ctx: &HintCtx) -> Vec<(&'static str, &'static str)> {
             }
             if *renamable {
                 v.push(("F2", "rename"));
+            }
+            if *package {
+                v.push(("Shift+F2", "rename pkg"));
             }
             v.extend([
                 ("A", "add next"),
@@ -500,11 +504,11 @@ mod tests {
         let item = HintCtx::Item {
             input: true,
             package: false,
-            renamable: false,
+            renamable: true,
             connect: true,
         };
         let k = keys(item);
-        assert!(k.contains(&"Space") && k.contains(&"C") && !k.contains(&"F2"));
+        assert!(k.contains(&"Space") && k.contains(&"C") && k.contains(&"F2"));
         assert_eq!(keys(HintCtx::QuickAdd), ["Up/Down", "Enter", "Esc"]);
         assert!(keys(HintCtx::Two).contains(&"C"));
     }

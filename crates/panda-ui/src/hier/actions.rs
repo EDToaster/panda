@@ -21,6 +21,21 @@ pub struct PackagePrompt {
     pub selection: Vec<String>,
     /// Error of the last attempt.
     pub error: Option<String>,
+    /// Select the whole name on the next frame (just opened: typing replaces the default).
+    pub select_all: bool,
+}
+
+/// The open "rename package" prompt.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RenamePrompt {
+    /// Package being renamed.
+    pub old: DefId,
+    /// New name being typed.
+    pub name: String,
+    /// Error of the last attempt.
+    pub error: Option<String>,
+    /// Select the whole name on the next frame.
+    pub select_all: bool,
 }
 
 /// State shared by the hierarchy panels and tools.
@@ -39,6 +54,8 @@ pub struct HierState {
     pub builtin: Vec<LibEntry>,
     /// Open package prompt.
     pub prompt: Option<PackagePrompt>,
+    /// Open rename-package prompt.
+    pub rename: Option<RenamePrompt>,
     /// Library search text.
     pub filter: String,
     /// Selected library entry (name), whose parameters are shown.
@@ -66,6 +83,7 @@ impl HierState {
             classifier: Classifier::new(),
             builtin: builtin_entries(),
             prompt: None,
+            rename: None,
             filter: String::new(),
             selected_entry: None,
             last_view: None,
@@ -142,7 +160,66 @@ impl HierState {
             name: default_package_name(app),
             selection,
             error: None,
+            select_all: true,
         });
+    }
+
+    /// Open the rename prompt for package `id` (its current name, selected).
+    pub fn ask_rename(&mut self, app: &AppState, id: &str) {
+        if app.doc.def(id).is_none() || id == app.doc.design.top {
+            self.status = Some(format!("'{id}' is not a package of this design"));
+            return;
+        }
+        self.rename = Some(RenamePrompt {
+            old: id.to_string(),
+            name: id.to_string(),
+            error: None,
+            select_all: true,
+        });
+    }
+
+    /// Apply the open rename prompt. On error the prompt stays open with the message.
+    pub fn submit_rename(&mut self, ed: Option<&SharedEditor>, app: &mut AppState) {
+        let Some(mut p) = self.rename.take() else {
+            return;
+        };
+        let new = p.name.trim().to_string();
+        if new == p.old {
+            return;
+        }
+        let r = super::manage::plan_rename_def(EditTarget::doc(app), &p.old, &new)
+            .and_then(|c| self.commit(ed, app, &c));
+        match r {
+            Ok(()) => {
+                if app.view.def == p.old {
+                    app.view.def = new.clone();
+                    self.last_view = Some((app.view.path.clone(), new.clone()));
+                }
+                if self.selected_entry.as_deref() == Some(p.old.as_str()) {
+                    self.selected_entry = Some(new.clone());
+                }
+                self.report(app, format!("renamed package '{}' to '{new}'", p.old));
+            }
+            Err(e) => {
+                p.error = Some(e);
+                self.rename = Some(p);
+            }
+        }
+    }
+
+    /// Delete package `id` (refused, with the reason in the status line, while it is used).
+    pub fn delete_def(&mut self, ed: Option<&SharedEditor>, app: &mut AppState, id: &str) {
+        let r = super::manage::plan_delete_def(EditTarget::doc(app), id)
+            .and_then(|c| self.commit(ed, app, &c));
+        match r {
+            Ok(()) => {
+                if self.selected_entry.as_deref() == Some(id) {
+                    self.selected_entry = None;
+                }
+                self.report(app, format!("deleted package '{id}' (Ctrl+Z to undo)"));
+            }
+            Err(e) => self.status = Some(e),
+        }
     }
 
     /// Create the package of the open prompt. On error the prompt stays open with the message.

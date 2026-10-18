@@ -20,6 +20,7 @@ pub mod actions;
 pub mod change;
 pub mod classify;
 pub mod library;
+pub mod manage;
 pub mod nav;
 pub mod package;
 pub mod ui;
