@@ -937,6 +937,8 @@ pub enum IdKind {
     Instance,
     /// A net id.
     Net,
+    /// The name of one of the def's own pins (a port of every instance of the def).
+    Pin,
 }
 
 /// Check that `new` can replace id `old` in `def` (the validator's rules: not empty, no `/`,
@@ -962,6 +964,7 @@ pub fn check_new_id(def: &ComponentDef, kind: IdKind, old: &str, new: &str) -> R
             def.instances.iter().any(|i| i.id == new)
         }
         IdKind::Net => def.nets.iter().any(|n| n.id == new),
+        IdKind::Pin => def.pins.iter().any(|p| p.name == new),
     };
     if taken {
         return Err(format!("'{new}' is already used in {}", def.id));
@@ -1088,6 +1091,112 @@ pub fn rename_net(
         Ok(())
     })();
     report(ed, r)
+}
+
+/// Rename pin `old` of `def_id` to `new`. The pin is also a port of every instance of the
+/// def, so the connections of those instances (in every parent def) follow; its marker
+/// geometry, symbol placement and selection follow too. One undoable action.
+pub fn rename_pin(
+    ed: &mut Editor,
+    t: &mut dyn EditTarget,
+    def_id: &str,
+    old: &str,
+    new: &str,
+) -> Result<(), String> {
+    let r = (|| {
+        let (ops, defs, geom) = plan_rename_pin(t.doc(), def_id, old, new)?;
+        if ops.is_empty() {
+            return Ok(());
+        }
+        ed.history.commit(
+            t,
+            format!("rename pin {old} to {new}"),
+            &defs,
+            ops,
+            move |doc| {
+                if let Some(g) = geom {
+                    doc.editors.insert(g.0, g.1);
+                }
+            },
+        )?;
+        let (o, n) = (ItemRef::Pin(old.into()), ItemRef::Pin(new.into()));
+        if ed.selection.items.remove(&o) {
+            ed.selection.items.insert(n);
+        }
+        Ok(())
+    })();
+    report(ed, r)
+}
+
+/// Geometry of one def to store after a change.
+pub type DefGeom = Option<(String, crate::doc::EditorData)>;
+
+/// The edit behind [`rename_pin`]: `(ops, touched defs, new geometry of def_id)`. No ops if
+/// `new == old`.
+pub fn plan_rename_pin(
+    doc: &crate::doc::Document,
+    def_id: &str,
+    old: &str,
+    new: &str,
+) -> Result<(Vec<EditOp>, Vec<String>, DefGeom), String> {
+    let def = doc
+        .def(def_id)
+        .ok_or_else(|| format!("unknown def '{def_id}'"))?;
+    check_new_id(def, IdKind::Pin, old, new)?;
+    if old == new {
+        return Ok((Vec::new(), Vec::new(), None));
+    }
+    let mut d = def.clone();
+    d.pins
+        .iter_mut()
+        .find(|p| p.name == old)
+        .ok_or_else(|| format!("no pin '{old}'"))?
+        .name = new.to_string();
+    for n in &mut d.nets {
+        for e in &mut n.ends {
+            if matches!(e, Endpoint::Pin(p) if p == old) {
+                *e = Endpoint::Pin(new.to_string());
+            }
+        }
+    }
+    let mut defs = vec![def_id.to_string()];
+    let mut ops = vec![EditOp::ReplaceDef(d)];
+    for parent in &doc.design.defs {
+        let insts: Vec<&str> = parent
+            .instances
+            .iter()
+            .filter(|i| matches!(&i.kind, InstKind::Def(x) if x == def_id))
+            .map(|i| i.id.as_str())
+            .collect();
+        if insts.is_empty() {
+            continue;
+        }
+        let mut p = parent.clone();
+        for n in &mut p.nets {
+            for e in &mut n.ends {
+                if let Endpoint::Port { inst, port } = e
+                    && port == old
+                    && insts.contains(&inst.as_str())
+                {
+                    *port = new.to_string();
+                }
+            }
+        }
+        defs.push(parent.id.clone());
+        ops.push(EditOp::ReplaceDef(p));
+    }
+    let geom = doc.editor(def_id).cloned().map(|mut g| {
+        if let Some(pg) = g.pins.remove(old) {
+            g.pins.insert(new.to_string(), pg);
+        }
+        if let Some(sym) = &mut g.symbol
+            && let Some(sp) = sym.pins.remove(old)
+        {
+            sym.pins.insert(new.to_string(), sp);
+        }
+        (def_id.to_string(), g)
+    });
+    Ok((ops, defs, geom))
 }
 
 /// Record the outcome in the editor's message line (as the edit core's actions do).
@@ -1224,7 +1333,7 @@ impl Inspector {
         ui.horizontal(|ui| {
             ui.label(match kind {
                 IdKind::Instance => "id",
-                IdKind::Net => "name",
+                IdKind::Net | IdKind::Pin => "name",
             });
             let out = egui::TextEdit::singleline(text)
                 .desired_width(120.0)
@@ -1259,6 +1368,7 @@ impl Inspector {
             let _ = match kind {
                 IdKind::Instance => rename_instance(ed, app, &def_id, id, &new),
                 IdKind::Net => rename_net(ed, app, &def_id, id, &new),
+                IdKind::Pin => rename_pin(ed, app, &def_id, id, &new),
             };
         }
     }
@@ -1682,8 +1792,10 @@ impl Panel for Inspector {
                     && let Some(ItemRef::Pin(name)) = sel.items.iter().next()
                 {
                     if let Some(p) = def.pins.iter().find(|p| &p.name == name) {
+                        let name = name.clone();
                         ui.heading(format!("pin {name}"));
                         ui.label(format!("{} · {} bit(s)", dir_label(p.dir), p.width));
+                        self.name_ui(ui, &mut ed, app, IdKind::Pin, &name);
                         let net = def
                             .nets
                             .iter()

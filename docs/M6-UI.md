@@ -70,6 +70,13 @@ or a sampling list the engine copies after each event). Must not slow `run` when
    selected wire or chip, arrows nudge (Shift: 5) or pan, Enter opens a package, Space toggles
    the selected input pin, Home fits, `+` / `-` zoom. A hint bar along the bottom of the canvas
    shows the keys for the current selection and tool; `?` shows every shortcut.
+
+   **Managing packages** (`hier/manage.rs`): right-click a package in the library for
+   **Rename…** (the def's id and name change; every chip of it, in every parent, follows) and
+   **Delete** (disabled, with the chips listed, while any chip of it is placed). Shift+F2 renames
+   the package of the selected chip. F2 on a pin renames it; renaming a package's pin rewires
+   that port on every chip of the package. Ctrl+G's name prompt is keyboard-only: the default
+   name is selected, Enter creates, Esc cancels. Each is one undoable action.
 4. **Hierarchy & packaging**: open/enter/exit package instances (breadcrumbs), create a package
    from a selection (crossing nets become pins), package symbol auto-layout, library palette
    (starts from NAND plus the primitives NAND cannot build: tri-state buffer, split / merge,

@@ -33,6 +33,7 @@ pub type Shared = Rc<RefCell<HierState>>;
 
 const UP: KeyboardShortcut = KeyboardShortcut::new(Modifiers::ALT, Key::ArrowUp);
 const PACKAGE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::G);
+const RENAME_PACKAGE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::SHIFT, Key::F2);
 
 fn badge_color(kind: ClassKind, dark: bool) -> Color32 {
     match (kind, dark) {
@@ -95,6 +96,97 @@ fn ask_package_name(ctx: &egui::Context, hs: &mut HierState, app: &AppState) {
     hs.ask_package(app, sel);
 }
 
+/// Shift+F2: rename the package of the single selected chip.
+fn ask_rename_selected(ctx: &egui::Context, hs: &mut HierState, app: &AppState) {
+    let sel = selection(ctx, app);
+    let def = app.doc.def(&app.view.def);
+    let pkg = match sel.as_slice() {
+        [one] => def
+            .and_then(|d| d.instances.iter().find(|i| &i.id == one))
+            .and_then(|i| match &i.kind {
+                panda_netlist::InstKind::Def(d) => Some(d.clone()),
+                _ => None,
+            }),
+        _ => None,
+    };
+    match pkg {
+        Some(id) => hs.ask_rename(app, &id),
+        None => hs.status = Some("select one package chip to rename its package".into()),
+    }
+}
+
+/// A single-line name field that has the keyboard focus; with `select_all` (consumed) the
+/// whole text is selected so typing replaces it.
+fn focused_name_field(ui: &mut Ui, text: &mut String, select_all: &mut bool) -> egui::Response {
+    let out = egui::TextEdit::singleline(text)
+        .desired_width(400.0)
+        .show(ui);
+    let r = out.response;
+    if std::mem::take(select_all) {
+        let mut state = out.state;
+        state
+            .cursor
+            .set_char_range(Some(egui::text::CCursorRange::select_all(&out.galley)));
+        state.store(ui.ctx(), r.id);
+        ui.ctx().request_repaint();
+    }
+    r.request_focus();
+    r.response
+}
+
+/// Key hints under a prompt's buttons.
+fn prompt_keys(ui: &mut Ui, enter: &str) {
+    ui.label(
+        RichText::new(format!("Enter {enter} · Esc cancel"))
+            .small()
+            .weak(),
+    );
+}
+
+fn rename_modal(ctx: &egui::Context, hs: &mut HierState, app: &mut AppState) {
+    let Some(p) = hs.rename.as_mut() else { return };
+    let mut submit = false;
+    let mut cancel = false;
+    let users = super::manage::users(&app.doc.design, &p.old);
+    let r = egui::Modal::new(egui::Id::new("hier.rename")).show(ctx, |ui| {
+        ui.set_width(420.0);
+        ui.heading(format!("Rename package {}", p.old));
+        ui.label(match users.len() {
+            0 => "Not placed anywhere yet.".to_string(),
+            n => format!(
+                "{n} chip(s) use it: {}. They all follow the new name.",
+                super::manage::describe_users(&users)
+            ),
+        });
+        ui.label("New name");
+        let te = focused_name_field(ui, &mut p.name, &mut p.select_all);
+        // The field keeps the focus (re-requested every frame), so watch the key itself.
+        if (te.has_focus() || te.lost_focus()) && ui.input(|i| i.key_pressed(Key::Enter)) {
+            submit = true;
+        }
+        if let Some(e) = &p.error {
+            ui.colored_label(ui.visuals().error_fg_color, e);
+        }
+        ui.horizontal(|ui| {
+            if ui.button("Rename").clicked() {
+                submit = true;
+            }
+            if ui.button("Cancel").clicked() {
+                cancel = true;
+            }
+        });
+        prompt_keys(ui, "rename");
+    });
+    if r.should_close() {
+        cancel = true;
+    }
+    if cancel {
+        hs.rename = None;
+    } else if submit {
+        hs.submit_rename(crate::edit::shared_editor(ctx).as_ref(), app);
+    }
+}
+
 // ---------------------------------------------------------------- breadcrumbs
 
 /// Top-bar breadcrumbs, badge, prompt host and shortcuts.
@@ -121,17 +213,26 @@ impl Panel for Breadcrumbs {
             }
             hs.last_view = Some(view);
         }
-        if hs.prompt.is_none() {
-            let (up, pkg) =
-                ctx.input_mut(|i| (i.consume_shortcut(&UP), i.consume_shortcut(&PACKAGE)));
+        if hs.prompt.is_none() && hs.rename.is_none() {
+            let (up, pkg, ren) = ctx.input_mut(|i| {
+                (
+                    i.consume_shortcut(&UP),
+                    i.consume_shortcut(&PACKAGE),
+                    i.consume_shortcut(&RENAME_PACKAGE),
+                )
+            });
             if up {
                 actions::exit(app);
             }
             if pkg {
                 ask_package_name(ctx, hs, app);
             }
+            if ren {
+                ask_rename_selected(ctx, hs, app);
+            }
         }
         prompt_modal(ctx, hs, app);
+        rename_modal(ctx, hs, app);
     }
 
     fn on_event(&mut self, ev: &SimEvent, app: &mut AppState) {
@@ -199,9 +300,9 @@ fn prompt_modal(ctx: &egui::Context, hs: &mut HierState, app: &mut AppState) {
             p.selection.join(", ")
         ));
         ui.label("Package (def) name");
-        let te = ui.add(egui::TextEdit::singleline(&mut p.name).desired_width(400.0));
-        te.request_focus();
-        if te.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+        let te = focused_name_field(ui, &mut p.name, &mut p.select_all);
+        // The field keeps the focus (re-requested every frame), so watch the key itself.
+        if (te.has_focus() || te.lost_focus()) && ui.input(|i| i.key_pressed(Key::Enter)) {
             submit = true;
         }
         if let Some(e) = &p.error {
@@ -215,6 +316,7 @@ fn prompt_modal(ctx: &egui::Context, hs: &mut HierState, app: &mut AppState) {
                 cancel = true;
             }
         });
+        prompt_keys(ui, "create");
     });
     if r.should_close() {
         cancel = true;
@@ -302,6 +404,45 @@ impl Panel for HierMenu {
 /// The library palette (left panel tab).
 pub struct LibraryTab(pub Shared);
 
+/// A library context-menu choice, applied after the list is drawn.
+enum Manage {
+    Rename(String),
+    Delete(String),
+}
+
+/// Right-click menu of a package in the library: rename (everywhere) / delete (when unused).
+fn package_menu(ui: &mut Ui, app: &AppState, id: &str, out: &mut Option<Manage>) {
+    if ui
+        .add(egui::Button::new("Rename…").shortcut_text("Shift+F2"))
+        .on_hover_text("Rename the package; every chip of it follows")
+        .clicked()
+    {
+        *out = Some(Manage::Rename(id.to_string()));
+        ui.close();
+    }
+    let users = super::manage::users(&app.doc.design, id);
+    let r = ui.add_enabled(users.is_empty(), egui::Button::new("Delete"));
+    let r = if users.is_empty() {
+        r.on_hover_text("Remove the package from the design (Ctrl+Z to undo)")
+    } else {
+        r.on_disabled_hover_text(format!(
+            "Still used by {}; delete those chips first",
+            super::manage::describe_users(&users)
+        ))
+    };
+    if r.clicked() {
+        *out = Some(Manage::Delete(id.to_string()));
+        ui.close();
+    }
+    if !users.is_empty() {
+        ui.label(
+            RichText::new(format!("in use: {} chip(s)", users.len()))
+                .small()
+                .weak(),
+        );
+    }
+}
+
 fn entry_matches(e: &LibEntry, filter: &str) -> bool {
     filter.is_empty() || e.name.to_lowercase().contains(&filter.to_lowercase())
 }
@@ -328,9 +469,15 @@ impl Panel for LibraryTab {
                 .weak(),
         );
         ui.separator();
+        // The last message (above the list, which fills the rest of the panel).
+        if let Some(s) = &hs.status {
+            ui.label(RichText::new(s).small().color(crate::theme::MAROON));
+            ui.separator();
+        }
         let into = app.view.def.clone();
         let user = user_entries(&app.doc.design);
         let mut arm: Option<LibEntry> = None;
+        let mut manage: Option<Manage> = None;
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
@@ -385,6 +532,11 @@ impl Panel for LibraryTab {
                                         arm = Some(e.clone());
                                     }
                                     if cat == Category::User {
+                                        r.context_menu(|ui| {
+                                            package_menu(ui, app, &e.name, &mut manage);
+                                        });
+                                    }
+                                    if cat == Category::User {
                                         let st = hs.classifier.get(&e.name).clone();
                                         badge_ui(ui, Some(&st), false);
                                     }
@@ -408,16 +560,20 @@ impl Panel for LibraryTab {
                         });
                 }
             });
+        match manage {
+            Some(Manage::Rename(id)) => hs.ask_rename(app, &id),
+            Some(Manage::Delete(id)) => {
+                let ed = crate::edit::shared_editor(ui.ctx());
+                hs.delete_def(ed.as_ref(), app, &id);
+            }
+            None => {}
+        }
         if let Some(e) = arm {
             let ed = crate::edit::shared_editor(ui.ctx());
             match actions::arm_entry(hs, ed.as_ref(), app, &e) {
                 Ok(req) => crate::edit::request_place(ui.ctx(), req),
                 Err(err) => hs.status = Some(err),
             }
-        }
-        if let Some(s) = &hs.status {
-            ui.separator();
-            ui.label(RichText::new(s).small());
         }
     }
 }
